@@ -233,41 +233,70 @@ def _align_curve_to_x_data(curve, x_data):
     return [curve_map.get(t, None) for t in x_data]
 
 
-def _normalize_curve_to_price_area(values, price_values):
-    clean_values = [v for v in values if v is not None]
+def _normalize_multiple_curves_to_price_area(curves, price_values):
+    """
+    多条权益曲线统一归一化到价格区域。
+    重点：
+    1. 多条曲线共享同一个 min/max，避免实时权益和已实现权益岔开。
+    2. 只压缩到价格图下方一小段区域，避免把K线视觉压扁。
+    """
+
     clean_prices = [float(v) for v in price_values if v == v]
 
-    if len(clean_values) == 0 or len(clean_prices) == 0:
-        return values
+    if len(clean_prices) == 0:
+        return curves
 
     price_min = min(clean_prices)
     price_max = max(clean_prices)
 
-    value_min = min(clean_values)
-    value_max = max(clean_values)
-
     if price_max == price_min:
-        return values
+        return curves
+
+    all_values = []
+
+    for curve in curves:
+        all_values.extend([v for v in curve if v is not None])
+
+    if len(all_values) == 0:
+        return curves
+
+    value_min = min(all_values)
+    value_max = max(all_values)
 
     price_range = price_max - price_min
+
+    # 关键改这里：
+    # 不再占满 8%~92%，而是只放在价格图下方 8%~28%
     target_min = price_min + price_range * 0.08
-    target_max = price_max - price_range * 0.08
+    target_max = price_min + price_range * 0.70
 
     if value_max == value_min:
         middle = (target_min + target_max) / 2
-        return [None if v is None else middle for v in values]
+        return [
+            [None if v is None else middle for v in curve]
+            for curve in curves
+        ]
 
-    normalized = []
+    normalized_curves = []
 
-    for v in values:
-        if v is None:
-            normalized.append(None)
-        else:
-            new_v = target_min + (v - value_min) / (value_max - value_min) * (target_max - target_min)
-            normalized.append(round(float(new_v), 6))
+    for curve in curves:
+        normalized = []
 
-    return normalized
+        for v in curve:
+            if v is None:
+                normalized.append(None)
+            else:
+                new_v = (
+                    target_min
+                    + (v - value_min)
+                    / (value_max - value_min)
+                    * (target_max - target_min)
+                )
+                normalized.append(round(float(new_v), 6))
 
+        normalized_curves.append(normalized)
+
+    return normalized_curves
 
 def _build_trade_points_from_trades(trades):
     open_x, open_y = [], []
@@ -786,8 +815,22 @@ def plot_generic_equity_curves(
 
     if equity_curve is not None and len(equity_curve) > 0:
         floating_equity_raw = _align_curve_to_x_data(equity_curve, x_data)
-        floating_equity_overlay = _normalize_curve_to_price_area(floating_equity_raw, price_values)
+    else:
+        floating_equity_raw = []
 
+    if realized_equity_curve is not None and len(realized_equity_curve) > 0:
+        realized_equity_raw = _align_curve_to_x_data(realized_equity_curve, x_data)
+    else:
+        realized_equity_raw = []
+
+    # 统一归一化
+    floating_equity_overlay, realized_equity_overlay = _normalize_multiple_curves_to_price_area(
+        [floating_equity_raw, realized_equity_raw],
+        price_values
+    )
+
+    # 添加到 overlay_equity_line
+    if len(floating_equity_overlay) > 0:
         overlay_equity_line.add_yaxis(
             series_name=_t(language, "floating_equity_trend"),
             y_axis=floating_equity_overlay,
@@ -797,10 +840,7 @@ def plot_generic_equity_curves(
             linestyle_opts=opts.LineStyleOpts(width=2, opacity=equity_opacity),
         )
 
-    if realized_equity_curve is not None and len(realized_equity_curve) > 0:
-        realized_equity_raw = _align_curve_to_x_data(realized_equity_curve, x_data)
-        realized_equity_overlay = _normalize_curve_to_price_area(realized_equity_raw, price_values)
-
+    if len(realized_equity_overlay) > 0:
         overlay_equity_line.add_yaxis(
             series_name=_t(language, "realized_equity_trend"),
             y_axis=realized_equity_overlay,
@@ -814,7 +854,6 @@ def plot_generic_equity_curves(
     kline = kline.overlap(overlay_equity_line)
 
     open_x, open_y, close_x, close_y = _build_trade_points_from_trades(trades)
-
     if len(open_x) == 0 and len(close_x) == 0:
         open_x, open_y, close_x, close_y = _build_trade_points_from_position(df, x_data)
 
