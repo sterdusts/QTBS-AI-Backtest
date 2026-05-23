@@ -4,7 +4,7 @@ import math
 from datetime import datetime, timezone
 
 import gradio as gr
-
+from module.AI.deepseek_strategy_reviewer import review_strategy_code_with_deepseek
 from module.AI.deepseek_code_generator import generate_strategy_code_with_deepseek
 from module.Strategy.strategy_loader import save_strategy_code, load_strategy_func
 from module.modules.Load_real_kline import load_real_kline, normalize_symbol
@@ -500,7 +500,56 @@ SUMMARY_TEXTS = {
     },
 }
 
-
+REVIEW_TEXTS = {
+    "zh": {
+        "title": "AI 策略审查",
+        "match": "策略匹配度",
+        "desc_title": "匹配说明",
+        "empty": "生成策略代码后，这里会显示 AI 匹配度评分。",
+        "note": "80%+：初步可用，建议进入回测验证。90%+：高度匹配，但仍需人工复核。评分不代表结果保证，请结合图表检查开仓、平仓、方向、仓位、手续费滑点与插针风险。",
+        "review_failed": "AI 审查失败",
+    },
+    "en": {
+        "title": "AI Strategy Review",
+        "match": "Strategy Match",
+        "desc_title": "Match Notes",
+        "empty": "After generating strategy code, the AI match score will appear here.",
+        "note": "80%+ means initially usable and ready for backtest validation. 90%+ means highly aligned, but still requires manual review. Scores are not guarantees. Check entries, exits, direction, position, fees, slippage, spike equity, and liquidation risk on the chart.",
+        "review_failed": "AI review failed",
+    },
+    "ko": {
+        "title": "AI 전략 검토",
+        "match": "전략 일치도",
+        "desc_title": "일치도 설명",
+        "empty": "전략 코드를 생성하면 여기에 AI 일치도 점수가 표시됩니다.",
+        "note": "80% 이상은 초기 사용 가능 상태이며 백테스트 검증을 권장합니다. 90% 이상은 높은 일치도를 의미하지만 수동 검토가 필요합니다. 점수는 결과 보장이 아니며 차트에서 진입, 청산, 방향, 포지션, 수수료, 슬리피지, 급등락 자산, 강제청산 위험을 확인하세요.",
+        "review_failed": "AI 검토 실패",
+    },
+    "ja": {
+        "title": "AI 戦略レビュー",
+        "match": "戦略一致度",
+        "desc_title": "一致度説明",
+        "empty": "戦略コード生成後、ここに AI 一致度スコアが表示されます。",
+        "note": "80%以上は初期利用可能な状態で、バックテスト検証を推奨します。90%以上は高い一致度を示しますが、手動確認は必要です。スコアは保証ではありません。チャートでエントリー、決済、方向、ポジション、手数料、スリッページ、急変時の資産、強制決済リスクを確認してください。",
+        "review_failed": "AI レビュー失敗",
+    },
+    "ar": {
+        "title": "مراجعة الاستراتيجية بالذكاء الاصطناعي",
+        "match": "درجة مطابقة الاستراتيجية",
+        "desc_title": "ملاحظات المطابقة",
+        "empty": "بعد إنشاء كود الاستراتيجية ستظهر هنا درجة المطابقة من الذكاء الاصطناعي.",
+        "note": "أكثر من 80% يعني أنها قابلة للاستخدام مبدئيًا وتحتاج إلى اختبار خلفي. أكثر من 90% يعني تطابقًا عاليًا، لكنه لا يغني عن المراجعة اليدوية. النتيجة ليست ضمانًا. تحقق من الدخول والخروج والاتجاه والمركز والرسوم والانزلاق السعري ومخاطر الذبذبات والتصفية عبر الرسم البياني.",
+        "review_failed": "فشلت مراجعة الذكاء الاصطناعي",
+    },
+    "ru": {
+        "title": "AI-проверка стратегии",
+        "match": "Соответствие стратегии",
+        "desc_title": "Пояснение соответствия",
+        "empty": "После генерации кода стратегии здесь появится AI-оценка соответствия.",
+        "note": "80%+ означает начальную пригодность для проверки в бэктесте. 90%+ означает высокое соответствие, но ручная проверка всё равно нужна. Оценка не является гарантией. Проверьте входы, выходы, направление, позицию, комиссии, проскальзывание, экстремумы капитала и риск ликвидации на графике.",
+        "review_failed": "Ошибка AI-проверки",
+    },
+}
 # =========================================================
 # 基础工具函数
 # =========================================================
@@ -722,6 +771,55 @@ def filter_df_by_date(df, start_str: str, end_str: str):
     return df
 
 
+def get_review_text(lang_code: str) -> dict:
+    return REVIEW_TEXTS.get(lang_code, REVIEW_TEXTS["zh"])
+
+
+def clamp_score(value) -> float:
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    return max(0.0, min(99.99, value))
+
+
+def build_review_html(review: dict | None, lang_code: str = "zh") -> str:
+    text = get_review_text(lang_code)
+
+    if not review:
+        return f"""
+        <div class="review-card">
+            <div class="review-title">{text["title"]}</div>
+            <div class="review-empty">{text["empty"]}</div>
+        </div>
+        """
+
+    match_score = clamp_score(review.get("match_score", 0))
+    match_summary = review.get("match_summary", "")
+
+    return f"""
+    <div class="review-card">
+        <div class="review-layout">
+            <div class="review-left">
+                <div class="review-title">{text["match"]}</div>
+
+                <div class="score-row">
+                    <div class="score-bar-bg">
+                        <div class="score-bar-fill" style="width:{match_score}%;"></div>
+                    </div>
+                    <div class="score-number">{match_score:.2f}%</div>
+                </div>
+            </div>
+
+            <div class="review-right">
+                <div class="review-summary-title">{text["desc_title"]}</div>
+                <div class="review-summary">{match_summary}</div>
+                <div class="review-note">{text["note"]}</div>
+            </div>
+        </div>
+    </div>
+    """
+
 def build_backtest_summary(
     metrics: dict,
     lang_code: str,
@@ -842,13 +940,15 @@ def update_ui_language(lang_code: str):
             label=text["code_output_label"],
         ),
         gr.update(
+            value=build_review_html(None, lang_code),
+        ),
+        gr.update(
             label=text["result_output_label"],
         ),
         gr.update(
             label=text["chart_file_label"],
         ),
     ]
-
 
 # =========================================================
 # DeepSeek 生成策略代码
@@ -877,10 +977,10 @@ def generate_code_from_ui(
         end_str = normalize_date(end_time, today_utc, output_language)
         validate_date_range(start_str, end_str, output_language)
     except Exception as e:
-        return f"# {str(e)}"
+        return f"# {str(e)}", build_review_html(None, output_language)
 
     if strategy_text is None or strategy_text.strip() == "":
-        return f"# {text['empty_strategy_error']}"
+        return f"# {text['empty_strategy_error']}", build_review_html(None, output_language)
 
     if symbol is None or symbol.strip() == "":
         symbol = "BTC"
@@ -904,7 +1004,7 @@ def generate_code_from_ui(
             lang_code=output_language,
         )
     except Exception as e:
-        return f"# {str(e)}"
+        return f"# {str(e)}", build_review_html(None, output_language)
 
     try:
         strategy_code = generate_strategy_code_with_deepseek(
@@ -919,10 +1019,35 @@ def generate_code_from_ui(
             slippage_percent=slippage_percent_value,
         )
 
-        return strategy_code
+        try:
+            review = review_strategy_code_with_deepseek(
+                user_strategy_text=strategy_text,
+                generated_code=strategy_code,
+                language=output_language,
+            )
+
+            review_html = build_review_html(review, output_language)
+
+        except Exception as review_error:
+            review_text = get_review_text(output_language)
+
+            review_html = build_review_html(
+                {
+                    "match_score": 0,
+                    "confidence_score": 0,
+                    "match_summary": f"{review_text['review_failed']}：{str(review_error)}",
+                    "confidence_summary": "",
+                },
+                output_language,
+            )
+
+        return strategy_code, review_html
 
     except Exception as e:
-        return f"# {text['api_fail_error']}\n# {str(e)}"
+        return (
+            f"# {text['api_fail_error']}\n# {str(e)}",
+            build_review_html(None, output_language),
+        )
 
 
 # =========================================================
@@ -1103,32 +1228,36 @@ custom_css = """
     min-height: 430px !important;
     font-size: 18px !important;
     border-radius: 18px !important;
-    background: #e8f7fa !important;
-    border: 2px solid #6f6f6f !important;
+    background: #f4fbfc !important;
+    border: 1px solid #dceff2 !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+
+#strategy-box textarea:focus {
+    border: 1px solid #cfe7ec !important;
+    box-shadow: 0 0 0 2px rgba(207, 231, 236, 0.35) !important;
+    outline: none !important;
 }
 
 #right-panel {
     padding-top: 20px;
 }
 
-/* 右侧两列参数区 */
 .param-row {
     gap: 12px !important;
     margin-bottom: 2px !important;
 }
 
-/* 让右侧输入框更紧凑一点 */
 #right-panel input,
 #right-panel textarea {
     font-size: 14px !important;
 }
 
-/* 日期选择框不要太挤 */
 #right-panel .wrap {
     min-height: 38px !important;
 }
 
-/* 按钮区域 */
 #button-row {
     gap: 12px !important;
     margin-top: 12px !important;
@@ -1147,6 +1276,98 @@ custom_css = """
 #result-box textarea {
     font-size: 15px !important;
 }
+
+/* AI 策略审查评分卡 */
+#review-output {
+    margin-top: 14px;
+    width: 100%;
+}
+
+.review-card {
+    background: #1f1f22;
+    border: 1px solid #3a3a40;
+    border-radius: 12px;
+    padding: 16px;
+    color: #f2f2f2;
+    min-height: 160px;
+}
+
+.review-layout {
+    display: grid;
+    grid-template-columns: 6fr 4fr;
+    gap: 14px;
+    align-items: start;
+}
+
+.review-left {
+    min-width: 0;
+}
+
+.review-right {
+    border-left: 1px solid #3a3a40;
+    padding-left: 14px;
+}
+
+.review-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 12px;
+}
+
+.score-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.score-bar-bg {
+    flex: 1;
+    height: 12px;
+    background: #3a3a40;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.score-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #f97316, #22c55e);
+    border-radius: 999px;
+}
+
+.score-number {
+    width: 68px;
+    text-align: right;
+    font-weight: 700;
+    color: #f3f4f6;
+}
+
+.review-summary-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #e5e7eb;
+    margin-bottom: 8px;
+}
+
+.review-summary {
+    font-size: 12px;
+    color: #b8b8b8;
+    line-height: 1.6;
+    margin-bottom: 8px;
+}
+
+.review-note {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #3a3a40;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #9ca3af;
+}
+
+.review-empty {
+    font-size: 13px;
+    color: #9ca3af;
+}
 """
 
 
@@ -1163,7 +1384,6 @@ with gr.Blocks(
 
     with gr.Column(elem_id="main-container"):
 
-        # 顶部区域：左侧标题说明，右上角语言选择
         with gr.Row(elem_id="top-bar"):
 
             with gr.Column(scale=8, elem_id="header-panel"):
@@ -1178,10 +1398,7 @@ with gr.Blocks(
                     elem_id="language-select",
                 )
 
-        # 主体区域：左侧策略输入，右侧回测参数
         with gr.Row():
-
-            # 左侧：策略输入框
             with gr.Column(scale=7, min_width=650):
                 strategy_input = gr.Textbox(
                     label=default_text["strategy_label"],
@@ -1190,10 +1407,13 @@ with gr.Blocks(
                     elem_id="strategy-box",
                 )
 
-            # 右侧：参数栏
+                review_output = gr.HTML(
+                    value=build_review_html(None, default_lang),
+                    elem_id="review-output",
+                )
+
             with gr.Column(scale=3, min_width=420, elem_id="right-panel"):
 
-                # 交易市场选择：保持单独一整行，不并排
                 market_select = gr.Dropdown(
                     label=default_text["market_label"],
                     choices=[(default_text["market_choice"], "crypto")],
@@ -1201,7 +1421,6 @@ with gr.Blocks(
                     interactive=False,
                 )
 
-                # 第一行：交易标的 + 时间周期
                 with gr.Row(elem_classes=["param-row"]):
                     symbol_input = gr.Textbox(
                         label=default_text["symbol_label"],
@@ -1218,7 +1437,6 @@ with gr.Blocks(
                         scale=1,
                     )
 
-                # 第二行：起始时间 + 结束时间
                 with gr.Row(elem_classes=["param-row"]):
                     start_date = gr.DateTime(
                         label=default_text["start_label"],
@@ -1238,7 +1456,6 @@ with gr.Blocks(
                         scale=1,
                     )
 
-                # 第三行：初始资金 + 杠杆倍数
                 with gr.Row(elem_classes=["param-row"]):
                     initial_cash_input = gr.Number(
                         label=default_text["initial_cash_label"],
@@ -1259,7 +1476,6 @@ with gr.Blocks(
                         scale=1,
                     )
 
-                # 第四行：仓位比例 + 手续费率
                 with gr.Row(elem_classes=["param-row"]):
                     position_size_input = gr.Number(
                         label=default_text["position_size_label"],
@@ -1280,7 +1496,6 @@ with gr.Blocks(
                         scale=1,
                     )
 
-                # 第五行：滑点 + 留空占位
                 with gr.Row(elem_classes=["param-row"]):
                     slippage_input = gr.Number(
                         label=default_text["slippage_label"],
@@ -1294,7 +1509,6 @@ with gr.Blocks(
                     with gr.Column(scale=1):
                         gr.Markdown("")
 
-                # 按钮：并排，减少右侧高度
                 with gr.Row(elem_id="button-row"):
                     generate_button = gr.Button(
                         value=default_text["generate_button"],
@@ -1309,6 +1523,8 @@ with gr.Blocks(
                         elem_id="backtest-button",
                         scale=1,
                     )
+
+
 
         strategy_code_output = gr.Code(
             label=default_text["code_output_label"],
@@ -1327,7 +1543,6 @@ with gr.Blocks(
             label=default_text["chart_file_label"],
         )
 
-        # 语言切换：动态更新整个 UI 文字
         language_select.change(
             fn=update_ui_language,
             inputs=[language_select],
@@ -1348,12 +1563,12 @@ with gr.Blocks(
                 generate_button,
                 backtest_button,
                 strategy_code_output,
+                review_output,
                 backtest_result_output,
                 chart_file_output,
             ],
         )
 
-        # 生成策略代码
         generate_button.click(
             fn=generate_code_from_ui,
             inputs=[
@@ -1370,10 +1585,12 @@ with gr.Blocks(
                 fee_rate_input,
                 slippage_input,
             ],
-            outputs=strategy_code_output,
+            outputs=[
+                strategy_code_output,
+                review_output,
+            ],
         )
 
-        # 运行回测
         backtest_button.click(
             fn=run_backtest_from_ui,
             inputs=[
@@ -1405,5 +1622,6 @@ if __name__ == "__main__":
     demo.launch(
         server_name="127.0.0.1",
         server_port=7860,
-        inbrowser=True
+        inbrowser=True,
+        css=custom_css,
     )

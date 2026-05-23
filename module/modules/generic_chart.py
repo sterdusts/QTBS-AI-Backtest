@@ -836,6 +836,7 @@ def plot_generic_equity_curves(
             y_axis=floating_equity_overlay,
             is_smooth=False,
             is_symbol_show=False,
+            tooltip_opts=opts.TooltipOpts(is_show=False),
             label_opts=opts.LabelOpts(is_show=False),
             linestyle_opts=opts.LineStyleOpts(width=2, opacity=equity_opacity),
         )
@@ -847,6 +848,7 @@ def plot_generic_equity_curves(
             is_smooth=False,
             is_step=True,
             is_symbol_show=False,
+            tooltip_opts=opts.TooltipOpts(is_show=False),
             label_opts=opts.LabelOpts(is_show=False),
             linestyle_opts=opts.LineStyleOpts(width=2, opacity=max(equity_opacity - 0.18, 0.2)),
         )
@@ -908,7 +910,7 @@ def plot_generic_equity_curves(
 
     grid.add(
         kline,
-        grid_opts=opts.GridOpts(pos_top="14%", pos_bottom="43%", pos_left="7%", pos_right="5%", is_contain_label=True),
+        grid_opts=opts.GridOpts(pos_top="14%", pos_bottom="43%", pos_left="6%", pos_right="20%", is_contain_label=True),
     )
 
     if len(floating_equity_raw) > 0 or len(realized_equity_raw) > 0:
@@ -945,7 +947,7 @@ def plot_generic_equity_curves(
 
         grid.add(
             real_equity_line,
-            grid_opts=opts.GridOpts(pos_top="63%", pos_bottom="20%", pos_left="7%", pos_right="5%", is_contain_label=True),
+            grid_opts=opts.GridOpts(pos_top="63%", pos_bottom="20%", pos_left="7%", pos_right="20%", is_contain_label=True),
         )
 
     if "volume" in df.columns:
@@ -967,7 +969,7 @@ def plot_generic_equity_curves(
 
         grid.add(
             bar,
-            grid_opts=opts.GridOpts(pos_top="86%", pos_bottom="7%", pos_left="7%", pos_right="5%", is_contain_label=True),
+            grid_opts=opts.GridOpts(pos_top="86%", pos_bottom="7%", pos_left="7%", pos_right="20%", is_contain_label=True),
         )
 
 
