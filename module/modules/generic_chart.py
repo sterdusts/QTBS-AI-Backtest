@@ -908,7 +908,7 @@ def plot_generic_equity_curves(
 
     grid.add(
         kline,
-        grid_opts=opts.GridOpts(pos_top="14%", pos_bottom="54%", pos_left="7%", pos_right="5%", is_contain_label=True),
+        grid_opts=opts.GridOpts(pos_top="14%", pos_bottom="43%", pos_left="7%", pos_right="5%", is_contain_label=True),
     )
 
     if len(floating_equity_raw) > 0 or len(realized_equity_raw) > 0:
@@ -937,7 +937,7 @@ def plot_generic_equity_curves(
             )
 
         real_equity_line.set_global_opts(
-            legend_opts=opts.LegendOpts(pos_left="center", pos_top="49%"),
+            legend_opts=opts.LegendOpts(pos_left="center", pos_top="59%"),
             tooltip_opts=opts.TooltipOpts(trigger="axis"),
             xaxis_opts=opts.AxisOpts(type_="category", boundary_gap=False, axislabel_opts=opts.LabelOpts(is_show=False)),
             yaxis_opts=opts.AxisOpts(type_="value", name=_t(language, "equity"), is_scale=True, split_number=3),
@@ -945,7 +945,7 @@ def plot_generic_equity_curves(
 
         grid.add(
             real_equity_line,
-            grid_opts=opts.GridOpts(pos_top="52%", pos_bottom="34%", pos_left="7%", pos_right="5%", is_contain_label=True),
+            grid_opts=opts.GridOpts(pos_top="63%", pos_bottom="20%", pos_left="7%", pos_right="5%", is_contain_label=True),
         )
 
     if "volume" in df.columns:
@@ -967,30 +967,9 @@ def plot_generic_equity_curves(
 
         grid.add(
             bar,
-            grid_opts=opts.GridOpts(pos_top="71%", pos_bottom="21%", pos_left="7%", pos_right="5%", is_contain_label=True),
-        )
-
-    if "target_position" in df.columns:
-        position_line = Line()
-        position_line.add_xaxis(x_data)
-        position_line.add_yaxis(
-            series_name=_t(language, "position"),
-            y_axis=[0 if v != v else int(v) for v in df["target_position"].fillna(0).tolist()],
-            is_step=True,
-            is_symbol_show=False,
-            label_opts=opts.LabelOpts(is_show=False),
-        )
-        position_line.set_global_opts(
-            legend_opts=opts.LegendOpts(pos_left="center", pos_top="83%"),
-            tooltip_opts=opts.TooltipOpts(trigger="axis"),
-            xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=25, font_size=10)),
-            yaxis_opts=opts.AxisOpts(type_="value", name=_t(language, "position"), min_=-1.2, max_=1.2, interval=1),
-        )
-
-        grid.add(
-            position_line,
             grid_opts=opts.GridOpts(pos_top="86%", pos_bottom="7%", pos_left="7%", pos_right="5%", is_contain_label=True),
         )
+
 
     grid.render(output_html_name)
     _make_html_responsive_and_multilingual(
