@@ -212,7 +212,7 @@ def data_acquisition(
     return df
 
 
-if True:
+if False:
     # ===== 批量更新示例 =====
     stock_list = ['ETH', 'BTC', 'SOL', 'DOGE', 'XRP',
                   'ADA', 'XLM', 'BNB', 'TRX']
