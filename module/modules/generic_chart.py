@@ -393,6 +393,104 @@ def _build_trade_points_from_position(df, x_data):
 
     return open_x, open_y, close_x, close_y
 
+def _inject_html_file_switcher(output_html_name: str, output_dir: str):
+    """
+    给 output_dir 下所有 HTML 文件同步注入/更新历史文件切换器。
+    这样切到旧 HTML 后，也能看到最新生成的 HTML 文件。
+    """
+
+    html_files = []
+
+    if os.path.exists(output_dir):
+        for filename in os.listdir(output_dir):
+            if filename.endswith(".html"):
+                file_path = os.path.join(output_dir, filename)
+                html_files.append({
+                    "name": filename,
+                    "path": file_path,
+                    "mtime": os.path.getmtime(file_path)
+                })
+
+    html_files.sort(key=lambda x: x["mtime"], reverse=True)
+
+    def build_switcher_html(current_filename: str) -> str:
+        options_html = ""
+
+        for item in html_files:
+            filename = item["name"]
+            selected = "selected" if filename == current_filename else ""
+            options_html += f'<option value="{filename}" {selected}>{filename}</option>\n'
+
+        return f"""
+<!-- QTBS_HTML_FILE_SWITCHER_START -->
+<div id="html-file-switcher">
+    <select id="html-file-select" onchange="switchHtmlFile(this.value)">
+        {options_html}
+    </select>
+</div>
+
+<script>
+    function switchHtmlFile(filename) {{
+        if (!filename) return;
+        window.location.href = filename;
+    }}
+</script>
+
+<style>
+    #html-file-switcher {{
+        position: fixed;
+        top: 10px;
+        right: 150px;
+        z-index: 999999;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid #dcdfe6;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-family: Arial, sans-serif;
+        font-size: 13px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }}
+
+    #html-file-select {{
+        width: 280px;
+        height: 28px;
+        border: 1px solid #cfd3dc;
+        border-radius: 6px;
+        background: white;
+        color: #303133;
+        padding: 3px 6px;
+        font-size: 13px;
+        outline: none;
+    }}
+
+    #html-file-select:hover {{
+        border-color: #a8abb2;
+    }}
+</style>
+<!-- QTBS_HTML_FILE_SWITCHER_END -->
+"""
+
+    for item in html_files:
+        html_path = item["path"]
+        current_filename = item["name"]
+
+        with open(html_path, "r", encoding="utf-8") as f:
+            html_text = f.read()
+
+        switcher_html = build_switcher_html(current_filename)
+
+        start_tag = "<!-- QTBS_HTML_FILE_SWITCHER_START -->"
+        end_tag = "<!-- QTBS_HTML_FILE_SWITCHER_END -->"
+
+        if start_tag in html_text and end_tag in html_text:
+            start = html_text.find(start_tag)
+            end = html_text.find(end_tag) + len(end_tag)
+            html_text = html_text[:start] + switcher_html + html_text[end:]
+        else:
+            html_text = html_text.replace("</body>", switcher_html + "\n</body>")
+
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_text)
 
 def _make_html_responsive_and_multilingual(
     html_path: str,
@@ -416,6 +514,8 @@ def _make_html_responsive_and_multilingual(
         },
         ensure_ascii=False
     )
+
+
 
     css = """
 <style>
@@ -974,6 +1074,9 @@ def plot_generic_equity_curves(
 
 
     grid.render(output_html_name)
+
+    _inject_html_file_switcher(output_html_name, output_dir)
+
     _make_html_responsive_and_multilingual(
         output_html_name,
         default_language=language,

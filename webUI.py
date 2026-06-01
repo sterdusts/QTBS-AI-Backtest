@@ -1524,14 +1524,13 @@ with gr.Blocks(
                         scale=1,
                     )
 
-
-
-        strategy_code_output = gr.Code(
-            label=default_text["code_output_label"],
-            language="python",
-            lines=26,
-            elem_id="output-code",
-        )
+        with gr.Accordion(default_text["code_output_label"], open=False):
+            strategy_code_output = gr.Code(
+                label="",
+                language="python",
+                lines=26,
+                elem_id="output-code",
+            )
 
         backtest_result_output = gr.Textbox(
             label=default_text["result_output_label"],
