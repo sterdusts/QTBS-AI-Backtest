@@ -76,6 +76,23 @@ QTBS automatically generates executable Python strategy functions.
 
 ---
 
+### Multi-Asset Portfolio Backtesting
+
+QTBS also understands multi-asset strategies described in natural language, for example:
+
+```text
+Compare the recent momentum of BTC and ETH.
+When BTC is clearly stronger, long BTC and short ETH with half capital each;
+when ETH is stronger, do the reverse; stay flat otherwise.
+```
+
+- The AI automatically selects the right strategy contract: single-asset discrete positions, or multi-asset continuous target weights (hedge / portfolio / dynamic sizing)
+- The portfolio engine handles weight reconciliation, rebalancing thresholds, average-cost accounting and conservative liquidation modeling
+- Parameter precedence: when the strategy code declares its symbols (`SYMBOLS`), the code wins and the panel's symbol field is ignored; timeframe, date range, capital, leverage, position size, fees and slippage always come from the panel
+- Engine semantics are specified in `STRATEGY_CONTRACT.md` and locked by golden-sample tests under `tests/`
+
+---
+
 ### AI Strategy Review
 
 QTBS automatically analyzes:
@@ -103,6 +120,14 @@ QTBS automatically generates:
 - Realized equity curves
 - Volume charts
 - Position curves
+
+For multi-asset strategies, QTBS renders a portfolio view instead:
+
+- Portfolio equity (floating + realized)
+- Per-symbol exposure curves
+- Normalized price comparison with buy / sell / liquidation markers
+
+All charts include a history switcher, and very long backtests are automatically downsampled for smooth rendering.
 
 This allows users to visually verify trading behavior and strategy execution logic.
 
@@ -188,6 +213,15 @@ Run the project:
 python webUI.py
 ```
 
+On Windows you can simply double-click `QTBS launcher.bat` — it creates the
+virtual environment and installs dependencies automatically on first run.
+
+Run the test suite (golden-sample tests locking the engine semantics):
+
+```bash
+python -m pytest tests -q
+```
+
 ---
 
 ## Important Notes
@@ -209,10 +243,12 @@ Example:
 Current version already supports:
 
 - Natural-language strategy generation
-- Historical backtesting
-- Visualized chart systems
+- Historical backtesting (single-asset and multi-asset portfolio engines)
+- Hedge / portfolio strategies via continuous target weights
+- Visualized chart systems (incl. portfolio view)
 - AI strategy match analysis
 - Multi-language UI support
+- A written AI↔engine strategy contract (`STRATEGY_CONTRACT.md`) locked by 150+ tests
 
 ---
 
@@ -220,10 +256,12 @@ Current version already supports:
 
 Planned future features:
 
-- Advanced position management systems
+- Intrabar trigger prices (stop-loss / take-profit at intraday levels)
+- Funding rates and borrowing costs
+- Behavioral strategy review (running generated code on synthetic data before the AI review)
+- Risk / robustness analysis modules (parameter sensitivity, in/out-of-sample)
 - Multi-strategy portfolios
 - AI-driven strategy optimization
-- Risk analysis modules
 - Local model deployment
 - More OpenAI-compatible API providers
 
@@ -357,6 +395,23 @@ QTBS 会自动生成可执行的 Python 策略函数。
 
 ---
 
+## 多标的组合回测
+
+QTBS 也能理解自然语言描述的多标的策略，例如：
+
+```text
+比较 BTC 和 ETH 最近的动量强弱。
+BTC 明显更强时各用一半资金做多 BTC、做空 ETH；
+ETH 更强时反向操作；强弱接近时空仓等待。
+```
+
+- AI 自动选择合适的策略契约：单标的离散仓位，或多标的连续目标权重（对冲 / 组合 / 动态仓位）
+- 组合引擎负责权重对账、再平衡阈值、移动平均成本记账与保守强平模型
+- 参数优先级：策略代码声明了标的（`SYMBOLS`）时以代码为准、面板的交易标的不生效；周期、回测时间、资金、杠杆、仓位、费率、滑点始终以面板为准
+- 引擎语义由根目录 `STRATEGY_CONTRACT.md` 规约，并由 `tests/` 金样例测试锁定
+
+---
+
 ## AI 策略审查
 
 QTBS 会自动分析：
@@ -384,6 +439,14 @@ QTBS 自动生成：
 - 已实现权益曲线
 - 成交量图
 - 仓位曲线
+
+多标的策略则渲染组合视图：
+
+- 组合权益（实时 + 已实现）
+- 各标的敞口曲线
+- 归一化价格对比与买入 / 卖出 / 强平标记
+
+所有图表带历史切换器，超长回测自动降采样保证流畅渲染。
 
 帮助用户直观验证策略行为与交易逻辑。
 
@@ -469,6 +532,14 @@ pip install -r requirements.txt
 python webUI.py
 ```
 
+Windows 下也可以直接双击 `QTBS launcher.bat`——首次运行会自动创建虚拟环境并安装依赖。
+
+运行测试（锁定引擎语义的金样例测试）：
+
+```bash
+python -m pytest tests -q
+```
+
 ---
 
 # 注意事项
@@ -490,10 +561,12 @@ python webUI.py
 当前版本已支持：
 
 - 自然语言生成策略
-- 历史回测
-- 图表可视化
+- 历史回测（单标的与多标的组合双引擎）
+- 连续目标权重的对冲 / 组合策略
+- 图表可视化（含组合视图）
 - AI 策略匹配分析
 - 多语言 UI
+- 成文的 AI↔引擎策略契约（`STRATEGY_CONTRACT.md`），150+ 测试锁定
 
 ---
 
@@ -501,10 +574,12 @@ python webUI.py
 
 未来计划包括：
 
-- 更复杂的仓位系统
+- 盘中触发价（止损 / 止盈按盘中价位成交）
+- 资金费率与借币成本
+- 行为审查（生成代码先在合成数据上实际运行再交给 AI 审查）
+- 风险 / 稳健性分析模块（参数敏感性、样本内外）
 - 多策略组合
 - AI 自动优化策略
-- 风险分析模块
 - 本地模型部署
 - 更多 OpenAI Compatible API 支持
 
@@ -637,6 +712,23 @@ QTBS는 실행 가능한 Python 전략 함수를 자동 생성합니다.
 
 ---
 
+## 멀티 종목 포트폴리오 백테스트
+
+QTBS는 자연어로 설명한 멀티 종목 전략도 이해합니다. 예시:
+
+```text
+BTC와 ETH의 최근 모멘텀을 비교한다.
+BTC가 확실히 강하면 자금의 절반씩 BTC 매수 / ETH 공매도,
+ETH가 강하면 반대로, 비슷하면 전량 청산 후 대기.
+```
+
+- AI가 적합한 전략 계약을 자동 선택: 단일 종목 이산 포지션, 또는 멀티 종목 연속 목표 가중치(헤지 / 포트폴리오 / 동적 포지션)
+- 포트폴리오 엔진이 가중치 정산, 리밸런싱 임계값, 평균 단가 회계, 보수적 청산 모델을 처리
+- 파라미터 우선순위: 전략 코드에 종목(`SYMBOLS`)이 선언되면 코드가 우선하며 패널의 종목 입력은 무시됩니다. 주기·기간·자금·레버리지·포지션 비율·수수료·슬리피지는 항상 패널 기준입니다
+- 엔진 의미론은 루트의 `STRATEGY_CONTRACT.md`에 명세되어 있고 `tests/`의 골든 샘플 테스트로 고정됩니다
+
+---
+
 ## AI 전략 검토
 
 QTBS는 자동으로 분석합니다.
@@ -664,6 +756,14 @@ QTBS는 자동으로 생성합니다.
 - 실현 손익 곡선
 - 거래량 차트
 - 포지션 곡선
+
+멀티 종목 전략은 포트폴리오 뷰로 렌더링됩니다.
+
+- 포트폴리오 자산 곡선(실시간 + 실현)
+- 종목별 노출 곡선
+- 정규화 가격 비교와 매수 / 매도 / 청산 마커
+
+모든 차트에 히스토리 전환기가 포함되며, 매우 긴 백테스트는 자동 다운샘플링으로 부드럽게 렌더링됩니다.
 
 사용자는 이를 통해 전략 동작을 직관적으로 검증할 수 있습니다.
 
@@ -749,6 +849,14 @@ pip install -r requirements.txt
 python webUI.py
 ```
 
+Windows에서는 `QTBS launcher.bat`를 더블클릭하면 됩니다. 첫 실행 시 가상환경 생성과 의존성 설치가 자동으로 진행됩니다.
+
+테스트 실행(엔진 의미론을 고정하는 골든 샘플 테스트):
+
+```bash
+python -m pytest tests -q
+```
+
 ---
 
 # 주의 사항
@@ -770,10 +878,12 @@ python webUI.py
 현재 지원 기능:
 
 - 자연어 전략 생성
-- 과거 데이터 백테스트
-- 시각화 차트 시스템
+- 과거 데이터 백테스트(단일 종목 + 멀티 종목 포트폴리오 듀얼 엔진)
+- 연속 목표 가중치 기반 헤지 / 포트폴리오 전략
+- 시각화 차트 시스템(포트폴리오 뷰 포함)
 - AI 전략 일치도 분석
 - 다국어 UI 지원
+- 문서화된 AI↔엔진 전략 계약(`STRATEGY_CONTRACT.md`)과 150+ 테스트
 
 ---
 
@@ -781,10 +891,12 @@ python webUI.py
 
 향후 추가 예정 기능:
 
-- 고급 포지션 관리 시스템
+- 장중 트리거 가격(손절 / 익절의 장중 체결)
+- 펀딩비 및 차입 비용
+- 행동 검증(생성 코드를 합성 데이터에서 실제 실행 후 AI 검토)
+- 리스크 / 강건성 분석 모듈(파라미터 민감도, 표본 내외)
 - 멀티 전략 포트폴리오
 - AI 기반 전략 자동 최적화
-- 리스크 분석 모듈
 - 로컬 모델 배포
 - 추가 OpenAI Compatible API 지원
 

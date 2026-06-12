@@ -1,7 +1,17 @@
 import os
+import sys
 import time
 import pandas as pd
 from binance.client import Client
+
+# 允许独立运行（python cryptocurrency_data/obtain_K_data.py）时找到项目根
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+# 符号归一化与文件命名单源在 Load_real_kline：下载侧与读取侧
+# 任何一边单独改动都会让对方找不到文件，不要在本文件重新定义
+from module.modules.Load_real_kline import kline_file_name, normalize_symbol
 
 COLS = [
     'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -9,13 +19,6 @@ COLS = [
 ]
 
 ONE_MINUTE_MS = 60_000
-
-
-def normalize_symbol(stock: str) -> str:
-    stock = stock.upper().strip()
-    if stock.endswith("USDT"):
-        return stock
-    return stock + "USDT"
 
 
 def load_existing_df(filename: str) -> pd.DataFrame:
@@ -139,7 +142,7 @@ def data_acquisition(
     interval = Client.KLINE_INTERVAL_1MINUTE
 
     os.makedirs(save_dir, exist_ok=True)
-    filename = os.path.join(save_dir, f'{symbol}_1MIN_data.csv')
+    filename = os.path.join(save_dir, kline_file_name(symbol))
 
     # 决定起点：全量 or 增量
     if update_mode:

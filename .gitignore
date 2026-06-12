@@ -66,3 +66,5 @@ desktop.ini
 # Gradio 临时文件
 # =========================
 gradio_cached_examples/
+# Claude Code session data
+.claude/

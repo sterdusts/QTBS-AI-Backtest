@@ -28,8 +28,9 @@ class KlineBuilder:
         close_time, qav, nt, tbv, tqv, ignore
         """
 
-        self.raw_df = raw_df.copy()
-        self.df_1m = self._prepare_1m_klines(self.raw_df)
+        # 不保留原始帧引用：清洗结果是唯一需要的状态，
+        # 原始 1m CSV 可达数百 MB，多存一份纯属浪费
+        self.df_1m = self._prepare_1m_klines(raw_df)
 
     def _prepare_1m_klines(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -42,7 +43,8 @@ class KlineBuilder:
             if col not in df.columns:
                 raise ValueError(f"原始数据缺少必要字段: {col}")
 
-        df = df.copy()
+        # 浅拷贝即可：写时复制下对 open_time 的赋值只复制该列，不动原始帧
+        df = df.copy(deep=False)
 
         # 兼容 Binance 毫秒时间戳 / 字符串时间
         if pd.api.types.is_numeric_dtype(df["open_time"]):
@@ -82,9 +84,12 @@ class KlineBuilder:
     def get_1m(self) -> pd.DataFrame:
         """
         返回清洗后的 1m K线。
+
+        直接返回内部帧（数百 MB 级，拷贝是纯浪费）：
+        调用方在写时复制语义下的任何写入都不会影响本对象。
         """
 
-        return self.df_1m.copy()
+        return self.df_1m
 
     def build(self, interval: str, drop_incomplete: bool = True) -> pd.DataFrame:
         """
@@ -101,7 +106,8 @@ class KlineBuilder:
         pandas 推荐用 "5min"，不要用 "5m"。
         """
 
-        df = self.df_1m.copy()
+        # resample 不改写源帧，无需拷贝
+        df = self.df_1m
 
         agg_dict = {
             "open": "first",
@@ -125,8 +131,11 @@ class KlineBuilder:
 
         # 删除最后一根未完成K线
         if drop_incomplete:
-            last_1m_time = df.index.max()
-            kline = kline[kline["close_time"] <= last_1m_time]
+            # 最后一根 1m K线 open_time 为 t，覆盖区间 [t, t+1min)，
+            # 数据实际覆盖到 t + 1min。
+            # 直接用 close_time <= t 会把一根实际已完成的高周期K线误删。
+            data_end_time = df.index.max() + pd.Timedelta(minutes=1)
+            kline = kline[kline["close_time"] <= data_end_time]
 
         return kline
 

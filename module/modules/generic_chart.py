@@ -1,9 +1,10 @@
 import os
 import json
-from datetime import datetime, timezone
 
 from pyecharts.charts import Line, Grid, Kline, Bar, Scatter
 from pyecharts import options as opts
+
+from module.modules.file_naming import build_timestamped_filename
 
 
 LANG_TEXT = {
@@ -136,9 +137,21 @@ LANG_TEXT = {
 }
 
 
-def _t(language: str, key: str) -> str:
-    language = language if language in LANG_TEXT else "zh"
-    return LANG_TEXT[language].get(key, LANG_TEXT["zh"].get(key, key))
+def make_translator(table):
+    """
+    图表文案查找工厂：generic 与 portfolio 共用同一回退语义——
+    语言缺失回退 zh，键缺失回退 zh 的同键，再缺失回退键名，绝不抛 KeyError
+    （文案表漏一个键只应显示降级文本，不应让整次回测在出图环节崩溃）。
+    """
+
+    def translate(language: str, key: str) -> str:
+        lang_table = table.get(language) or table["zh"]
+        return lang_table.get(key, table["zh"].get(key, key))
+
+    return translate
+
+
+_t = make_translator(LANG_TEXT)
 
 
 def _to_str_time(x):
@@ -393,47 +406,63 @@ def _build_trade_points_from_position(df, x_data):
 
     return open_x, open_y, close_x, close_y
 
-def _inject_html_file_switcher(output_html_name: str, output_dir: str):
-    """
-    给 output_dir 下所有 HTML 文件同步注入/更新历史文件切换器。
-    这样切到旧 HTML 后，也能看到最新生成的 HTML 文件。
-    """
+# ---------------------------------------------------------
+# 历史图表切换器（manifest 方案）
+#
+# 文件清单只写进一个几 KB 的 manifest.js，每张图注入一段读取
+# manifest 的加载器（file:// 下 <script src> 不受 CORS 限制）。
+# 旧方案是每次出图把目录下所有历史 HTML 整读整写一遍——单文件
+# HTML 内嵌全部序列数据（MB~百 MB 级），代价随历史数量线性增长。
+# ---------------------------------------------------------
 
-    html_files = []
+_SWITCHER_MANIFEST_NAME = "qtbs_chart_manifest.js"
+_SWITCHER_START = "<!-- QTBS_MANIFEST_SWITCHER_START -->"
+_SWITCHER_END = "<!-- QTBS_MANIFEST_SWITCHER_END -->"
+_LEGACY_SWITCHER_START = "<!-- QTBS_HTML_FILE_SWITCHER_START -->"
+_LEGACY_SWITCHER_END = "<!-- QTBS_HTML_FILE_SWITCHER_END -->"
 
-    if os.path.exists(output_dir):
-        for filename in os.listdir(output_dir):
-            if filename.endswith(".html"):
-                file_path = os.path.join(output_dir, filename)
-                html_files.append({
-                    "name": filename,
-                    "path": file_path,
-                    "mtime": os.path.getmtime(file_path)
-                })
+# 进程内已做过旧格式迁移的目录：迁移是一次 O(全部历史) 的读写，
+# 每个进程每个目录只做一次，之后出图只写 manifest + 新文件本身
+_MIGRATED_DIRS: set = set()
 
-    html_files.sort(key=lambda x: x["mtime"], reverse=True)
 
-    def build_switcher_html(current_filename: str) -> str:
-        options_html = ""
-
-        for item in html_files:
-            filename = item["name"]
-            selected = "selected" if filename == current_filename else ""
-            options_html += f'<option value="{filename}" {selected}>{filename}</option>\n'
-
-        return f"""
-<!-- QTBS_HTML_FILE_SWITCHER_START -->
+def _build_switcher_block() -> str:
+    return f"""
+{_SWITCHER_START}
+<script src="{_SWITCHER_MANIFEST_NAME}"></script>
 <div id="html-file-switcher">
-    <select id="html-file-select" onchange="switchHtmlFile(this.value)">
-        {options_html}
-    </select>
+    <select id="html-file-select" onchange="switchHtmlFile(this.value)"></select>
 </div>
 
 <script>
     function switchHtmlFile(filename) {{
-        if (!filename) return;
-        window.location.href = filename;
+        if (filename) window.location.href = filename;
     }}
+
+    (function () {{
+        var files = window.QTBS_CHART_FILES || [];
+        var select = document.getElementById("html-file-select");
+        var current = window.location.pathname.split(/[\\\\/]/).pop();
+        try {{ current = decodeURIComponent(current); }} catch (e) {{}}
+
+        var found = false;
+        files.forEach(function (name) {{
+            var option = document.createElement("option");
+            option.value = name;
+            option.textContent = name;
+            if (name === current) {{ option.selected = true; found = true; }}
+            select.appendChild(option);
+        }});
+
+        // 当前文件比 manifest 更新（极少见的竞态）时兜底显示自己
+        if (!found && current) {{
+            var option = document.createElement("option");
+            option.value = current;
+            option.textContent = current;
+            option.selected = true;
+            select.insertBefore(option, select.firstChild);
+        }}
+    }})();
 </script>
 
 <style>
@@ -467,39 +496,175 @@ def _inject_html_file_switcher(output_html_name: str, output_dir: str):
         border-color: #a8abb2;
     }}
 </style>
-<!-- QTBS_HTML_FILE_SWITCHER_END -->
+{_SWITCHER_END}
 """
 
-    for item in html_files:
-        html_path = item["path"]
-        current_filename = item["name"]
 
-        with open(html_path, "r", encoding="utf-8") as f:
-            html_text = f.read()
+def _apply_switcher_block(html_text: str) -> str:
+    """剥掉旧格式内嵌清单（如有），注入/替换 manifest 加载器（幂等）。"""
 
-        switcher_html = build_switcher_html(current_filename)
+    block = _build_switcher_block()
 
-        start_tag = "<!-- QTBS_HTML_FILE_SWITCHER_START -->"
-        end_tag = "<!-- QTBS_HTML_FILE_SWITCHER_END -->"
+    if _LEGACY_SWITCHER_START in html_text and _LEGACY_SWITCHER_END in html_text:
+        start = html_text.find(_LEGACY_SWITCHER_START)
+        end = html_text.find(_LEGACY_SWITCHER_END) + len(_LEGACY_SWITCHER_END)
+        html_text = html_text[:start] + html_text[end:]
 
-        if start_tag in html_text and end_tag in html_text:
-            start = html_text.find(start_tag)
-            end = html_text.find(end_tag) + len(end_tag)
-            html_text = html_text[:start] + switcher_html + html_text[end:]
-        else:
-            html_text = html_text.replace("</body>", switcher_html + "\n</body>")
+    if _SWITCHER_START in html_text and _SWITCHER_END in html_text:
+        start = html_text.find(_SWITCHER_START)
+        end = html_text.find(_SWITCHER_END) + len(_SWITCHER_END)
+        return html_text[:start] + block + html_text[end:]
 
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(html_text)
+    # 插在最后一个 </body> 前（首个可能落在内嵌数据里）
+    idx = html_text.rfind("</body>")
+    if idx != -1:
+        return html_text[:idx] + block + "\n" + html_text[idx:]
 
-def _make_html_responsive_and_multilingual(
-    html_path: str,
+    return html_text
+
+
+def _tail_contains(file_path: str, marker: str) -> bool:
+    """只读文件尾部探测标记是否存在。
+
+    切换器块注入在 </body> 前、离文件尾很近：不必为一次格式探测
+    把上百 MB 的单文件 HTML 整个读进内存。
+    """
+
+    size = os.path.getsize(file_path)
+
+    with open(file_path, "rb") as f:
+        f.seek(max(0, size - 262_144))
+        return marker.encode("utf-8") in f.read()
+
+
+def _sync_chart_history(output_dir: str):
+    """
+    维护历史图表切换器。**绝不向上抛异常**：历史目录里的脏文件、
+    编码异常或文件占用，不应让已经成功完成的回测与出图被报告为失败。
+
+    1. 重写 manifest.js（全部 HTML 文件名，按 mtime 新→旧）
+    2. 首次调用时把含旧格式标记的自家文件迁移到 manifest 加载器
+       （每进程每目录一次；逐文件异常隔离；只动带 QTBS 旧标记的文件，
+       外来 HTML 不改写）
+
+    新生成的 HTML 由调用方在写盘前用 _apply_switcher_block 注入，
+    到这里已是新格式，迁移循环的尾部探测会直接跳过它。
+    """
+
+    html_files = []
+
+    if os.path.exists(output_dir):
+        for filename in os.listdir(output_dir):
+            if not filename.endswith(".html"):
+                continue
+            file_path = os.path.join(output_dir, filename)
+            try:
+                html_files.append((filename, os.path.getmtime(file_path)))
+            except OSError:
+                continue  # listdir 与 stat 之间被删除等竞态
+
+    html_files.sort(key=lambda item: item[1], reverse=True)
+    names = [name for name, _ in html_files]
+
+    manifest_path = os.path.join(output_dir, _SWITCHER_MANIFEST_NAME)
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write(
+                "window.QTBS_CHART_FILES = "
+                + json.dumps(names, ensure_ascii=False) + ";"
+            )
+    except OSError as e:
+        # manifest 写失败：新图表的切换器会退化为只显示自身，不致命
+        print(f"历史图表清单写入失败（不影响本次出图）: {e}")
+
+    dir_key = os.path.abspath(output_dir)
+    if dir_key in _MIGRATED_DIRS:
+        return
+
+    for name in names:
+        file_path = os.path.join(output_dir, name)
+
+        try:
+            if _tail_contains(file_path, _SWITCHER_START):
+                continue  # 已是新格式
+
+            # 只迁移带 QTBS 旧标记的自家文件：
+            # 用户存进目录的外来 HTML 不应被改写内容
+            if not _tail_contains(file_path, _LEGACY_SWITCHER_START):
+                continue
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                old_text = f.read()
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(_apply_switcher_block(old_text))
+        except (OSError, UnicodeError) as e:
+            # 单个坏文件（占用锁定/编码异常）跳过，不阻断其余迁移与本次出图
+            print(f"历史图表迁移跳过 {name}: {e}")
+            continue
+
+    _MIGRATED_DIRS.add(dir_key)
+
+# 全屏自适应样式：generic 与 portfolio 图表共用。
+# .chart-container 是 pyecharts 生成的容器类名——若升级 pyecharts 后
+# 图表白屏/裁切，只需要改这一处，两类图表同时生效。
+FULLSCREEN_CSS = """
+<style>
+html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #ffffff;
+}
+
+.chart-container {
+    width: 100vw !important;
+    height: 100vh !important;
+}
+</style>
+"""
+
+# 仅供不带多语言面板的最小注入路径（portfolio 图表）使用；
+# generic 图表的 resize 监听在多语言脚本内（语言切换后需要重绘）
+RESIZE_JS = """
+<script>
+window.addEventListener("resize", function() {
+    setTimeout(function() {
+        if (typeof echarts === "undefined") return;
+        document.querySelectorAll("div[_echarts_instance_]").forEach(function(dom) {
+            var chart = echarts.getInstanceByDom(dom);
+            if (chart) chart.resize();
+        });
+    }, 100);
+});
+</script>
+"""
+
+
+def _apply_responsive(html: str) -> str:
+    """全屏 CSS + 窗口缩放跟随（不带多语言面板的最小版本，纯文本变换）。"""
+
+    # </head> 取首个、</body> 取最后一个且只插一处：内嵌的序列数据里
+    # 若出现同名字面量，replace 全替换会把 CSS/JS 重复注入到数据中间
+    if "</head>" in html:
+        html = html.replace("</head>", FULLSCREEN_CSS + "\n</head>", 1)
+
+    idx = html.rfind("</body>")
+    if idx != -1:
+        html = html[:idx] + RESIZE_JS + "\n" + html[idx:]
+
+    return html
+
+
+def _apply_responsive_and_multilingual(
+    html: str,
     default_language: str = "zh",
     symbol: str = "",
     interval: str = ""
-):
-    with open(html_path, "r", encoding="utf-8") as f:
-        html = f.read()
+) -> str:
+    """全屏自适应 + 多语言面板（纯文本变换，由调用方统一读写文件）。"""
 
     language_options = ""
     for code, info in LANG_TEXT.items():
@@ -517,22 +682,8 @@ def _make_html_responsive_and_multilingual(
 
 
 
-    css = """
+    css = FULLSCREEN_CSS + """
 <style>
-html, body {
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    padding: 0;
-    overflow: hidden;
-    background: #ffffff;
-}
-
-.chart-container {
-    width: 100vw !important;
-    height: 100vh !important;
-}
-
 #qtbs-language-panel {
     position: fixed;
     top: 10px;
@@ -785,16 +936,19 @@ window.addEventListener("resize", function() {{
 </script>
 """
 
+    # 与 _apply_responsive 同理：定位单一插入点，避免数据中的同名
+    # 字面量被 replace 全替换造成重复注入
     if "</head>" in html:
-        html = html.replace("</head>", css + "\n</head>")
+        html = html.replace("</head>", css + "\n</head>", 1)
 
     if "<body>" in html:
-        html = html.replace("<body>", "<body>\n" + js)
-    elif "</body>" in html:
-        html = html.replace("</body>", js + "\n</body>")
+        html = html.replace("<body>", "<body>\n" + js, 1)
+    else:
+        idx = html.rfind("</body>")
+        if idx != -1:
+            html = html[:idx] + js + "\n" + html[idx:]
 
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    return html
 
 
 def plot_generic_equity_curves(
@@ -822,9 +976,9 @@ def plot_generic_equity_curves(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    utc_now = datetime.now(timezone.utc)
-    utc_timestamp_str = utc_now.strftime("%Y-%m-%d_%H-%M-%S_UTC")
-    output_html_name = os.path.join(output_dir, f"{file_prefix}_{utc_timestamp_str}.html")
+    output_html_name = os.path.join(
+        output_dir, build_timestamped_filename(file_prefix, ".html")
+    )
 
     symbol, interval = _infer_symbol_interval(result, file_prefix)
     chart_title = _build_chart_title(result, file_prefix, language, title)
@@ -1075,14 +1229,23 @@ def plot_generic_equity_curves(
 
     grid.render(output_html_name)
 
-    _inject_html_file_switcher(output_html_name, output_dir)
+    # 单次读写完成全部后处理：历史切换器 + 全屏自适应 + 多语言
+    # （1m 级单文件 HTML 可达上百 MB，多一轮读写就多一份磁盘往返）
+    with open(output_html_name, "r", encoding="utf-8") as f:
+        html = f.read()
 
-    _make_html_responsive_and_multilingual(
-        output_html_name,
+    html = _apply_switcher_block(html)
+    html = _apply_responsive_and_multilingual(
+        html,
         default_language=language,
         symbol=symbol,
         interval=interval,
     )
+
+    with open(output_html_name, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    _sync_chart_history(output_dir)
 
     print(f"回测图表已生成：{output_html_name}")
 

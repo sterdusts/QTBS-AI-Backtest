@@ -1,65 +1,29 @@
-import pandas as pd
-from module.modules.kline_builder import KlineBuilder
+"""
+标的归一化与本地 K 线数据文件辅助函数。
+
+历史上的多周期加载函数 load_real_kline 已被
+data_panel.load_symbol_kline（按需重采样 + 缓存）取代。
+"""
+
 import os
 
-def load_real_kline(symbol: str):
-    """
-    复用 main.py 的逻辑：
-    1. 检查本地是否有 1min K线
-    2. 没有就拉取
-    3. 读取 CSV
-    4. 构造多周期 K线
-    """
 
-    symbol = normalize_symbol(symbol)
+# 本地 K 线文件命名的唯一出处：下载器写文件、路径查找读文件、目录扫描
+# 匹配文件三方共用同一套。任何一处单独改动都会让「下载成功但读取
+# FileNotFoundError、且 has_kline_data 永远 False 导致每次回测重新全量
+# 下载」——所以不要在别处再手写这个后缀。
+KLINE_FILE_SUFFIX = "_1MIN_data.csv"
 
-    if has_kline_data(symbol):
-        print(f"已获取 {symbol} 数据")
-    else:
-        print(f"正在拉取 {symbol} 数据")
-        Obtain_K(symbol)
 
-    file_path = get_kline_file_path(symbol)
-    raw_df = pd.read_csv(file_path)
-
-    print("原始数据读取完成")
-    print(raw_df.head())
-    print(raw_df.tail())
-
-    builder = KlineBuilder(raw_df)
-
-    print("正在构造K线")
-
-    df_1m = builder.get_1m()
-    df_5m = builder.build("5min")
-    df_15m = builder.build("15min")
-    df_1h = builder.build("1h")
-    df_4h = builder.build("4h")
-    df_1d = builder.build("1d")
-
-    print("K线构造完成")
-
-    return {
-        "1m": df_1m,
-        "5m": df_5m,
-        "15m": df_15m,
-        "1h": df_1h,
-        "4h": df_4h,
-        "1d": df_1d,
-    }
+def kline_file_name(symbol: str) -> str:
+    return f"{normalize_symbol(symbol)}{KLINE_FILE_SUFFIX}"
 
 
 def get_kline_file_path(
     symbol: str,
-    interval: str = "1MIN",
     data_dir: str = "cryptocurrency_data/kline_data"
 ) -> str:
-    symbol = normalize_symbol(symbol)
-
-    file_name = f"{symbol}_{interval}_data.csv"
-    file_path = os.path.join(data_dir, file_name)
-
-    return file_path
+    return os.path.join(data_dir, kline_file_name(symbol))
 
 
 def normalize_symbol(user_input: str, quote: str = "USDT") -> str:
@@ -96,33 +60,33 @@ def get_base_asset(symbol: str, quote: str = "USDT") -> str:
     return symbol
 
 
-def Obtain_K(symbol: str):
+def Obtain_K(symbol: str, save_dir: str = "cryptocurrency_data/kline_data"):
     """
     拉取K线数据。
 
     注意：
-    data_acquisition(stock=...) 接收 BTC / ETH 这种基础币种。
-    如果它内部会自己拼接 USDT，这里就传 base_asset。
+    1. data_acquisition(stock=...) 接收 BTC / ETH 这种基础币种。
+    2. save_dir 必须与调用方读取数据的目录一致：
+       data_acquisition 自己的默认值是 "kline_data"（相对 CWD），
+       不透传会导致数据下载到错误位置，读取时 FileNotFoundError。
     """
 
     from cryptocurrency_data.obtain_K_data import data_acquisition
 
     base_asset = get_base_asset(symbol)
-    data_acquisition(stock=base_asset)
+
+    data_acquisition(
+        stock=base_asset,
+        save_dir=save_dir,
+    )
 
 
 def has_kline_data(
     symbol: str,
-    interval: str = "1MIN",
     data_dir: str = "cryptocurrency_data/kline_data"
 ) -> bool:
     """
     检查本地是否存在某个币种的K线数据文件。
     """
 
-    symbol = normalize_symbol(symbol)
-
-    file_name = f"{symbol}_{interval}_data.csv"
-    file_path = os.path.join(data_dir, file_name)
-
-    return os.path.exists(file_path)
+    return os.path.exists(get_kline_file_path(symbol, data_dir=data_dir))

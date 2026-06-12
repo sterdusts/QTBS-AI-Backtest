@@ -1,15 +1,28 @@
-import os
 import re
 import math
+import html
 from datetime import datetime, timezone
 
 import gradio as gr
 from module.AI.deepseek_strategy_reviewer import review_strategy_code_with_deepseek
 from module.AI.deepseek_code_generator import generate_strategy_code_with_deepseek
-from module.Strategy.strategy_loader import save_strategy_code, load_strategy_func
-from module.modules.Load_real_kline import load_real_kline, normalize_symbol
+from module.Strategy.strategy_loader import (
+    load_strategy_func_from_code,
+    parse_strategy_metadata,
+    save_strategy_code_audit,
+    validate_strategy_metadata,
+)
+from module.modules.Load_real_kline import normalize_symbol
 from module.modules.code_backtest_core import CodeBacktestCore
+from module.modules.portfolio_backtest_core import PortfolioBacktestCore
+from module.modules.data_panel import (
+    filter_df_by_date,
+    list_local_symbols,
+    load_aligned_panel,
+    load_symbol_kline,
+)
 from module.modules.generic_chart import plot_generic_equity_curves
+from module.modules.portfolio_chart import plot_portfolio_result
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -52,6 +65,8 @@ UI_TEXTS = {
         "market_choice": "加密货币",
         "symbol_label": "交易标的",
         "symbol_placeholder": "不输入默认 BTC，例如 BTC / ETH / SOL",
+        "param_priority_short": "参数优先级：标的以代码声明优先，其余以本面板为准",
+        "param_priority_note": "策略代码声明了标的（SYMBOLS，多标的对冲/组合必然如此）时，交易标的以代码为准、上方输入不生效；周期、回测时间、资金、杠杆、仓位、费率、滑点始终以本面板为准；策略内部参数（回看长度、阈值等）以代码为准。",
         "timeframe_label": "时间周期",
         "start_label": "起始时间",
         "end_label": "结束时间",
@@ -78,7 +93,6 @@ UI_TEXTS = {
         "invalid_position_size_error": "仓位比例必须在 0 到 100 之间。",
         "invalid_fee_rate_error": "手续费率不能小于 0。请输入 0 或正数，例如 0.05 表示 0.05%，也就是万分之五。",
         "invalid_slippage_error": "滑点不能小于 0。请输入 0 或正数，例如 0.02 表示 0.02%。",
-        "timeframe_not_found_error": "找不到 {symbol} 的 {timeframe} K线数据。当前可用周期：{keys}",
         "too_few_klines_error": "过滤后的 K线数量太少，当前只有 {count} 条。请扩大时间范围。",
     },
     "ko": {
@@ -95,6 +109,8 @@ UI_TEXTS = {
         "market_choice": "암호화폐",
         "symbol_label": "거래 종목",
         "symbol_placeholder": "입력하지 않으면 기본값은 BTC입니다. 예: BTC / ETH / SOL",
+        "param_priority_short": "우선순위: 코드에 선언된 종목이 우선, 나머지는 이 패널 기준",
+        "param_priority_note": "전략 코드에 종목(SYMBOLS)이 선언된 경우(멀티 종목 헤지/포트폴리오는 항상 해당) 코드의 종목이 우선하며 위의 거래 종목 입력은 무시됩니다. 주기·백테스트 기간·자금·레버리지·포지션 비율·수수료·슬리피지는 항상 이 패널 기준이고, 전략 내부 파라미터(룩백 길이, 임계값 등)는 코드 기준입니다.",
         "timeframe_label": "시간 주기",
         "start_label": "시작 시간",
         "end_label": "종료 시간",
@@ -121,7 +137,6 @@ UI_TEXTS = {
         "invalid_position_size_error": "포지션 비율은 0에서 100 사이여야 합니다.",
         "invalid_fee_rate_error": "수수료율은 0보다 작을 수 없습니다. 0 또는 양수를 입력하세요. 예: 0.05는 0.05%, 즉 0.0005를 의미합니다.",
         "invalid_slippage_error": "슬리피지는 0보다 작을 수 없습니다. 0 또는 양수를 입력하세요. 예: 0.02는 0.02%를 의미합니다.",
-        "timeframe_not_found_error": "{symbol}의 {timeframe} K라인 데이터를 찾을 수 없습니다. 현재 사용 가능한 주기: {keys}",
         "too_few_klines_error": "필터링 후 K라인 수가 너무 적습니다. 현재 {count}개입니다. 기간을 넓혀 주세요.",
     },
     "en": {
@@ -138,6 +153,8 @@ Generate strategy code first, then run the backtest.
         "market_choice": "Cryptocurrency",
         "symbol_label": "Trading Symbol",
         "symbol_placeholder": "If empty, default is BTC. Example: BTC / ETH / SOL",
+        "param_priority_short": "Precedence: code-declared symbols win; everything else uses this panel",
+        "param_priority_note": "When the strategy code declares symbols (SYMBOLS — always the case for multi-symbol hedge/portfolio strategies), the code wins and the Trading Symbol field above is ignored. Timeframe, date range, capital, leverage, position size, fee and slippage always come from this panel; strategy-internal parameters (lookback, thresholds, etc.) come from the code.",
         "timeframe_label": "Timeframe",
         "start_label": "Start Time",
         "end_label": "End Time",
@@ -164,7 +181,6 @@ Generate strategy code first, then run the backtest.
         "invalid_position_size_error": "Position size must be between 0 and 100.",
         "invalid_fee_rate_error": "Fee rate cannot be less than 0. Enter 0 or a positive number. Example: 0.05 means 0.05%, equal to 0.0005.",
         "invalid_slippage_error": "Slippage cannot be less than 0. Enter 0 or a positive number. Example: 0.02 means 0.02%.",
-        "timeframe_not_found_error": "Cannot find {timeframe} K-line data for {symbol}. Available timeframes: {keys}",
         "too_few_klines_error": "Too few K-lines after filtering. Current count: {count}. Please expand the time range.",
     },
     "ja": {
@@ -181,6 +197,8 @@ Generate strategy code first, then run the backtest.
         "market_choice": "暗号資産",
         "symbol_label": "取引銘柄",
         "symbol_placeholder": "未入力の場合は BTC がデフォルトです。例：BTC / ETH / SOL",
+        "param_priority_short": "優先順位：コード宣言の銘柄が優先、その他は本パネル基準",
+        "param_priority_note": "戦略コードに銘柄（SYMBOLS）が宣言されている場合（マルチ銘柄のヘッジ/ポートフォリオでは必ず宣言されます）、コード内の銘柄が優先され、上の取引銘柄欄は無視されます。時間足・期間・資金・レバレッジ・ポジション比率・手数料・スリッページは常に本パネルの設定が適用され、戦略内部のパラメータ（ルックバック、しきい値など）はコードに従います。",
         "timeframe_label": "時間足",
         "start_label": "開始時間",
         "end_label": "終了時間",
@@ -207,7 +225,6 @@ Generate strategy code first, then run the backtest.
         "invalid_position_size_error": "ポジション比率は 0 から 100 の間である必要があります。",
         "invalid_fee_rate_error": "手数料率は 0 未満にできません。0 または正の数を入力してください。例：0.05 は 0.05%、つまり 0.0005 を意味します。",
         "invalid_slippage_error": "スリッページは 0 未満にできません。0 または正の数を入力してください。例：0.02 は 0.02% を意味します。",
-        "timeframe_not_found_error": "{symbol} の {timeframe} K線データが見つかりません。利用可能な時間足：{keys}",
         "too_few_klines_error": "フィルタ後のK線数が少なすぎます。現在 {count} 本です。期間を広げてください。",
     },
     "ar": {
@@ -224,6 +241,8 @@ Generate strategy code first, then run the backtest.
         "market_choice": "العملات المشفرة",
         "symbol_label": "رمز التداول",
         "symbol_placeholder": "إذا تُرك فارغًا فالقيمة الافتراضية هي BTC. مثال: BTC / ETH / SOL",
+        "param_priority_short": "الأولوية: رموز الكود أولاً، والباقي من هذه اللوحة",
+        "param_priority_note": "عندما يعلن كود الاستراتيجية الرموز (SYMBOLS — وهذا دائمًا حال استراتيجيات التحوط/المحافظ متعددة الرموز) تكون الأولوية للكود ويتم تجاهل حقل رمز التداول أعلاه. الإطار الزمني وفترة الاختبار ورأس المال والرافعة ونسبة المركز والرسوم والانزلاق تُؤخذ دائمًا من هذه اللوحة؛ أما المعاملات الداخلية للاستراتيجية (فترة النظر، العتبات...) فمن الكود.",
         "timeframe_label": "الإطار الزمني",
         "start_label": "وقت البداية",
         "end_label": "وقت النهاية",
@@ -250,7 +269,6 @@ Generate strategy code first, then run the backtest.
         "invalid_position_size_error": "يجب أن يكون حجم الصفقة بين 0 و 100.",
         "invalid_fee_rate_error": "لا يمكن أن تكون نسبة الرسوم أقل من 0. أدخل 0 أو رقمًا موجبًا. مثال: 0.05 يعني 0.05%، أي 0.0005.",
         "invalid_slippage_error": "لا يمكن أن يكون الانزلاق السعري أقل من 0. أدخل 0 أو رقمًا موجبًا. مثال: 0.02 يعني 0.02%.",
-        "timeframe_not_found_error": "لا يمكن العثور على بيانات K-line للإطار {timeframe} للرمز {symbol}. الأطر المتاحة: {keys}",
         "too_few_klines_error": "عدد شموع K-line بعد التصفية قليل جدًا. العدد الحالي: {count}. يرجى توسيع الفترة الزمنية.",
     },
     "ru": {
@@ -267,6 +285,8 @@ Generate strategy code first, then run the backtest.
         "market_choice": "Криптовалюта",
         "symbol_label": "Торговый инструмент",
         "symbol_placeholder": "Если не указано, по умолчанию BTC. Например: BTC / ETH / SOL",
+        "param_priority_short": "Приоритет: символы из кода важнее; остальное — из панели",
+        "param_priority_note": "Если код стратегии объявляет инструменты (SYMBOLS — для мультиактивных хедж/портфельных стратегий это всегда так), приоритет у кода, а поле «Торговый инструмент» выше игнорируется. Таймфрейм, период, капитал, плечо, доля позиции, комиссия и проскальзывание всегда берутся из этой панели; внутренние параметры стратегии (окно, пороги и т.д.) — из кода.",
         "timeframe_label": "Таймфрейм",
         "start_label": "Начальное время",
         "end_label": "Конечное время",
@@ -293,7 +313,6 @@ Generate strategy code first, then run the backtest.
         "invalid_position_size_error": "Размер позиции должен быть от 0 до 100.",
         "invalid_fee_rate_error": "Комиссия не может быть меньше 0. Введите 0 или положительное число. Например: 0.05 означает 0.05%, то есть 0.0005.",
         "invalid_slippage_error": "Проскальзывание не может быть меньше 0. Введите 0 или положительное число. Например: 0.02 означает 0.02%.",
-        "timeframe_not_found_error": "Не найдены K-line данные {timeframe} для {symbol}. Доступные таймфреймы: {keys}",
         "too_few_klines_error": "После фильтрации осталось слишком мало K-line данных. Текущее количество: {count}. Расширьте временной диапазон.",
     },
 }
@@ -756,23 +775,35 @@ def validate_backtest_params(
     )
 
 
-def filter_df_by_date(df, start_str: str, end_str: str):
-    """
-    按 index 时间过滤 K线。
-    要求 df.index 是 DatetimeIndex。
-    """
-
-    if start_str:
-        df = df[df.index >= start_str]
-
-    if end_str:
-        df = df[df.index <= end_str]
-
-    return df
-
-
 def get_review_text(lang_code: str) -> dict:
     return REVIEW_TEXTS.get(lang_code, REVIEW_TEXTS["zh"])
+
+
+def resolve_strategy_route(strategy_code: str, ui_symbol: str):
+    """
+    根据策略代码元数据决定回测路由。
+
+    返回 (contract_version, symbols)：
+    - v2：使用代码中声明的 SYMBOLS（必须存在）
+    - v1：代码点名了标的就用代码的，否则用 UI 选择的标的
+    """
+
+    metadata = parse_strategy_metadata(strategy_code)
+
+    # 版本与 SYMBOLS 组合规则单源在 strategy_loader.validate_strategy_metadata
+    # （与生成侧共用）：未知版本、v2 缺 SYMBOLS/格式不规范、v1 多标的都在此拒绝
+    validate_strategy_metadata(metadata)
+
+    if metadata["contract_version"] == 2:
+        # 策略代码内部按 SYMBOLS 原样引用面板键与权重列，
+        # 这里只去重（保持顺序），不做静默改写
+        return 2, list(dict.fromkeys(metadata["symbols"]))
+
+    # v1：校验保证 SYMBOLS 至多一个，不存在静默截断
+    if metadata["symbols"]:
+        return 1, [normalize_symbol(metadata["symbols"][0])]
+
+    return 1, [normalize_symbol(ui_symbol)]
 
 
 def clamp_score(value) -> float:
@@ -795,7 +826,8 @@ def build_review_html(review: dict | None, lang_code: str = "zh") -> str:
         """
 
     match_score = clamp_score(review.get("match_score", 0))
-    match_summary = review.get("match_summary", "")
+    # AI 返回的文本插入 HTML 前必须转义，防止内容里的 < > & 破坏页面结构
+    match_summary = html.escape(str(review.get("match_summary", "")))
 
     return f"""
     <div class="review-card">
@@ -883,6 +915,23 @@ def build_backtest_summary(
 # UI 文案动态更新
 # =========================================================
 
+def build_param_priority_html(text: dict) -> str:
+    """一行简短声明 + 悬停感叹号展开详情（纯 CSS 气泡，不依赖 JS）。"""
+
+    short = html.escape(text["param_priority_short"])
+    detail = html.escape(text["param_priority_note"])
+
+    return (
+        '<div id="param-priority-note">'
+        f"<span>{short}</span>"
+        '<span class="qtbs-tooltip">'
+        '<span class="qtbs-tooltip-icon">!</span>'
+        f'<span class="qtbs-tooltip-text">{detail}</span>'
+        "</span>"
+        "</div>"
+    )
+
+
 def update_ui_language(lang_code: str):
     text = get_ui_text(lang_code)
 
@@ -909,6 +958,7 @@ def update_ui_language(lang_code: str):
         gr.update(
             label=text["timeframe_label"],
         ),
+        build_param_priority_html(text),
         gr.update(
             label=text["start_label"],
         ),
@@ -1017,6 +1067,7 @@ def generate_code_from_ui(
             initial_cash=initial_cash_value,
             fee_rate_percent=fee_rate_percent_value,
             slippage_percent=slippage_percent_value,
+            available_symbols=list_local_symbols(),
         )
 
         try:
@@ -1112,32 +1163,16 @@ def run_backtest_from_ui(
         slippage_value = slippage_percent_value / 100
         position_size_value = position_size_percent_value / 100
 
-        # 1. 保存并加载策略函数
-        save_strategy_code(strategy_code)
-        strategy_func = load_strategy_func()
+        # 1. 解析契约元数据决定路由（v1 单标的 / v2 组合），
+        #    校验并从内存加载策略函数（不经过共享文件，并发安全），
+        #    同时把实际参与回测的代码留档到 Past_data/strategy_code/ 便于追溯
+        route_version, route_symbols = resolve_strategy_route(strategy_code, symbol)
+        strategy_func = load_strategy_func_from_code(strategy_code)
+        save_strategy_code_audit(strategy_code)
 
-        # 2. 加载真实 K 线
-        kline_data = load_real_kline(symbol)
-
-        if timeframe not in kline_data:
-            return text["timeframe_not_found_error"].format(
-                symbol=symbol,
-                timeframe=timeframe,
-                keys=list(kline_data.keys()),
-            ), None
-
-        df = kline_data[timeframe].copy()
-
-        # 3. 按时间过滤
-        df = filter_df_by_date(df, start_str, end_str)
-
-        if len(df) < 100:
-            return text["too_few_klines_error"].format(
-                count=len(df),
-            ), None
-
-        # 4. 运行回测
-        backtester = CodeBacktestCore(
+        # 两个引擎共享同一组参数：只在这里定义一次，
+        # 新增参数时不会出现 v1/v2 分支漏改一边的静默分叉
+        engine_kwargs = dict(
             strategy_func=strategy_func,
             initial_cash=initial_cash_value,
             fee_rate=fee_rate_value,
@@ -1146,29 +1181,64 @@ def run_backtest_from_ui(
             position_size=position_size_value,
         )
 
-        result = backtester.run(df)
+        # ---- 按版本只加载数据；数据充分性标准共用一份，v1/v2 不会各自漂移 ----
+
+        if route_version == 2:
+            # 日期过滤下沉到 load_aligned_panel 内部、对齐之前执行：
+            # 避免先对全历史做 union 对齐、再把窗口外的行全部丢弃
+            data = load_aligned_panel(
+                route_symbols, timeframe,
+                start_date=start_str, end_date=end_str,
+            )
+            kline_count = len(next(iter(data.values())))
+            display_symbol = " + ".join(route_symbols)
+        else:
+            symbol = route_symbols[0]
+            df = load_symbol_kline(symbol, timeframe)
+            df = filter_df_by_date(df, start_str, end_str)
+            kline_count = len(df)
+            display_symbol = symbol
+
+        if kline_count < 100:
+            return text["too_few_klines_error"].format(count=kline_count), None
+
+        # ---- 跑引擎、出图：分支体只保留真正不同的部分 ----
+
+        if route_version == 2:
+            result = PortfolioBacktestCore(**engine_kwargs).run(data)
+
+            base_names = "_".join(s.replace("USDT", "") for s in route_symbols[:4])
+            html_path = plot_portfolio_result(
+                result=result,
+                output_dir="Past_data",
+                file_prefix=f"{base_names}_{timeframe}_webui_portfolio",
+                timeframe=timeframe,
+                language=output_language,
+                auto_open=True,
+            )
+        else:
+            result = CodeBacktestCore(**engine_kwargs).run(df)
+
+            html_path = plot_generic_equity_curves(
+                result=result,
+                output_dir="Past_data",
+                file_prefix=f"{symbol}_{timeframe}_webui_code_strategy",
+                auto_open=True,
+                language=output_language,
+            )
+
         metrics = result["metrics"]
-
-        # 5. 生成图表
-        html_path = plot_generic_equity_curves(
-            result=result,
-            output_dir="Past_data",
-            file_prefix=f"{symbol}_{timeframe}_webui_code_strategy",
-            title=f"{symbol} {timeframe} AI代码策略回测净值曲线",
-            auto_open=True,
-        )
-
         chart_path = html_path if html_path else summary_text["chart_path_missing"]
 
         summary = build_backtest_summary(
             metrics=metrics,
             lang_code=output_language,
             market=market,
-            symbol=symbol,
+            symbol=display_symbol,
             timeframe=timeframe,
             start_str=start_str,
             end_str=end_str,
-            kline_count=len(df),
+            kline_count=kline_count,
             leverage_value=leverage_value,
             effective_leverage_value=effective_leverage_value,
             position_size_percent_value=position_size_percent_value,
@@ -1191,6 +1261,79 @@ custom_css = """
 #main-container {
     max-width: 1500px;
     margin: 0 auto;
+}
+
+/* 气泡是绝对定位的后代元素：从组件到气泡的整条祖先链都不能裁切，
+   否则悬停时只剩 help 光标、看不到内容 */
+#param-priority-wrap,
+#param-priority-wrap .html-container,
+#param-priority-wrap .prose {
+    overflow: visible !important;
+}
+
+#param-priority-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: #8a8f99;
+    margin: 0 0 4px 2px;
+}
+
+/* 防溢出的裁切只作用于短句文本本身，不碰气泡所在的兄弟节点 */
+#param-priority-note > span:first-child {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.qtbs-tooltip {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+}
+
+.qtbs-tooltip-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    border: 1px solid #a8abb2;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
+    color: #8a8f99;
+    cursor: help;
+    user-select: none;
+}
+
+.qtbs-tooltip .qtbs-tooltip-text {
+    visibility: hidden;
+    opacity: 0;
+    position: absolute;
+    top: 130%;
+    right: -8px;
+    z-index: 1000;
+    width: 360px;
+    max-width: 70vw;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(40, 44, 52, 0.96);
+    color: #f0f2f5;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: normal;
+    text-align: start;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+    transition: opacity 0.15s ease;
+    pointer-events: none;
+}
+
+.qtbs-tooltip:hover .qtbs-tooltip-text {
+    visibility: visible;
+    opacity: 1;
 }
 
 #top-bar {
@@ -1414,6 +1557,11 @@ with gr.Blocks(
 
             with gr.Column(scale=3, min_width=420, elem_id="right-panel"):
 
+                param_priority_note = gr.HTML(
+                    build_param_priority_html(default_text),
+                    elem_id="param-priority-wrap",
+                )
+
                 market_select = gr.Dropdown(
                     label=default_text["market_label"],
                     choices=[(default_text["market_choice"], "crypto")],
@@ -1552,6 +1700,7 @@ with gr.Blocks(
                 market_select,
                 symbol_input,
                 timeframe_select,
+                param_priority_note,
                 start_date,
                 end_date,
                 initial_cash_input,

@@ -1,10 +1,19 @@
 import pandas as pd
 import numpy as np
 
+from module.modules.backtest_metrics import (
+    attach_engine_metrics,
+    calculate_holding_hours,
+    calculate_metrics,
+)
+
 
 class CodeBacktestCore:
     """
     代码策略回测核心。
+
+    执行语义与 AI↔引擎契约见项目根目录 STRATEGY_CONTRACT.md。
+    修改本引擎的执行语义，必须同步契约文档与 tests/ 金样例测试。
 
     strategy_func(df) 只负责生成 target_position：
         1  = 做多
@@ -46,13 +55,32 @@ class CodeBacktestCore:
         self.position_size = min(max(self.position_size, 0.0), 1.0)
 
         self.enable_liquidation = bool(enable_liquidation)
-        self.maintenance_margin_rate = max(float(maintenance_margin_rate), 0.0)
+        # rate ≥ 1 没有意义（开仓即触线）且会让强平价公式除零，截到 1 以下
+        self.maintenance_margin_rate = min(max(float(maintenance_margin_rate), 0.0), 0.99)
         self.stop_on_liquidation = bool(stop_on_liquidation)
         self.liquidation_fee_rate = max(float(liquidation_fee_rate), 0.0)
 
     def run(self, df: pd.DataFrame) -> dict:
-        df = df.copy()
-        df = self.strategy_func(df)
+        # 浅拷贝即可防策略篡改：pandas 写时复制下任何写入只复制被改的块
+        df = df.copy(deep=False)
+
+        try:
+            df = self.strategy_func(df)
+        except KeyError as e:
+            # v2 策略（按标的名访问数据面板）被错误路由进 v1 时最典型的炸点。
+            # 只有缺的键长得像交易对时才提示版本声明，避免把策略自身的
+            # 普通 KeyError（dict 键拼错等）错误归因到契约路由上
+            key = e.args[0] if e.args else None
+            if isinstance(key, str) and key.upper().endswith("USDT"):
+                raise ValueError(
+                    f"策略函数按标的名取数据失败（KeyError: {e}）。"
+                    "多标的策略（契约 v2）必须声明 CONTRACT_VERSION = 2，"
+                    "否则会被按单标的 v1 路由。"
+                ) from e
+            raise ValueError(
+                f"策略代码访问了不存在的键/列（KeyError: {e}），"
+                "请检查策略引用的列名或字典键是否存在。"
+            ) from e
 
         if "target_position" not in df.columns:
             raise ValueError("策略函数必须生成 target_position 字段")
@@ -62,7 +90,17 @@ class CodeBacktestCore:
         if missing_columns:
             raise ValueError(f"回测数据缺少必要字段: {missing_columns}")
 
-        df["target_position"] = df["target_position"].fillna(0).astype(int)
+        # 合法值校验必须在整数转换之前：astype(int) 会把 0.5 向零截断成
+        # 合法的 0、把 inf 炸成晦涩的 pandas 转换错误，校验就形同虚设
+        raw_target = df["target_position"].fillna(0)
+        invalid_mask = ~raw_target.isin([-1, 0, 1])
+        if invalid_mask.any():
+            invalid_values = sorted(set(raw_target[invalid_mask].tolist()))
+            raise ValueError(
+                f"target_position 只能是 -1, 0, 1，发现非法值: {invalid_values}"
+            )
+
+        df["target_position"] = raw_target.astype(int)
 
         cash = self.initial_cash
 
@@ -85,17 +123,13 @@ class CodeBacktestCore:
         realized_equity = self.initial_cash
         liquidated = False
 
-        for i in range(1, len(df) - 1):
+        for i in range(len(df)):
             current_time = df.index[i]
-            next_time = df.index[i + 1]
-
             current_target = int(df["target_position"].iloc[i])
-            previous_target = int(df["target_position"].iloc[i - 1])
 
             high_price = float(df["high"].iloc[i])
             low_price = float(df["low"].iloc[i])
             close_price = float(df["close"].iloc[i])
-            next_open = float(df["open"].iloc[i + 1])
 
             mtm = self._calculate_mtm_equity(
                 cash=cash,
@@ -137,6 +171,7 @@ class CodeBacktestCore:
                     event=liquidation_event,
                     entry_time=entry_time,
                     position_side=position_side,
+                    position=position,
                     entry_price=entry_price,
                     entry_raw_price=entry_raw_price,
                     entry_equity=entry_equity,
@@ -215,10 +250,19 @@ class CodeBacktestCore:
                 "equity": float(realized_equity),
             })
 
-            if current_target == previous_target:
+            # 最后一根 K 线没有下一根开盘价，只做权益结算，不再执行交易
+            if i + 1 >= len(df):
+                break
+
+            # 目标仓位与实际持仓一致时无需交易。
+            # 与实际持仓比较（而不是与上一根信号比较），可以正确处理：
+            # 1. 首根 K 线即有信号的情况（旧逻辑永远不会开仓）
+            # 2. 开仓失败（资金不足等）后在后续 K 线重试
+            if current_target == position_side:
                 continue
 
-            execute_time = next_time
+            next_open = float(df["open"].iloc[i + 1])
+            execute_time = df.index[i + 1]
             exit_raw_price = next_open
 
             if position_side != 0:
@@ -251,10 +295,12 @@ class CodeBacktestCore:
                 entry_notional = None
                 entry_open_fee = None
 
-            if current_target == 1:
+            # target 合法性已在 run() 入口统一校验，此处只需区分开仓与否；
+            # 多空开仓除 side 外完全一致，合并为单一路径避免两份记账漂移
+            if current_target != 0:
                 open_result = self._open_position(
                     cash=cash,
-                    side=1,
+                    side=current_target,
                     raw_price=next_open,
                     execute_time=execute_time,
                 )
@@ -262,7 +308,7 @@ class CodeBacktestCore:
                 if open_result is not None:
                     cash = open_result["cash_after"]
                     position = open_result["position"]
-                    position_side = 1
+                    position_side = current_target
                     entry_price = open_result["entry_price"]
                     entry_raw_price = open_result["entry_raw_price"]
                     entry_time = open_result["entry_time"]
@@ -271,31 +317,38 @@ class CodeBacktestCore:
                     entry_notional = open_result["entry_notional"]
                     entry_open_fee = open_result["entry_open_fee"]
 
-            elif current_target == -1:
-                open_result = self._open_position(
-                    cash=cash,
-                    side=-1,
-                    raw_price=next_open,
-                    execute_time=execute_time,
-                )
+        # 回测结束时仍持仓：以最后收盘价虚拟结算，计入交易统计。
+        # 不产生真实成交、不改变现金与权益曲线，只是让 trade_count / 胜率
+        # 不再漏掉这笔仓位（否则会出现「0 笔交易却有收益」的自相矛盾报告）。
+        if position_side != 0 and len(df) > 0:
+            last_time = df.index[-1]
+            last_close = float(df["close"].iloc[-1])
 
-                if open_result is not None:
-                    cash = open_result["cash_after"]
-                    position = open_result["position"]
-                    position_side = -1
-                    entry_price = open_result["entry_price"]
-                    entry_raw_price = open_result["entry_raw_price"]
-                    entry_time = open_result["entry_time"]
-                    entry_equity = open_result["entry_equity"]
-                    entry_margin = open_result["entry_margin"]
-                    entry_notional = open_result["entry_notional"]
-                    entry_open_fee = open_result["entry_open_fee"]
+            equity_now = self._equity_at_price(
+                cash=cash,
+                position=position,
+                position_side=position_side,
+                entry_price=entry_price,
+                mark_price=last_close,
+            )
 
-            elif current_target == 0:
-                pass
-
-            else:
-                raise ValueError("target_position 只能是 -1, 0, 1")
+            trades.append(self._build_trade(
+                exit_reason="end_of_data",
+                position_side=position_side,
+                position=position,
+                entry_time=entry_time,
+                exit_time=last_time,
+                entry_price=entry_price,
+                exit_price=last_close,
+                entry_raw_price=entry_raw_price,
+                exit_raw_price=last_close,
+                entry_equity=entry_equity,
+                entry_margin=entry_margin,
+                entry_notional=entry_notional,
+                entry_open_fee=entry_open_fee,
+                close_fee=0.0,
+                equity_after=equity_now,
+            ))
 
         final_equity = equity_curve[-1]["equity_close"] if equity_curve else self.initial_cash
 
@@ -306,12 +359,7 @@ class CodeBacktestCore:
             final_equity=final_equity,
         )
 
-        metrics["leverage"] = self.leverage
-        metrics["position_size"] = self.position_size
-        metrics["enable_liquidation"] = self.enable_liquidation
-        metrics["maintenance_margin_rate"] = self.maintenance_margin_rate
-        metrics["liquidation_count"] = len(liquidation_events)
-        metrics["liquidated"] = bool(liquidated)
+        attach_engine_metrics(metrics, self, len(liquidation_events), liquidated)
 
         return {
             "df": df,
@@ -377,42 +425,80 @@ class CodeBacktestCore:
     ):
         if position_side == 1:
             exit_price = exit_raw_price * (1 - self.slippage)
-
-            raw_return = exit_raw_price / entry_raw_price - 1
-            gross_pnl = entry_notional * raw_return
-            gross_pnl_pct = gross_pnl / entry_equity * 100 if entry_equity else 0.0
-
             net_pnl_before_close_fee = position * (exit_price - entry_price)
-            close_notional = abs(position * exit_price)
-            close_fee = close_notional * self.fee_rate
-
-            cash_after = cash + net_pnl_before_close_fee - close_fee
-
         elif position_side == -1:
             exit_price = exit_raw_price * (1 + self.slippage)
-
-            raw_return = (entry_raw_price - exit_raw_price) / entry_raw_price
-            gross_pnl = entry_notional * raw_return
-            gross_pnl_pct = gross_pnl / entry_equity * 100 if entry_equity else 0.0
-
             net_pnl_before_close_fee = position * (entry_price - exit_price)
-            close_notional = abs(position * exit_price)
-            close_fee = close_notional * self.fee_rate
-
-            cash_after = cash + net_pnl_before_close_fee - close_fee
-
         else:
             raise ValueError("未知仓位方向")
 
-        net_pnl = cash_after - entry_equity
+        close_fee = abs(position * exit_price) * self.fee_rate
+        cash_after = cash + net_pnl_before_close_fee - close_fee
+
+        trade = self._build_trade(
+            exit_reason="signal",
+            position_side=position_side,
+            position=position,
+            entry_time=entry_time,
+            exit_time=execute_time,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            entry_raw_price=entry_raw_price,
+            exit_raw_price=exit_raw_price,
+            entry_equity=entry_equity,
+            entry_margin=entry_margin,
+            entry_notional=entry_notional,
+            entry_open_fee=entry_open_fee,
+            close_fee=close_fee,
+            equity_after=cash_after,
+        )
+
+        return {
+            "cash_after": float(cash_after),
+            "trade": trade,
+        }
+
+    def _build_trade(
+        self,
+        exit_reason,
+        position_side,
+        position,
+        entry_time,
+        exit_time,
+        entry_price,
+        exit_price,
+        entry_raw_price,
+        exit_raw_price,
+        entry_equity,
+        entry_margin,
+        entry_notional,
+        entry_open_fee,
+        close_fee,
+        equity_after,
+        extra=None,
+    ):
+        """
+        统一的成交记录构造器：signal / liquidation / end_of_data 三种收尾
+        共用同一字段集与同一 gross/net 口径，杜绝三处手写副本各自漂移。
+
+        gross = raw 价格口径的纯价格盈亏（不含滑点与手续费），与组合引擎同口径。
+        """
+
+        if position_side == 1:
+            gross_pnl = position * (exit_raw_price - entry_raw_price)
+        else:
+            gross_pnl = position * (entry_raw_price - exit_raw_price)
+
+        gross_pnl_pct = gross_pnl / entry_equity * 100 if entry_equity else 0.0
+
+        net_pnl = equity_after - entry_equity
         net_pnl_pct = net_pnl / entry_equity * 100 if entry_equity else 0.0
-        holding_hours = self._calculate_holding_hours(entry_time, execute_time)
 
         trade = {
             "entry_time": str(entry_time),
-            "exit_time": str(execute_time),
+            "exit_time": str(exit_time),
             "side": "long" if position_side == 1 else "short",
-            "exit_reason": "signal",
+            "exit_reason": exit_reason,
 
             "entry_price": float(entry_price),
             "exit_price": float(exit_price),
@@ -434,15 +520,15 @@ class CodeBacktestCore:
             "net_pnl": float(net_pnl),
             "net_pnl_pct": float(net_pnl_pct),
 
-            "holding_hours": float(holding_hours),
-            "equity_after": float(cash_after),
-            "liquidated": False,
+            "holding_hours": float(self._calculate_holding_hours(entry_time, exit_time)),
+            "equity_after": float(equity_after),
+            "liquidated": exit_reason == "liquidation",
         }
 
-        return {
-            "cash_after": float(cash_after),
-            "trade": trade,
-        }
+        if extra:
+            trade.update(extra)
+
+        return trade
 
     def _calculate_mtm_equity(
         self,
@@ -542,63 +628,52 @@ class CodeBacktestCore:
         if position_side == 0 or position <= 0:
             return None
 
-        liquidation_equity = entry_equity * self.maintenance_margin_rate
+        # 维持保证金 = rate × 当前名义价值（交易所惯例口径，与组合引擎一致）。
+        # 强平价是 equity(p) = rate × position × p 的解；
+        # rate = 0 时退化为旧公式 entry ∓ cash / position
+        rate = self.maintenance_margin_rate
 
         if position_side == 1:
-            liquidation_price = entry_price + (liquidation_equity - cash) / position
+            liquidation_price = (position * entry_price - cash) / (position * (1.0 - rate))
+            triggered = low_price <= liquidation_price
+            trigger_price, trigger_field = low_price, "low"
+        else:
+            liquidation_price = (position * entry_price + cash) / (position * (1.0 + rate))
+            triggered = high_price >= liquidation_price
+            trigger_price, trigger_field = high_price, "high"
 
-            if low_price <= liquidation_price:
-                return {
-                    "time": str(current_time),
-                    "side": "long",
-                    "entry_time": str(entry_time),
-                    "entry_price": float(entry_price),
-                    "entry_raw_price": float(entry_raw_price),
-                    "liquidation_price": float(liquidation_price),
-                    "trigger_price": float(low_price),
-                    "trigger_field": "low",
-                    "equity_before": float(entry_equity),
-                    "equity_after": float(max(liquidation_equity, 0.0)),
-                    "entry_margin": float(entry_margin),
-                    "entry_notional": float(entry_notional),
-                    "open_fee": float(entry_open_fee),
-                    "liquidation_fee": float(abs(position * liquidation_price) * self.liquidation_fee_rate),
-                    "leverage": int(self.leverage),
-                    "position_size": float(self.position_size),
-                    "maintenance_margin_rate": float(self.maintenance_margin_rate),
-                }
+        if not triggered:
+            return None
 
-        elif position_side == -1:
-            liquidation_price = entry_price - (liquidation_equity - cash) / position
+        # 触发时的权益恰好等于维持保证金线
+        liquidation_equity = rate * position * liquidation_price
 
-            if high_price >= liquidation_price:
-                return {
-                    "time": str(current_time),
-                    "side": "short",
-                    "entry_time": str(entry_time),
-                    "entry_price": float(entry_price),
-                    "entry_raw_price": float(entry_raw_price),
-                    "liquidation_price": float(liquidation_price),
-                    "trigger_price": float(high_price),
-                    "trigger_field": "high",
-                    "equity_before": float(entry_equity),
-                    "equity_after": float(max(liquidation_equity, 0.0)),
-                    "entry_margin": float(entry_margin),
-                    "entry_notional": float(entry_notional),
-                    "open_fee": float(entry_open_fee),
-                    "liquidation_fee": float(abs(position * liquidation_price) * self.liquidation_fee_rate),
-                    "leverage": int(self.leverage),
-                    "position_size": float(self.position_size),
-                    "maintenance_margin_rate": float(self.maintenance_margin_rate),
-                }
-
-        return None
+        return {
+            "time": str(current_time),
+            "side": "long" if position_side == 1 else "short",
+            "entry_time": str(entry_time),
+            "entry_price": float(entry_price),
+            "entry_raw_price": float(entry_raw_price),
+            "liquidation_price": float(liquidation_price),
+            "trigger_price": float(trigger_price),
+            "trigger_field": trigger_field,
+            "equity_before": float(entry_equity),
+            "equity_after": float(max(liquidation_equity, 0.0)),
+            "entry_margin": float(entry_margin),
+            "entry_notional": float(entry_notional),
+            "open_fee": float(entry_open_fee),
+            "liquidation_fee": float(abs(position * liquidation_price) * self.liquidation_fee_rate),
+            "leverage": int(self.leverage),
+            "position_size": float(self.position_size),
+            "maintenance_margin_rate": float(self.maintenance_margin_rate),
+        }
 
     def _build_liquidation_trade(
         self,
         event,
         entry_time,
         position_side,
+        position,
         entry_price,
         entry_raw_price,
         entry_equity,
@@ -610,78 +685,33 @@ class CodeBacktestCore:
         exit_raw_price,
         cash_after,
     ):
-        if position_side == 1:
-            raw_return = exit_raw_price / entry_raw_price - 1
-        elif position_side == -1:
-            raw_return = (entry_raw_price - exit_raw_price) / entry_raw_price
-        else:
-            raw_return = 0.0
-
-        gross_pnl = entry_notional * raw_return
-        gross_pnl_pct = gross_pnl / entry_equity * 100 if entry_equity else 0.0
-
-        net_pnl = cash_after - entry_equity
-        net_pnl_pct = net_pnl / entry_equity * 100 if entry_equity else 0.0
-
-        holding_hours = self._calculate_holding_hours(entry_time, exit_time)
-
-        return {
-            "entry_time": str(entry_time),
-            "exit_time": str(exit_time),
-            "side": "long" if position_side == 1 else "short",
-            "exit_reason": "liquidation",
-
-            "entry_price": float(entry_price),
-            "exit_price": float(exit_price),
-            "entry_raw_price": float(entry_raw_price),
-            "exit_raw_price": float(exit_raw_price),
-
-            "leverage": int(self.leverage),
-            "position_size": float(self.position_size),
-            "entry_margin": float(entry_margin),
-            "entry_notional": float(entry_notional),
-            "open_fee": float(entry_open_fee),
-            "close_fee": float(event.get("liquidation_fee", 0.0)),
-            "liquidation_fee": float(event.get("liquidation_fee", 0.0)),
-
-            "gross_pnl": float(gross_pnl),
-            "gross_pnl_pct": float(gross_pnl_pct),
-
-            "pnl": float(net_pnl),
-            "pnl_pct": float(net_pnl_pct),
-            "net_pnl": float(net_pnl),
-            "net_pnl_pct": float(net_pnl_pct),
-
-            "holding_hours": float(holding_hours),
-            "equity_after": float(cash_after),
-
-            "liquidated": True,
-            "liquidation_price": float(event["liquidation_price"]),
-            "trigger_price": float(event["trigger_price"]),
-            "trigger_field": event["trigger_field"],
-        }
+        return self._build_trade(
+            exit_reason="liquidation",
+            position_side=position_side,
+            position=position,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            entry_raw_price=entry_raw_price,
+            exit_raw_price=exit_raw_price,
+            entry_equity=entry_equity,
+            entry_margin=entry_margin,
+            entry_notional=entry_notional,
+            entry_open_fee=entry_open_fee,
+            close_fee=float(event.get("liquidation_fee", 0.0)),
+            equity_after=cash_after,
+            extra={
+                "liquidation_fee": float(event.get("liquidation_fee", 0.0)),
+                "liquidation_price": float(event["liquidation_price"]),
+                "trigger_price": float(event["trigger_price"]),
+                "trigger_field": event["trigger_field"],
+            },
+        )
 
     def _calculate_holding_hours(self, entry_time, exit_time) -> float:
-        if entry_time is None or exit_time is None:
-            return 0.0
-
-        entry_dt = pd.to_datetime(entry_time)
-        exit_dt = pd.to_datetime(exit_time)
-
-        return (exit_dt - entry_dt).total_seconds() / 3600
-
-    def _max_consecutive_count(self, values, condition_func) -> int:
-        max_count = 0
-        current_count = 0
-
-        for value in values:
-            if condition_func(value):
-                current_count += 1
-                max_count = max(max_count, current_count)
-            else:
-                current_count = 0
-
-        return max_count
+        # 口径单源在 backtest_metrics，与组合引擎共用
+        return calculate_holding_hours(entry_time, exit_time)
 
     def _calculate_metrics(
         self,
@@ -690,142 +720,10 @@ class CodeBacktestCore:
         initial_cash,
         final_equity,
     ):
-        if initial_cash <= 0:
-            total_return_pct = 0.0
-        else:
-            total_return_pct = (final_equity / initial_cash - 1) * 100
-
-        worst_equity_values = np.array(
-            [x.get("equity_worst", x["equity"]) for x in equity_curve],
-            dtype=float,
+        # 指标计算已抽取到 backtest_metrics.py，与组合引擎共用
+        return calculate_metrics(
+            equity_curve=equity_curve,
+            trades=trades,
+            initial_cash=initial_cash,
+            final_equity=final_equity,
         )
-
-        if len(worst_equity_values) > 0:
-            peak = np.maximum.accumulate(worst_equity_values)
-            peak = np.where(peak == 0, np.nan, peak)
-            drawdown = (worst_equity_values - peak) / peak
-            drawdown = drawdown[~np.isnan(drawdown)]
-            max_drawdown_pct = float(drawdown.min() * 100) if len(drawdown) > 0 else 0.0
-        else:
-            max_drawdown_pct = 0.0
-
-        annual_return_pct = 0.0
-        sharpe_ratio = 0.0
-
-        if len(equity_curve) >= 2:
-            equity_df = pd.DataFrame(equity_curve)
-            equity_df["time"] = pd.to_datetime(equity_df["time"])
-            equity_df = equity_df.sort_values("time")
-
-            if "equity_close" in equity_df.columns:
-                equity_series = equity_df["equity_close"].astype(float)
-            else:
-                equity_series = equity_df["equity"].astype(float)
-
-            start_time = equity_df["time"].iloc[0]
-            end_time = equity_df["time"].iloc[-1]
-            duration_days = (end_time - start_time).total_seconds() / 86400
-
-            if duration_days > 0 and initial_cash > 0 and final_equity > 0:
-                annual_return_pct = ((final_equity / initial_cash) ** (365.25 / duration_days) - 1) * 100
-
-            returns = equity_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-
-            time_diffs = equity_df["time"].diff().dropna()
-
-            if len(time_diffs) > 0:
-                median_period_days = time_diffs.median().total_seconds() / 86400
-
-                if median_period_days > 0 and len(returns) > 1:
-                    periods_per_year = 365.25 / median_period_days
-                    return_std = returns.std()
-
-                    if return_std and return_std > 0:
-                        sharpe_ratio = returns.mean() / return_std * np.sqrt(periods_per_year)
-
-        trade_count = len(trades)
-
-        if trade_count == 0:
-            return {
-                "initial_cash": initial_cash,
-                "final_equity": final_equity,
-                "total_return_pct": total_return_pct,
-                "max_drawdown_pct": max_drawdown_pct,
-                "annual_return_pct": annual_return_pct,
-                "sharpe_ratio": sharpe_ratio,
-
-                "trade_count": 0,
-                "gross_win_rate": 0.0,
-                "net_win_rate": 0.0,
-                "win_rate": 0.0,
-
-                "avg_profit": 0.0,
-                "avg_loss": 0.0,
-                "payoff_ratio": 0.0,
-                "profit_factor": 0.0,
-
-                "max_consecutive_wins": 0,
-                "max_consecutive_losses": 0,
-                "avg_holding_hours": 0.0,
-            }
-
-        gross_pnls = np.array([t.get("gross_pnl", 0.0) for t in trades], dtype=float)
-        net_pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
-        holding_hours = np.array([t.get("holding_hours", 0.0) for t in trades], dtype=float)
-
-        gross_win_rate = np.sum(gross_pnls > 0) / trade_count * 100
-        net_win_rate = np.sum(net_pnls > 0) / trade_count * 100
-
-        profit_trades = net_pnls[net_pnls > 0]
-        loss_trades = net_pnls[net_pnls < 0]
-
-        avg_profit = float(profit_trades.mean()) if len(profit_trades) > 0 else 0.0
-        avg_loss = float(loss_trades.mean()) if len(loss_trades) > 0 else 0.0
-
-        if avg_loss < 0:
-            payoff_ratio = avg_profit / abs(avg_loss)
-        else:
-            payoff_ratio = float("inf") if avg_profit > 0 else 0.0
-
-        gross_profit_sum = float(profit_trades.sum()) if len(profit_trades) > 0 else 0.0
-        gross_loss_sum = float(loss_trades.sum()) if len(loss_trades) > 0 else 0.0
-
-        if gross_loss_sum < 0:
-            profit_factor = gross_profit_sum / abs(gross_loss_sum)
-        else:
-            profit_factor = float("inf") if gross_profit_sum > 0 else 0.0
-
-        max_consecutive_wins = self._max_consecutive_count(
-            net_pnls,
-            lambda x: x > 0,
-        )
-
-        max_consecutive_losses = self._max_consecutive_count(
-            net_pnls,
-            lambda x: x < 0,
-        )
-
-        avg_holding_hours = float(holding_hours.mean()) if len(holding_hours) > 0 else 0.0
-
-        return {
-            "initial_cash": initial_cash,
-            "final_equity": final_equity,
-            "total_return_pct": total_return_pct,
-            "max_drawdown_pct": max_drawdown_pct,
-            "annual_return_pct": annual_return_pct,
-            "sharpe_ratio": sharpe_ratio,
-
-            "trade_count": trade_count,
-            "gross_win_rate": gross_win_rate,
-            "net_win_rate": net_win_rate,
-            "win_rate": net_win_rate,
-
-            "avg_profit": avg_profit,
-            "avg_loss": avg_loss,
-            "payoff_ratio": payoff_ratio,
-            "profit_factor": profit_factor,
-
-            "max_consecutive_wins": max_consecutive_wins,
-            "max_consecutive_losses": max_consecutive_losses,
-            "avg_holding_hours": avg_holding_hours,
-        }
