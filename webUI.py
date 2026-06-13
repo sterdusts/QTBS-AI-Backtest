@@ -4,18 +4,22 @@ import html
 from datetime import datetime, timezone
 
 import gradio as gr
+from module.AI.api_config import LANGUAGE_DISPLAY_NAMES, clamp_score
 from module.AI.deepseek_strategy_reviewer import review_strategy_code_with_deepseek
 from module.AI.deepseek_code_generator import generate_strategy_code_with_deepseek
+from module.Strategy.behavior_check import format_behavior_summary, run_behavior_check
 from module.Strategy.strategy_loader import (
     load_strategy_func_from_code,
     parse_strategy_metadata,
     save_strategy_code_audit,
     validate_strategy_metadata,
 )
-from module.modules.Load_real_kline import normalize_symbol
+from module.modules.Load_real_kline import get_base_asset, normalize_symbol
 from module.modules.code_backtest_core import CodeBacktestCore
 from module.modules.portfolio_backtest_core import PortfolioBacktestCore
+from module.modules import fetch_queue
 from module.modules.data_panel import (
+    DEFAULT_DATA_DIR,
     filter_df_by_date,
     list_local_symbols,
     load_aligned_panel,
@@ -40,14 +44,8 @@ LANGUAGE_CHOICES = [
     ("Русский", "ru"),
 ]
 
-LANGUAGE_NAME_MAP = {
-    "zh": "中文",
-    "ko": "한국어",
-    "en": "English",
-    "ja": "日本語",
-    "ar": "العربية",
-    "ru": "Русский",
-}
+# AI 输出语言显示名单源在 api_config（LANGUAGE_DISPLAY_NAMES，
+# 生成与审查共用同一份，新增语言只改一处）
 
 
 UI_TEXTS = {
@@ -527,6 +525,11 @@ REVIEW_TEXTS = {
         "empty": "生成策略代码后，这里会显示 AI 匹配度评分。",
         "note": "80%+：初步可用，建议进入回测验证。90%+：高度匹配，但仍需人工复核。评分不代表结果保证，请结合图表检查开仓、平仓、方向、仓位、手续费滑点与插针风险。",
         "review_failed": "AI 审查失败",
+        "behavior_pass_short": "行为检查通过",
+        "behavior_fail_short": "行为检查失败",
+        "behavior_pass": "行为检查通过：代码已在 {bars} 根合成K线上实际运行，完成 {trades} 笔交易",
+        "behavior_fail": "行为检查失败：代码在合成数据上运行出错——{error}",
+        "behavior_tip": "行为检查＝把生成的代码在 720 根合成K线（上涨/下跌/震荡三段行情）上真正跑一遍回测引擎。✓ 表示代码能正常运行、产生交易、没有运行时错误；✗ 表示运行报错（会写明原因）。它只验证「代码能不能跑」，不代表「代码符合你的描述」——是否符合描述由上方的策略匹配度判断。",
     },
     "en": {
         "title": "AI Strategy Review",
@@ -535,6 +538,11 @@ REVIEW_TEXTS = {
         "empty": "After generating strategy code, the AI match score will appear here.",
         "note": "80%+ means initially usable and ready for backtest validation. 90%+ means highly aligned, but still requires manual review. Scores are not guarantees. Check entries, exits, direction, position, fees, slippage, spike equity, and liquidation risk on the chart.",
         "review_failed": "AI review failed",
+        "behavior_pass_short": "Behavior check passed",
+        "behavior_fail_short": "Behavior check failed",
+        "behavior_pass": "Behavior check passed: code executed on {bars} synthetic bars, {trades} trades completed",
+        "behavior_fail": "Behavior check failed: runtime error on synthetic data — {error}",
+        "behavior_tip": "Behavior check = the generated code is actually run through the engine on 720 synthetic bars (uptrend/downtrend/range). ✓ means it runs, produces trades, and has no runtime error; ✗ means it errored (reason shown). It only verifies the code *runs*, not that it *matches your description* — matching is judged by the Strategy Match score above.",
     },
     "ko": {
         "title": "AI 전략 검토",
@@ -543,6 +551,11 @@ REVIEW_TEXTS = {
         "empty": "전략 코드를 생성하면 여기에 AI 일치도 점수가 표시됩니다.",
         "note": "80% 이상은 초기 사용 가능 상태이며 백테스트 검증을 권장합니다. 90% 이상은 높은 일치도를 의미하지만 수동 검토가 필요합니다. 점수는 결과 보장이 아니며 차트에서 진입, 청산, 방향, 포지션, 수수료, 슬리피지, 급등락 자산, 강제청산 위험을 확인하세요.",
         "review_failed": "AI 검토 실패",
+        "behavior_pass_short": "행동 검사 통과",
+        "behavior_fail_short": "행동 검사 실패",
+        "behavior_pass": "행동 검사 통과: 합성 K라인 {bars}개에서 실제 실행됨, 거래 {trades}건 완료",
+        "behavior_fail": "행동 검사 실패: 합성 데이터 실행 중 오류 — {error}",
+        "behavior_tip": "행동 검사＝생성된 코드를 720개의 합성 K라인(상승/하락/횡보 3구간)에서 실제로 백테스트 엔진에 돌려봅니다. ✓ 는 코드가 정상 실행되어 거래가 발생하고 런타임 오류가 없음을, ✗ 는 실행 중 오류(원인 표시)를 의미합니다. 이는 「코드가 실행되는지」만 검증하며 「설명과 일치하는지」는 위의 전략 일치도로 판단합니다.",
     },
     "ja": {
         "title": "AI 戦略レビュー",
@@ -551,6 +564,11 @@ REVIEW_TEXTS = {
         "empty": "戦略コード生成後、ここに AI 一致度スコアが表示されます。",
         "note": "80%以上は初期利用可能な状態で、バックテスト検証を推奨します。90%以上は高い一致度を示しますが、手動確認は必要です。スコアは保証ではありません。チャートでエントリー、決済、方向、ポジション、手数料、スリッページ、急変時の資産、強制決済リスクを確認してください。",
         "review_failed": "AI レビュー失敗",
+        "behavior_pass_short": "動作チェック合格",
+        "behavior_fail_short": "動作チェック失敗",
+        "behavior_pass": "動作チェック合格：合成K線 {bars} 本で実行済み、取引 {trades} 件完了",
+        "behavior_fail": "動作チェック失敗：合成データでの実行エラー — {error}",
+        "behavior_tip": "動作チェック＝生成されたコードを 720 本の合成K線（上昇/下降/レンジの3区間）でバックテストエンジンに実際に通します。✓ はコードが正常に動作し取引が発生、ランタイムエラーなしを、✗ は実行エラー（原因を表示）を意味します。これは「コードが動くか」だけを検証し、「説明と一致するか」は上の戦略一致度で判断します。",
     },
     "ar": {
         "title": "مراجعة الاستراتيجية بالذكاء الاصطناعي",
@@ -559,6 +577,11 @@ REVIEW_TEXTS = {
         "empty": "بعد إنشاء كود الاستراتيجية ستظهر هنا درجة المطابقة من الذكاء الاصطناعي.",
         "note": "أكثر من 80% يعني أنها قابلة للاستخدام مبدئيًا وتحتاج إلى اختبار خلفي. أكثر من 90% يعني تطابقًا عاليًا، لكنه لا يغني عن المراجعة اليدوية. النتيجة ليست ضمانًا. تحقق من الدخول والخروج والاتجاه والمركز والرسوم والانزلاق السعري ومخاطر الذبذبات والتصفية عبر الرسم البياني.",
         "review_failed": "فشلت مراجعة الذكاء الاصطناعي",
+        "behavior_pass_short": "اجتاز فحص السلوك",
+        "behavior_fail_short": "فشل فحص السلوك",
+        "behavior_pass": "اجتاز فحص السلوك: تم تنفيذ الكود على {bars} شمعة اصطناعية وأُنجزت {trades} صفقة",
+        "behavior_fail": "فشل فحص السلوك: خطأ أثناء التشغيل على البيانات الاصطناعية — {error}",
+        "behavior_tip": "فحص السلوك = تشغيل الكود المُولَّد فعليًا عبر محرك الاختبار على 720 شمعة اصطناعية (صعود/هبوط/تذبذب). ✓ يعني أن الكود يعمل ويُنتج صفقات دون أخطاء تشغيل؛ ✗ يعني حدوث خطأ (يُعرض سببه). إنه يتحقق فقط من «أن الكود يعمل»، لا من «مطابقته لوصفك» — المطابقة تُقيَّم بدرجة مطابقة الاستراتيجية أعلاه.",
     },
     "ru": {
         "title": "AI-проверка стратегии",
@@ -567,6 +590,106 @@ REVIEW_TEXTS = {
         "empty": "После генерации кода стратегии здесь появится AI-оценка соответствия.",
         "note": "80%+ означает начальную пригодность для проверки в бэктесте. 90%+ означает высокое соответствие, но ручная проверка всё равно нужна. Оценка не является гарантией. Проверьте входы, выходы, направление, позицию, комиссии, проскальзывание, экстремумы капитала и риск ликвидации на графике.",
         "review_failed": "Ошибка AI-проверки",
+        "behavior_pass_short": "Поведенческая проверка пройдена",
+        "behavior_fail_short": "Поведенческая проверка не пройдена",
+        "behavior_pass": "Поведенческая проверка пройдена: код выполнен на {bars} синтетических барах, сделок: {trades}",
+        "behavior_fail": "Поведенческая проверка не пройдена: ошибка при выполнении на синтетических данных — {error}",
+        "behavior_tip": "Поведенческая проверка = сгенерированный код реально прогоняется через движок на 720 синтетических барах (рост/падение/боковик). ✓ — код работает, создаёт сделки, без ошибок выполнения; ✗ — произошла ошибка (причина показана). Проверяется только то, что код *запускается*, а не то, что он *соответствует вашему описанию* — соответствие оценивает «Соответствие стратегии» выше.",
+    },
+}
+
+
+# 数据拉取/更新进度区文案（六语言）
+FETCH_TEXTS = {
+    "zh": {
+        "idle": "数据已是最新",
+        "initial": "首次拉取",
+        "update": "更新数据",
+        "running": "数据{mode}中",
+        "total": "总进度",
+        "current": "当前",
+        "done_all": "数据{mode}完成",
+        "failed": "失败",
+        "button": "更新数据",
+        "button_running": "更新中…",
+        "tip_initial": "本次将首次拉取以下交易对（2017 至今的 1 分钟数据）：",
+        "tip_update": "本次将更新以下交易对的数据：",
+        "tip_idle": "启动时自动扫描本地交易对并更新；首次使用则初次拉取默认币种。点「更新数据」可手动更新。",
+    },
+    "en": {
+        "idle": "Data is up to date",
+        "initial": "Initial download",
+        "update": "Update",
+        "running": "{mode} in progress",
+        "total": "Total",
+        "current": "Current",
+        "done_all": "{mode} complete",
+        "failed": "failed",
+        "button": "Update Data",
+        "button_running": "Updating…",
+        "tip_initial": "Initial download of these symbols (1m data since 2017):",
+        "tip_update": "Updating data for these symbols:",
+        "tip_idle": "On startup, local symbols are scanned and updated automatically; first use downloads the default symbols. Click 'Update Data' to update manually.",
+    },
+    "ko": {
+        "idle": "데이터가 최신 상태입니다",
+        "initial": "최초 다운로드",
+        "update": "데이터 업데이트",
+        "running": "{mode} 진행 중",
+        "total": "전체",
+        "current": "현재",
+        "done_all": "{mode} 완료",
+        "failed": "실패",
+        "button": "데이터 업데이트",
+        "button_running": "업데이트 중…",
+        "tip_initial": "다음 종목을 최초 다운로드합니다(2017년부터의 1분 데이터):",
+        "tip_update": "다음 종목의 데이터를 업데이트합니다:",
+        "tip_idle": "시작 시 로컬 종목을 스캔하여 자동 업데이트하며, 최초 사용 시 기본 종목을 다운로드합니다. '데이터 업데이트'로 수동 업데이트할 수 있습니다.",
+    },
+    "ja": {
+        "idle": "データは最新です",
+        "initial": "初回取得",
+        "update": "データ更新",
+        "running": "{mode}中",
+        "total": "全体",
+        "current": "現在",
+        "done_all": "{mode}完了",
+        "failed": "失敗",
+        "button": "データ更新",
+        "button_running": "更新中…",
+        "tip_initial": "以下の銘柄を初回取得します（2017年以降の1分データ）：",
+        "tip_update": "以下の銘柄のデータを更新します：",
+        "tip_idle": "起動時にローカル銘柄をスキャンして自動更新し、初回利用時はデフォルト銘柄を取得します。「データ更新」で手動更新できます。",
+    },
+    "ar": {
+        "idle": "البيانات محدّثة",
+        "initial": "التنزيل الأول",
+        "update": "تحديث البيانات",
+        "running": "جارٍ {mode}",
+        "total": "الإجمالي",
+        "current": "الحالي",
+        "done_all": "اكتمل {mode}",
+        "failed": "فشل",
+        "button": "تحديث البيانات",
+        "button_running": "جارٍ التحديث…",
+        "tip_initial": "سيتم التنزيل الأول للرموز التالية (بيانات الدقيقة منذ 2017):",
+        "tip_update": "سيتم تحديث بيانات الرموز التالية:",
+        "tip_idle": "عند بدء التشغيل تُفحص الرموز المحلية وتُحدّث تلقائيًا؛ الاستخدام الأول ينزّل الرموز الافتراضية. اضغط «تحديث البيانات» للتحديث يدويًا.",
+    },
+    "ru": {
+        "idle": "Данные актуальны",
+        "initial": "Первая загрузка",
+        "update": "Обновление",
+        "running": "{mode}…",
+        "total": "Всего",
+        "current": "Текущий",
+        "done_all": "{mode}: готово",
+        "failed": "ошибка",
+        "button": "Обновить данные",
+        "button_running": "Обновление…",
+        "tip_initial": "Первая загрузка этих инструментов (1-мин данные с 2017):",
+        "tip_update": "Обновление данных по этим инструментам:",
+        "tip_idle": "При запуске локальные инструменты сканируются и обновляются автоматически; при первом запуске загружаются инструменты по умолчанию. Нажмите «Обновить данные» для ручного обновления.",
     },
 }
 # =========================================================
@@ -779,6 +902,179 @@ def get_review_text(lang_code: str) -> dict:
     return REVIEW_TEXTS.get(lang_code, REVIEW_TEXTS["zh"])
 
 
+def get_fetch_text(lang_code: str) -> dict:
+    return FETCH_TEXTS.get(lang_code, FETCH_TEXTS["zh"])
+
+
+def tooltip_html(inner_html: str) -> str:
+    """统一的 "!" 悬停气泡（参数优先级 / 进度清单 / 行为检查共用）。
+
+    inner_html 必须是调用方已转义/构造好的安全 HTML（可含 <br>）。
+    """
+    return (
+        '<span class="qtbs-tooltip">'
+        '<span class="qtbs-tooltip-icon">!</span>'
+        f'<span class="qtbs-tooltip-text">{inner_html}</span>'
+        "</span>"
+    )
+
+
+def _fetch_batch_mode(snapshot: dict) -> str:
+    """整批的模式标签：只要含任一首次拉取的币种就算「首次拉取」。"""
+    modes = [m for _, m in snapshot.get("symbols", [])]
+    return "initial" if "initial" in modes else "update"
+
+
+def build_fetch_progress_html(snapshot: dict, lang_code: str) -> str:
+    """渲染数据拉取进度区：总进度条 + 当前币种脉冲 + 小字 + "!" 悬停清单。"""
+
+    text = get_fetch_text(lang_code)
+    running = snapshot.get("running")
+    recently_done = snapshot.get("recently_done")
+    total = snapshot.get("total", 0)
+    done = snapshot.get("done", 0)
+    current = snapshot.get("current")
+    symbols = snapshot.get("symbols", [])
+    errors = snapshot.get("errors", [])
+
+    batch_mode = _fetch_batch_mode(snapshot)
+    mode_label = text[batch_mode]
+
+    # 悬停清单：本批全部币种 + 各自模式；空闲时给说明
+    if symbols:
+        tip_head = text["tip_initial"] if batch_mode == "initial" else text["tip_update"]
+        lines = []
+        for sym, m in symbols:
+            tag = text[m]
+            mark = ""
+            if sym in errors:
+                mark = f" ({text['failed']})"
+            elif current == sym:
+                mark = " ●"
+            lines.append(f"{html.escape(sym)} — {tag}{mark}")
+        tip = tip_head + "<br>" + "<br>".join(lines)
+    else:
+        tip = text["tip_idle"]
+
+    tip_html = tooltip_html(tip)
+
+    pct = int(done / total * 100) if total > 0 else 0
+
+    if running:
+        status = text["running"].format(mode=mode_label)
+        cur_name = html.escape(current) if current else ""
+        cur_tag = text[snapshot.get("current_mode") or "update"]
+        current_line = (
+            f'<div class="fetch-current-label">{text["current"]}: '
+            f'<b>{cur_name}</b> · {cur_tag}</div>'
+            '<div class="fetch-pulse-track"><div class="fetch-pulse-bar"></div></div>'
+        )
+    elif recently_done:
+        status = text["done_all"].format(mode=mode_label)
+        current_line = ""
+        pct = 100
+    else:
+        status = text["idle"]
+        current_line = ""
+
+    return f"""
+    <div id="fetch-progress" class="{'fetch-active' if running else ''}">
+        <div class="fetch-head">
+            <span class="fetch-status">{html.escape(status)}</span>
+            {tip_html}
+        </div>
+        <div class="fetch-total-row">
+            <div class="fetch-total-track">
+                <div class="fetch-total-bar" style="width:{pct}%;"></div>
+            </div>
+            <span class="fetch-total-num">{done}/{total}</span>
+        </div>
+        {current_line}
+    </div>
+    """
+
+
+def refresh_fetch_progress(lang_code: str):
+    """Timer 轮询：渲染进度 HTML + 按钮可用性（拉取中禁用）。"""
+    snap = fetch_queue.snapshot()
+    text = get_fetch_text(lang_code)
+    running = snap.get("running")
+    return (
+        build_fetch_progress_html(snap, lang_code),
+        gr.update(
+            value=text["button_running"] if running else text["button"],
+            interactive=not running,
+        ),
+    )
+
+
+def _enqueue_local_or_default():
+    """扫描本地交易对入队更新；首次使用（本地为空）则入队默认币种初次拉取。"""
+    local = list_local_symbols(DEFAULT_DATA_DIR)
+    targets = local if local else fetch_queue.DEFAULT_INITIAL_SYMBOLS
+    fetch_queue.enqueue(targets, DEFAULT_DATA_DIR)
+
+
+def on_app_start(lang_code: str):
+    """页面加载：空闲则扫描本地交易对依次更新（首次使用拉默认币种）。
+
+    用 is_running 守卫而非一次性 latch：若上次启动批量失败（如启动时断网），
+    后续页面加载/刷新会重试，不会永久停在「数据已是最新」的误导态。
+    """
+    if not fetch_queue.is_running():
+        _enqueue_local_or_default()
+    return refresh_fetch_progress(lang_code)
+
+
+def on_manual_update(lang_code: str):
+    """手动更新按钮：更新本地全部交易对；正在拉取时点击无效。"""
+    if not fetch_queue.is_running():
+        _enqueue_local_or_default()
+    return refresh_fetch_progress(lang_code)
+
+
+def parse_common_ui_params(
+    output_language: str,
+    symbol,
+    start_time,
+    end_time,
+    initial_cash,
+    leverage,
+    position_size_percent,
+    fee_rate_percent,
+    slippage_percent,
+):
+    """
+    生成与回测两个入口共用的 UI 参数解析（缺省值与校验规则单源）。
+
+    两个入口各抄一份时，任何缺省值/校验规则只改一边都会让 AI 生成
+    所见的回测环境与实际回测参数静默分叉。
+
+    返回 (start_str, end_str, symbol, 校验后的六元组)；解析失败抛异常。
+    """
+
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    start_str = normalize_date(start_time, "2017-01-01", output_language)
+    end_str = normalize_date(end_time, today_utc, output_language)
+    validate_date_range(start_str, end_str, output_language)
+
+    if symbol is None or symbol.strip() == "":
+        symbol = "BTC"
+    symbol = normalize_symbol(symbol)
+
+    params = validate_backtest_params(
+        initial_cash=initial_cash,
+        leverage=leverage,
+        position_size_percent=position_size_percent,
+        fee_rate_percent=fee_rate_percent,
+        slippage_percent=slippage_percent,
+        lang_code=output_language,
+    )
+
+    return start_str, end_str, symbol, params
+
+
 def resolve_strategy_route(strategy_code: str, ui_symbol: str):
     """
     根据策略代码元数据决定回测路由。
@@ -795,23 +1091,14 @@ def resolve_strategy_route(strategy_code: str, ui_symbol: str):
     validate_strategy_metadata(metadata)
 
     if metadata["contract_version"] == 2:
-        # 策略代码内部按 SYMBOLS 原样引用面板键与权重列，
-        # 这里只去重（保持顺序），不做静默改写
-        return 2, list(dict.fromkeys(metadata["symbols"]))
+        # 共享校验已保证 SYMBOLS 非空、格式规范且无重复，原样使用
+        return 2, list(metadata["symbols"])
 
     # v1：校验保证 SYMBOLS 至多一个，不存在静默截断
     if metadata["symbols"]:
         return 1, [normalize_symbol(metadata["symbols"][0])]
 
     return 1, [normalize_symbol(ui_symbol)]
-
-
-def clamp_score(value) -> float:
-    try:
-        value = float(value)
-    except Exception:
-        value = 0.0
-    return max(0.0, min(99.99, value))
 
 
 def build_review_html(review: dict | None, lang_code: str = "zh") -> str:
@@ -829,6 +1116,32 @@ def build_review_html(review: dict | None, lang_code: str = "zh") -> str:
     # AI 返回的文本插入 HTML 前必须转义，防止内容里的 < > & 破坏页面结构
     match_summary = html.escape(str(review.get("match_summary", "")))
 
+    behavior = review.get("behavior")
+    behavior_html = ""
+    if behavior:
+        # 表面只显示「✓ 行为检查通过 / ✗ 行为检查失败」；具体跑了多少根、
+        # 多少笔交易（或报错原因）+ 行为检查是什么，全部进 "!" 悬停详解
+        if behavior.get("ok"):
+            short = text["behavior_pass_short"]
+            detail = text["behavior_pass"].format(
+                bars=behavior.get("synthetic_bars", 0),
+                trades=behavior.get("trade_count", 0),
+            )
+            cls, icon = "behavior-pass", "✓"
+        else:
+            short = text["behavior_fail_short"]
+            detail = text["behavior_fail"].format(error=str(behavior.get("error", "")))
+            cls, icon = "behavior-fail", "✗"
+
+        # detail 与 behavior_tip 各自转义后用 <br> 拼接（<br> 不能被转义）
+        tip_full = (
+            html.escape(detail) + "<br><br>" + html.escape(text.get("behavior_tip", ""))
+        )
+        behavior_html = (
+            f'<div class="review-behavior {cls}">'
+            f'<span>{icon} {html.escape(short)}</span> {tooltip_html(tip_full)}</div>'
+        )
+
     return f"""
     <div class="review-card">
         <div class="review-layout">
@@ -841,6 +1154,7 @@ def build_review_html(review: dict | None, lang_code: str = "zh") -> str:
                     </div>
                     <div class="score-number">{match_score:.2f}%</div>
                 </div>
+                {behavior_html}
             </div>
 
             <div class="review-right">
@@ -924,16 +1238,14 @@ def build_param_priority_html(text: dict) -> str:
     return (
         '<div id="param-priority-note">'
         f"<span>{short}</span>"
-        '<span class="qtbs-tooltip">'
-        '<span class="qtbs-tooltip-icon">!</span>'
-        f'<span class="qtbs-tooltip-text">{detail}</span>'
-        "</span>"
+        f"{tooltip_html(detail)}"
         "</div>"
     )
 
 
 def update_ui_language(lang_code: str):
     text = get_ui_text(lang_code)
+    _snap = fetch_queue.snapshot()  # 进度区与按钮共用一次快照
 
     return [
         text["header"],
@@ -986,9 +1298,8 @@ def update_ui_language(lang_code: str):
         gr.update(
             value=text["backtest_button"],
         ),
-        gr.update(
-            label=text["code_output_label"],
-        ),
+        # 代码折叠面板的标题随语言切换（标题在 Accordion 上，不是内部 gr.Code）
+        gr.update(label=text["code_output_label"]),
         gr.update(
             value=build_review_html(None, lang_code),
         ),
@@ -997,6 +1308,13 @@ def update_ui_language(lang_code: str):
         ),
         gr.update(
             label=text["chart_file_label"],
+        ),
+        # 进度区按新语言重渲染（读一次快照，不重置进度，也不再额外 is_running）
+        gr.update(value=build_fetch_progress_html(_snap, lang_code)),
+        gr.update(
+            value=get_fetch_text(lang_code)[
+                "button_running" if _snap["running"] else "button"
+            ]
         ),
     ]
 
@@ -1020,38 +1338,21 @@ def generate_code_from_ui(
 ):
     text = get_ui_text(output_language)
 
-    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    try:
-        start_str = normalize_date(start_time, "2017-01-01", output_language)
-        end_str = normalize_date(end_time, today_utc, output_language)
-        validate_date_range(start_str, end_str, output_language)
-    except Exception as e:
-        return f"# {str(e)}", build_review_html(None, output_language)
-
     if strategy_text is None or strategy_text.strip() == "":
         return f"# {text['empty_strategy_error']}", build_review_html(None, output_language)
 
-    if symbol is None or symbol.strip() == "":
-        symbol = "BTC"
-
-    symbol = normalize_symbol(symbol)
-
     try:
-        (
+        start_str, end_str, symbol, (
             initial_cash_value,
             leverage_value,
             effective_leverage_value,
             position_size_percent_value,
             fee_rate_percent_value,
             slippage_percent_value,
-        ) = validate_backtest_params(
-            initial_cash=initial_cash,
-            leverage=leverage,
-            position_size_percent=position_size_percent,
-            fee_rate_percent=fee_rate_percent,
-            slippage_percent=slippage_percent,
-            lang_code=output_language,
+        ) = parse_common_ui_params(
+            output_language, symbol, start_time, end_time,
+            initial_cash, leverage, position_size_percent,
+            fee_rate_percent, slippage_percent,
         )
     except Exception as e:
         return f"# {str(e)}", build_review_html(None, output_language)
@@ -1062,7 +1363,7 @@ def generate_code_from_ui(
             market=market,
             symbol=symbol,
             timeframe=timeframe,
-            language=LANGUAGE_NAME_MAP.get(output_language, "中文"),
+            language=LANGUAGE_DISPLAY_NAMES.get(output_language, "简体中文"),
             allow_short=False,
             initial_cash=initial_cash_value,
             fee_rate_percent=fee_rate_percent_value,
@@ -1070,13 +1371,20 @@ def generate_code_from_ui(
             available_symbols=list_local_symbols(),
         )
 
+        # 行为审查：交给审查 AI 之前先在合成数据上真实跑一遍引擎
+        # （不调用 API、永不抛异常）。运行时错误在这里就拦截成事实，
+        # 审查 AI 拿到的是「代码实际做了什么」而不只是代码文本
+        behavior = run_behavior_check(strategy_code)
+
         try:
             review = review_strategy_code_with_deepseek(
                 user_strategy_text=strategy_text,
                 generated_code=strategy_code,
                 language=output_language,
+                behavior_summary=format_behavior_summary(behavior),
             )
 
+            review["behavior"] = behavior
             review_html = build_review_html(review, output_language)
 
         except Exception as review_error:
@@ -1085,9 +1393,8 @@ def generate_code_from_ui(
             review_html = build_review_html(
                 {
                     "match_score": 0,
-                    "confidence_score": 0,
                     "match_summary": f"{review_text['review_failed']}：{str(review_error)}",
-                    "confidence_summary": "",
+                    "behavior": behavior,
                 },
                 output_language,
             )
@@ -1123,38 +1430,21 @@ def run_backtest_from_ui(
     summary_text = get_summary_text(output_language)
 
     try:
-        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-        try:
-            start_str = normalize_date(start_time, "2017-01-01", output_language)
-            end_str = normalize_date(end_time, today_utc, output_language)
-            validate_date_range(start_str, end_str, output_language)
-        except Exception as e:
-            return str(e), None
-
         if strategy_code is None or strategy_code.strip() == "":
             return text["no_code_error"], None
 
-        if symbol is None or symbol.strip() == "":
-            symbol = "BTC"
-
-        symbol = normalize_symbol(symbol)
-
         try:
-            (
+            start_str, end_str, symbol, (
                 initial_cash_value,
                 leverage_value,
                 effective_leverage_value,
                 position_size_percent_value,
                 fee_rate_percent_value,
                 slippage_percent_value,
-            ) = validate_backtest_params(
-                initial_cash=initial_cash,
-                leverage=leverage,
-                position_size_percent=position_size_percent,
-                fee_rate_percent=fee_rate_percent,
-                slippage_percent=slippage_percent,
-                lang_code=output_language,
+            ) = parse_common_ui_params(
+                output_language, symbol, start_time, end_time,
+                initial_cash, leverage, position_size_percent,
+                fee_rate_percent, slippage_percent,
             )
         except Exception as e:
             return str(e), None
@@ -1186,28 +1476,37 @@ def run_backtest_from_ui(
         if route_version == 2:
             # 日期过滤下沉到 load_aligned_panel 内部、对齐之前执行：
             # 避免先对全历史做 union 对齐、再把窗口外的行全部丢弃
+            # required_end 缺省派生自 end_date，无需重复传
             data = load_aligned_panel(
                 route_symbols, timeframe,
                 start_date=start_str, end_date=end_str,
             )
-            kline_count = len(next(iter(data.values())))
+            data_index = next(iter(data.values())).index
             display_symbol = " + ".join(route_symbols)
         else:
             symbol = route_symbols[0]
-            df = load_symbol_kline(symbol, timeframe)
+            df = load_symbol_kline(symbol, timeframe, required_end=end_str)
             df = filter_df_by_date(df, start_str, end_str)
-            kline_count = len(df)
+            data_index = df.index
             display_symbol = symbol
+
+        kline_count = len(data_index)
 
         if kline_count < 100:
             return text["too_few_klines_error"].format(count=kline_count), None
+
+        # 摘要展示实际参与回测的数据范围：本地数据没覆盖到请求窗口时，
+        # 按请求日期展示会给短窗口结果贴上长周期标签（年化/夏普失真）。
+        # 索引已排序，取首尾是 O(1)
+        actual_start = str(data_index[0])
+        actual_end = str(data_index[-1])
 
         # ---- 跑引擎、出图：分支体只保留真正不同的部分 ----
 
         if route_version == 2:
             result = PortfolioBacktestCore(**engine_kwargs).run(data)
 
-            base_names = "_".join(s.replace("USDT", "") for s in route_symbols[:4])
+            base_names = "_".join(get_base_asset(s) for s in route_symbols[:4])
             html_path = plot_portfolio_result(
                 result=result,
                 output_dir="Past_data",
@@ -1236,8 +1535,8 @@ def run_backtest_from_ui(
             market=market,
             symbol=display_symbol,
             timeframe=timeframe,
-            start_str=start_str,
-            end_str=end_str,
+            start_str=actual_start,
+            end_str=actual_end,
             kline_count=kline_count,
             leverage_value=leverage_value,
             effective_leverage_value=effective_leverage_value,
@@ -1263,6 +1562,34 @@ custom_css = """
     margin: 0 auto;
 }
 
+.review-behavior {
+    font-size: 12.5px;
+    margin: 8px 0 2px 0;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+/* 颜色直接钉到内部 span 并 !important：否则被 Gradio prose 的 span 颜色覆盖成灰 */
+.review-behavior.behavior-pass,
+.review-behavior.behavior-pass > span {
+    color: #2da44e !important;
+}
+
+.review-behavior.behavior-fail,
+.review-behavior.behavior-fail > span {
+    color: #d64545 !important;
+    font-weight: 600;
+}
+
+/* 行为检查的 "!" 气泡是绝对定位后代：整条祖先链不能裁切 */
+#review-output,
+#review-output .html-container,
+#review-output .prose {
+    overflow: visible !important;
+}
+
 /* 气泡是绝对定位的后代元素：从组件到气泡的整条祖先链都不能裁切，
    否则悬停时只剩 help 光标、看不到内容 */
 #param-priority-wrap,
@@ -1286,6 +1613,97 @@ custom_css = """
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* ---- 数据拉取进度区 ---- */
+#fetch-progress-wrap,
+#fetch-progress-wrap .html-container,
+#fetch-progress-wrap .prose {
+    overflow: visible !important;
+}
+
+#fetch-progress {
+    font-size: 12px;
+    color: #6b7280;
+    margin: 6px 2px 2px 2px;
+}
+
+.fetch-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.fetch-status {
+    font-weight: 600;
+    color: #4b5563;
+}
+
+#fetch-progress.fetch-active .fetch-status {
+    color: #2563eb;
+}
+
+.fetch-total-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.fetch-total-track {
+    flex: 1;
+    height: 7px;
+    border-radius: 4px;
+    background: #e5e7eb;
+    overflow: hidden;
+}
+
+.fetch-total-bar {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #34d399, #2563eb);
+    transition: width 0.4s ease;
+}
+
+.fetch-total-num {
+    font-variant-numeric: tabular-nums;
+    color: #6b7280;
+    min-width: 42px;
+    text-align: right;
+}
+
+.fetch-current-label {
+    margin-top: 4px;
+    color: #6b7280;
+}
+
+.fetch-pulse-track {
+    margin-top: 3px;
+    height: 5px;
+    border-radius: 3px;
+    background: #e5e7eb;
+    overflow: hidden;
+    position: relative;
+}
+
+.fetch-pulse-bar {
+    position: absolute;
+    height: 100%;
+    width: 35%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, rgba(37,99,235,0.2), #2563eb, rgba(37,99,235,0.2));
+    animation: fetch-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes fetch-pulse {
+    0%   { left: -35%; }
+    100% { left: 100%; }
+}
+
+#fetch-update-button {
+    margin-top: 6px;
+    font-size: 12px !important;
+    min-height: 30px !important;
 }
 
 .qtbs-tooltip {
@@ -1345,10 +1763,19 @@ custom_css = """
     padding-right: 20px;
 }
 
-#language-top-panel {
-    max-width: 210px;
+/* 右上区：进度模块（左）+ 语言选择（右）并排等高 */
+#top-right-panel {
     margin-left: auto;
     padding-top: 6px;
+}
+
+#top-right-row {
+    align-items: stretch;
+}
+
+/* 语言列垂直居中，与左侧进度模块顶底对齐看起来等高 */
+#lang-col {
+    justify-content: center;
 }
 
 #language-select {
@@ -1529,17 +1956,33 @@ with gr.Blocks(
 
         with gr.Row(elem_id="top-bar"):
 
-            with gr.Column(scale=8, elem_id="header-panel"):
+            with gr.Column(scale=6, elem_id="header-panel"):
                 header_md = gr.Markdown(default_text["header"])
 
-            with gr.Column(scale=2, min_width=180, elem_id="language-top-panel"):
-                language_select = gr.Dropdown(
-                    label=default_text["language_label"],
-                    choices=LANGUAGE_CHOICES,
-                    value=default_lang,
-                    interactive=True,
-                    elem_id="language-select",
-                )
+            # 右上：数据进度模块（左）+ 语言选择（右）并排等高
+            with gr.Column(scale=6, min_width=420, elem_id="top-right-panel"):
+                with gr.Row(equal_height=True, elem_id="top-right-row"):
+                    with gr.Column(scale=3, min_width=220, elem_id="fetch-col"):
+                        fetch_progress = gr.HTML(
+                            build_fetch_progress_html(fetch_queue.snapshot(), default_lang),
+                            elem_id="fetch-progress-wrap",
+                        )
+                        fetch_button = gr.Button(
+                            value=get_fetch_text(default_lang)["button"],
+                            elem_id="fetch-update-button",
+                            size="sm",
+                        )
+
+                    with gr.Column(scale=2, min_width=150, elem_id="lang-col"):
+                        language_select = gr.Dropdown(
+                            label=default_text["language_label"],
+                            choices=LANGUAGE_CHOICES,
+                            value=default_lang,
+                            interactive=True,
+                            elem_id="language-select",
+                        )
+
+                fetch_timer = gr.Timer(1.0)
 
         with gr.Row():
             with gr.Column(scale=7, min_width=650):
@@ -1672,7 +2115,7 @@ with gr.Blocks(
                         scale=1,
                     )
 
-        with gr.Accordion(default_text["code_output_label"], open=False):
+        with gr.Accordion(default_text["code_output_label"], open=False) as code_accordion:
             strategy_code_output = gr.Code(
                 label="",
                 language="python",
@@ -1710,10 +2153,12 @@ with gr.Blocks(
                 slippage_input,
                 generate_button,
                 backtest_button,
-                strategy_code_output,
+                code_accordion,
                 review_output,
                 backtest_result_output,
                 chart_file_output,
+                fetch_progress,
+                fetch_button,
             ],
         )
 
@@ -1759,6 +2204,26 @@ with gr.Blocks(
                 backtest_result_output,
                 chart_file_output,
             ],
+        )
+
+        # ---- 数据拉取进度区：Timer 轮询全局状态、手动更新、启动自动更新 ----
+
+        fetch_timer.tick(
+            fn=refresh_fetch_progress,
+            inputs=[language_select],
+            outputs=[fetch_progress, fetch_button],
+        )
+
+        fetch_button.click(
+            fn=on_manual_update,
+            inputs=[language_select],
+            outputs=[fetch_progress, fetch_button],
+        )
+
+        demo.load(
+            fn=on_app_start,
+            inputs=[language_select],
+            outputs=[fetch_progress, fetch_button],
         )
 
 

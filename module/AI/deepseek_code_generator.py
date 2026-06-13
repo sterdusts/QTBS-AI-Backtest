@@ -3,10 +3,9 @@
 # 本文件 prompt 中的策略规则源自项目根目录 STRATEGY_CONTRACT.md（契约 v1）。
 # 修改任何规则必须与契约文档、tests/ 金样例测试保持同步。
 
-import os
 import re
-from openai import OpenAI
 
+from module.AI.api_config import make_client
 from module.Strategy.strategy_loader import (
     parse_strategy_metadata,
     validate_strategy_code,
@@ -21,17 +20,31 @@ FORBIDDEN_TIMEFRAME_TOKENS = [
     '"1m"', "'1m'",
     '"5m"', "'5m'",
     '"15m"', "'15m'",
+    '"30m"', "'30m'",
     '"1h"', "'1h'",
+    '"2h"', "'2h'",
+    '"6h"', "'6h'",
+    '"8h"', "'8h'",
+    '"12h"', "'12h'",
     '"4h"', "'4h'",
     '"1d"', "'1d'",
+    '"1w"', "'1w'",
     '"1T"', "'1T'",
     '"5T"', "'5T'",
     '"15T"', "'15T'",
     '"1H"', "'1H'",
     '"4H"', "'4H'",
     '"1D"', "'1D'",
+    # pandas 分钟别名与时间窗写法：rolling("12h")/Timedelta("12h") 与
+    # 写死周期等价，asfreq/Grouper 与 resample 等价，一并拦截
+    '"1min"', "'1min'",
+    '"5min"', "'5min'",
+    '"15min"', "'15min'",
+    '"30min"', "'30min'",
+    '"60min"', "'60min'",
+    "asfreq(",
+    "Grouper(",
     "resample(",
-    ".resample(",
 ]
 
 
@@ -349,17 +362,8 @@ def generate_strategy_code_with_deepseek(
         Python 代码字符串
     """
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-
-    if not api_key:
-        raise ValueError(
-            "没有读取到 DEEPSEEK_API_KEY，请在项目根目录的 .env 文件中设置 DEEPSEEK_API_KEY。"
-        )
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com"
-    )
+    # .env 加载与客户端构造单源在 api_config（与审查器同一套）
+    client = make_client()
 
     system_prompt = """
 你是一个量化策略代码生成器。
@@ -412,9 +416,17 @@ def generate_strategy_code_with_deepseek(
         }
     )
 
-    content = response.choices[0].message.content
+    choice = response.choices[0]
 
-    code = clean_python_code(content)
+    # 输出被长度上限截断时，残缺代码会以「语法错误」的误导性报错
+    # 呈现给用户：必须在这里把真因说清楚
+    if choice.finish_reason == "length":
+        raise ValueError(
+            "策略代码生成被输出长度上限截断（策略过于复杂或注释过长），"
+            "请精简策略描述后重试。"
+        )
+
+    code = clean_python_code(choice.message.content)
 
     validate_generated_code(code)
 

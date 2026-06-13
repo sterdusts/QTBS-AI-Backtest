@@ -399,6 +399,16 @@ def test_fractional_target_rejected():
         core.run(make_df([100, 100, 100]))
 
 
+def test_mixed_type_invalid_target_message():
+    """混合类型非法值（'1' 与 0.5）必须报契约错误，
+    不能在 sorted 处炸 TypeError。"""
+    core = CodeBacktestCore(
+        strategy_func=lambda d: d.assign(target_position=["1", 0.5, 0])
+    )
+    with pytest.raises(ValueError, match="只能是 -1, 0, 1"):
+        core.run(make_df([100, 100, 100]))
+
+
 def test_non_finite_target_rejected():
     """inf 必须以契约报错拒绝，而不是在 astype 处抛晦涩的转换错误。"""
     core = CodeBacktestCore(

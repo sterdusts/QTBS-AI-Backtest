@@ -79,6 +79,10 @@ class KlineBuilder:
             (df["close"] > 0)
         ]
 
+        # 时间戳合理性底线：损坏数据产出的 1677/1970 年幽灵索引会让
+        # resample 物化数百年的分箱直接 OOM
+        df = df[df.index >= pd.Timestamp("2010-01-01")]
+
         return df
 
     def get_1m(self) -> pd.DataFrame:

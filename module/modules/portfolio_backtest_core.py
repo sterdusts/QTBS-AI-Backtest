@@ -39,6 +39,7 @@ from module.modules.backtest_metrics import (
     attach_engine_metrics,
     calculate_holding_hours,
     calculate_metrics,
+    normalize_engine_params,
 )
 
 
@@ -59,22 +60,23 @@ class PortfolioBacktestCore:
         liquidation_fee_rate: float = 0.0,
     ):
         self.strategy_func = strategy_func
-        self.initial_cash = float(initial_cash)
-        self.fee_rate = float(fee_rate)
-        self.slippage = float(slippage)
 
-        self.leverage = int(leverage)
-        if self.leverage <= 0:
-            self.leverage = 1
+        # 参数截断规则单源在 backtest_metrics，与单标的引擎完全一致
+        params = normalize_engine_params(
+            initial_cash, fee_rate, slippage, leverage,
+            position_size, maintenance_margin_rate, liquidation_fee_rate,
+        )
+        self.initial_cash = params["initial_cash"]
+        self.fee_rate = params["fee_rate"]
+        self.slippage = params["slippage"]
+        self.leverage = params["leverage"]
+        self.position_size = params["position_size"]
+        self.maintenance_margin_rate = params["maintenance_margin_rate"]
+        self.liquidation_fee_rate = params["liquidation_fee_rate"]
 
-        self.position_size = min(max(float(position_size), 0.0), 1.0)
         self.rebalance_threshold = max(float(rebalance_threshold), 0.0)
-
         self.enable_liquidation = bool(enable_liquidation)
-        # 与 v1 同样截到 1 以下：rate ≥ 1 意味着开仓即触维持线
-        self.maintenance_margin_rate = min(max(float(maintenance_margin_rate), 0.0), 0.99)
         self.stop_on_liquidation = bool(stop_on_liquidation)
-        self.liquidation_fee_rate = max(float(liquidation_fee_rate), 0.0)
 
     # =========================================================
     # 主流程
@@ -354,6 +356,15 @@ class PortfolioBacktestCore:
                         adverse, _ = leg_extremes(s, i)
                         liq_price = avg_entry[s] + (adverse - avg_entry[s]) * alpha
 
+                        # 跳空越过强平价时按本根开盘价结算（与 v1 同规则）：
+                        # 插值价在该根从未成交过，按它结算会凭空回收权益
+                        open_v = opens[s][i]
+                        if not math.isnan(open_v):
+                            if q > 0:
+                                liq_price = min(liq_price, open_v)
+                            else:
+                                liq_price = max(liq_price, open_v)
+
                         realized = q * (liq_price - avg_entry[s])
                         liq_fee = abs(q) * liq_price * self.liquidation_fee_rate
                         liq_fee_total += liq_fee
@@ -403,8 +414,12 @@ class PortfolioBacktestCore:
                         "time": ts,
                         "equity": float(cash),
                         "equity_close": float(cash),
-                        "equity_worst": float(equity_worst),
-                        "equity_best": float(equity_best),
+                        # 全部腿已在强平价结算：账户盘中真实极值就是结算后
+                        # 权益。worst 用虚拟极值会报不可能回撤；best 用虚拟
+                        # 有利极值会造从未实现的幽灵峰抬高后续回撤分母——
+                        # 两者都落到结算后 cash
+                        "equity_worst": float(cash),
+                        "equity_best": float(cash),
                         "liquidated": True,
                     })
 
@@ -554,6 +569,7 @@ class PortfolioBacktestCore:
 
         return {
             "data": data,
+            "raw_weights": raw_weights,   # 策略原始返回值（未经 _prepare_weights）
             "weights": weights,
             "trades": episodes,
             "fills": fills,
@@ -579,6 +595,18 @@ class PortfolioBacktestCore:
             missing = [c for c in required_columns if c not in df.columns]
             if missing:
                 raise ValueError(f"{symbol} 的 K 线缺少必要字段: {missing}")
+
+            # 引擎依赖「同一行 OHLC 要么全有效、要么全 NaN（未上市/缺数据）」
+            # 的不变式：行内混合缺失会让持仓估值取到 None 而深处崩溃，
+            # 必须在入口报清楚
+            valid = df[required_columns].notna()
+            mixed = valid.any(axis=1) & ~valid.all(axis=1)
+            if bool(mixed.any()):
+                raise ValueError(
+                    f"{symbol} 的 K 线存在 OHLC 部分缺失的行（如 open 有值但 "
+                    "close 为 NaN）：同一行要么全部有效、要么全部为 NaN，"
+                    "请使用 data_panel.load_aligned_panel 加载数据"
+                )
 
             if index is None:
                 index = df.index

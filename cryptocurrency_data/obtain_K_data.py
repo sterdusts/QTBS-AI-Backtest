@@ -11,7 +11,11 @@ if _PROJECT_ROOT not in sys.path:
 
 # 符号归一化与文件命名单源在 Load_real_kline：下载侧与读取侧
 # 任何一边单独改动都会让对方找不到文件，不要在本文件重新定义
-from module.modules.Load_real_kline import kline_file_name, normalize_symbol
+from module.modules.Load_real_kline import (
+    atomic_write_csv,
+    kline_file_name,
+    normalize_symbol,
+)
 
 COLS = [
     'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -42,17 +46,27 @@ def load_existing_df(filename: str) -> pd.DataFrame:
 
     df = df[[c for c in COLS if c in df.columns]]
 
-    # 统一 open_time
+    # 统一 open_time。NaT 在 astype(int64) 下会变成 1677 年的哨兵值，
+    # 幽灵行一旦随增量更新落盘，重采样会物化数百年分箱直接 OOM——
+    # 损坏行必须先丢弃
+    # 毫秒换算必须与 datetime64 分辨率无关：pandas 3 默认 us 分辨率，
+    # astype(int64)//10**6 会把毫秒错算成秒（错 1000 倍）
+    epoch = pd.Timestamp(0, tz="UTC")
+    one_ms = pd.Timedelta(milliseconds=1)
+
     if not pd.api.types.is_numeric_dtype(df["open_time"]):
         dt = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
-        df["open_time"] = (dt.astype("int64") // 10**6)
+        df = df[dt.notna()]
+        df["open_time"] = (dt[dt.notna()] - epoch) // one_ms
     else:
         df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+        df = df[df["open_time"].notna()]
 
-    # 统一 close_time
+    # 统一 close_time（同样丢弃损坏行）
     if not pd.api.types.is_numeric_dtype(df["close_time"]):
         dt = pd.to_datetime(df["close_time"], utc=True, errors="coerce")
-        df["close_time"] = (dt.astype("int64") // 10**6)
+        df = df[dt.notna()]
+        df["close_time"] = (dt[dt.notna()] - epoch) // one_ms
     else:
         df["close_time"] = pd.to_numeric(df["close_time"], errors="coerce")
 
@@ -207,8 +221,9 @@ def data_acquisition(
     # 增加可读时间列，但不替代原始毫秒列
     df = add_datetime_columns(df)
 
-    # 保存
-    df.to_csv(filename, index=False, encoding='utf-8-sig')
+    # 原子写：在 .staging 暂存区写完整文件再 os.replace 覆盖原文件，
+    # 让回测读该文件可与本次更新安全并行（永远读到完整文件）
+    atomic_write_csv(df, filename, index=False, encoding='utf-8-sig')
     print(f"✅ 已保存到: {filename}")
     print(f"✅ 当前总行数: {len(df)} | 本次抓取原始新增: {len(new_df)}")
 

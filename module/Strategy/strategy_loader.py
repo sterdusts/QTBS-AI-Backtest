@@ -212,6 +212,14 @@ def validate_strategy_metadata(metadata: dict) -> None:
                 '例如 SYMBOLS = ["BTCUSDT", "ETHUSDT"]。'
             )
         validate_symbols_format(symbols)
+
+        # 重复标的必须拒绝而不是静默去重：策略代码会按原始 SYMBOLS
+        # 建权重列，重复列在引擎 reindex 时炸出无法自查的 pandas 报错
+        duplicates = sorted({s for s in symbols if symbols.count(s) > 1})
+        if duplicates:
+            raise ValueError(
+                f"SYMBOLS 不能包含重复标的: {duplicates}，请去重后重新声明。"
+            )
     elif symbols and len(symbols) > 1:
         raise ValueError(
             "契约 v1 只支持单标的，但 SYMBOLS 声明了多个标的。"

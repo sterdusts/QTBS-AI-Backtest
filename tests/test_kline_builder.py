@@ -61,6 +61,20 @@ def test_drop_incomplete_bar():
     assert len(builder.build("4h", drop_incomplete=False)) == 3
 
 
+def test_ghost_timestamp_rows_dropped():
+    """损坏时间戳产出的 1677 年哨兵值幽灵行必须在清洗时丢弃，
+    否则 resample 会物化数百年分箱直接 OOM。"""
+    raw = make_1m_df("2024-01-01 00:00", 240)
+    ghost = raw.iloc[[0]].copy()
+    ghost["open_time"] = pd.Timestamp("1677-09-21 00:12:43.145224193")
+    raw = pd.concat([ghost, raw], ignore_index=True)
+
+    builder = KlineBuilder(raw)
+
+    assert len(builder.df_1m) == 240
+    assert builder.df_1m.index.min() == pd.Timestamp("2024-01-01 00:00")
+
+
 def test_exact_boundary_bar_kept():
     """
     回归测试：数据恰好结束于周期边界前 1 分钟时（00:00-03:59），

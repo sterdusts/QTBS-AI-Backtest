@@ -3,12 +3,13 @@ data_panel 多资产对齐数据层测试。
 """
 
 import os
+import time
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from module.modules import data_panel
+from module.modules import data_panel, fetch_queue
 from module.modules.data_panel import (
     align_klines,
     filter_df_by_date,
@@ -22,8 +23,10 @@ from module.modules.Load_real_kline import kline_file_name
 @pytest.fixture(autouse=True)
 def clean_cache():
     data_panel.clear_cache()
+    fetch_queue.reset()
     yield
     data_panel.clear_cache()
+    fetch_queue.reset()
 
 
 def write_synthetic_csv(data_dir, symbol, start, periods):
@@ -78,10 +81,74 @@ def test_missing_data_without_autofetch_raises(tmp_path):
 def test_auto_fetch_failure_raises_actionable_error(tmp_path, monkeypatch):
     """下载层吞掉异常空手而归时，必须报「拉取失败」而不是指向
     一个本就不该存在的文件的 FileNotFoundError。"""
-    monkeypatch.setattr(data_panel, "Obtain_K", lambda symbol, save_dir: None)
+    # 拉取由 fetch_queue 的 worker 执行：patch 它的 Obtain_K（no-op 不落盘）
+    monkeypatch.setattr(fetch_queue, "Obtain_K", lambda symbol, save_dir: None)
 
     with pytest.raises(ValueError, match="自动拉取"):
         load_symbol_kline("BTC", "4h", data_dir=str(tmp_path), auto_fetch=True)
+
+
+def _wait_queue_idle(timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not fetch_queue.is_running():
+            return
+        time.sleep(0.02)
+
+
+def test_stale_data_triggers_incremental_refresh(tmp_path, monkeypatch):
+    """请求窗口超出本地覆盖：触发一次非阻塞后台增量补拉，同进程内不重复打 API。"""
+    data_dir = str(tmp_path)
+    write_synthetic_csv(data_dir, "BTCUSDT", "2024-01-01 00:00", 480)  # 截止 01-01 07:59
+
+    calls = []
+    monkeypatch.setattr(
+        fetch_queue, "Obtain_K", lambda symbol, save_dir: calls.append(symbol)
+    )
+
+    # 增量补拉现在是非阻塞后台 enqueue：回测立即返回，worker 异步拉取
+    load_symbol_kline("BTC", "1h", data_dir=data_dir,
+                      auto_fetch=True, required_end="2024-02-01")
+    _wait_queue_idle()
+    assert calls == ["BTCUSDT"]
+
+    load_symbol_kline("BTC", "1h", data_dir=data_dir,
+                      auto_fetch=True, required_end="2024-02-01")
+    _wait_queue_idle()
+    assert calls == ["BTCUSDT"]  # 每进程每标的最多一次
+
+
+def test_covered_window_skips_refresh(tmp_path, monkeypatch):
+    """本地数据已覆盖请求窗口（含当天整天）：不打 API。"""
+    data_dir = str(tmp_path)
+    # 2 天数据（截止 2024-01-02 23:59）覆盖 required_end=2024-01-01 的整天
+    write_synthetic_csv(data_dir, "BTCUSDT", "2024-01-01 00:00", 2 * 1440)
+
+    calls = []
+    monkeypatch.setattr(
+        fetch_queue, "Obtain_K", lambda symbol, save_dir: calls.append(symbol)
+    )
+
+    load_symbol_kline("BTC", "1h", data_dir=data_dir,
+                      auto_fetch=True, required_end="2024-01-01")
+    assert calls == []
+
+
+def test_refresh_when_data_ends_within_requested_day(tmp_path, monkeypatch):
+    """#32 回归：本地数据落在请求当天内（如截止当天 07:59，窗口要到当天
+    23:59）必须补拉，不能因午夜口径误判已覆盖而少近一天数据。"""
+    data_dir = str(tmp_path)
+    write_synthetic_csv(data_dir, "BTCUSDT", "2024-01-01 00:00", 480)  # 截止 01-01 07:59
+
+    calls = []
+    monkeypatch.setattr(
+        fetch_queue, "Obtain_K", lambda symbol, save_dir: calls.append(symbol)
+    )
+
+    load_symbol_kline("BTC", "1h", data_dir=data_dir,
+                      auto_fetch=True, required_end="2024-01-01")
+    _wait_queue_idle()
+    assert calls == ["BTCUSDT"]
 
 
 def test_cache_avoids_rereading_csv(tmp_path, monkeypatch):

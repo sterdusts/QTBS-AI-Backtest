@@ -5,6 +5,7 @@ from module.modules.backtest_metrics import (
     attach_engine_metrics,
     calculate_holding_hours,
     calculate_metrics,
+    normalize_engine_params,
 )
 
 
@@ -43,22 +44,22 @@ class CodeBacktestCore:
         liquidation_fee_rate: float = 0.0,
     ):
         self.strategy_func = strategy_func
-        self.initial_cash = float(initial_cash)
-        self.fee_rate = float(fee_rate)
-        self.slippage = float(slippage)
 
-        self.leverage = int(leverage)
-        if self.leverage <= 0:
-            self.leverage = 1
-
-        self.position_size = float(position_size)
-        self.position_size = min(max(self.position_size, 0.0), 1.0)
+        # 参数截断规则单源在 backtest_metrics，与组合引擎完全一致
+        params = normalize_engine_params(
+            initial_cash, fee_rate, slippage, leverage,
+            position_size, maintenance_margin_rate, liquidation_fee_rate,
+        )
+        self.initial_cash = params["initial_cash"]
+        self.fee_rate = params["fee_rate"]
+        self.slippage = params["slippage"]
+        self.leverage = params["leverage"]
+        self.position_size = params["position_size"]
+        self.maintenance_margin_rate = params["maintenance_margin_rate"]
+        self.liquidation_fee_rate = params["liquidation_fee_rate"]
 
         self.enable_liquidation = bool(enable_liquidation)
-        # rate ≥ 1 没有意义（开仓即触线）且会让强平价公式除零，截到 1 以下
-        self.maintenance_margin_rate = min(max(float(maintenance_margin_rate), 0.0), 0.99)
         self.stop_on_liquidation = bool(stop_on_liquidation)
-        self.liquidation_fee_rate = max(float(liquidation_fee_rate), 0.0)
 
     def run(self, df: pd.DataFrame) -> dict:
         # 浅拷贝即可防策略篡改：pandas 写时复制下任何写入只复制被改的块
@@ -95,7 +96,9 @@ class CodeBacktestCore:
         raw_target = df["target_position"].fillna(0)
         invalid_mask = ~raw_target.isin([-1, 0, 1])
         if invalid_mask.any():
-            invalid_values = sorted(set(raw_target[invalid_mask].tolist()))
+            # key=repr：非法值可能混合类型（如 '1' 与 0.5），裸 sorted 会
+            # 抛 TypeError，把契约报错变成 Python 内部错误
+            invalid_values = sorted(set(raw_target[invalid_mask].tolist()), key=repr)
             raise ValueError(
                 f"target_position 只能是 -1, 0, 1，发现非法值: {invalid_values}"
             )
@@ -144,6 +147,7 @@ class CodeBacktestCore:
             liquidation_event = None
 
             if self.enable_liquidation and position_side != 0:
+                # open_price 只有强平分支用到：空仓/关闭强平时不必每根取值
                 liquidation_event = self._check_liquidation(
                     current_time=current_time,
                     cash=cash,
@@ -156,6 +160,7 @@ class CodeBacktestCore:
                     entry_margin=entry_margin,
                     entry_notional=entry_notional,
                     entry_open_fee=entry_open_fee,
+                    open_price=float(df["open"].iloc[i]),
                     high_price=high_price,
                     low_price=low_price,
                 )
@@ -195,8 +200,12 @@ class CodeBacktestCore:
                     "equity_close": float(cash),
                     "equity_at_high": float(mtm["equity_at_high"]),
                     "equity_at_low": float(mtm["equity_at_low"]),
-                    "equity_worst": float(mtm["equity_worst"]),
-                    "equity_best": float(mtm["equity_best"]),
+                    # 仓位在强平价已被关闭：账户盘中真实极值就是结算后
+                    # 权益。worst 用虚拟极值会报 < -100% 的不可能回撤；
+                    # best 用虚拟有利极值会造一个仓位从未实现的幽灵峰，
+                    # 抬高后续回撤分母——两者都必须落到结算后 cash
+                    "equity_worst": float(cash),
+                    "equity_best": float(cash),
                     "price_high": float(high_price),
                     "price_low": float(low_price),
                     "price_close": float(close_price),
@@ -622,6 +631,7 @@ class CodeBacktestCore:
         entry_margin,
         entry_notional,
         entry_open_fee,
+        open_price,
         high_price,
         low_price,
     ):
@@ -637,16 +647,26 @@ class CodeBacktestCore:
             liquidation_price = (position * entry_price - cash) / (position * (1.0 - rate))
             triggered = low_price <= liquidation_price
             trigger_price, trigger_field = low_price, "low"
+            # 跳空越过强平价时按本根开盘价结算：理论强平价在该根
+            # 从未成交过，按它结算会凭空回收市场没给过的权益
+            fill_price = min(liquidation_price, open_price)
         else:
             liquidation_price = (position * entry_price + cash) / (position * (1.0 + rate))
             triggered = high_price >= liquidation_price
             trigger_price, trigger_field = high_price, "high"
+            fill_price = max(liquidation_price, open_price)
 
         if not triggered:
             return None
 
-        # 触发时的权益恰好等于维持保证金线
-        liquidation_equity = rate * position * liquidation_price
+        # 结算后权益 = 按实际成交价的盯市权益（非跳空时恰好等于维持线）
+        liquidation_equity = self._equity_at_price(
+            cash=cash,
+            position=position,
+            position_side=position_side,
+            entry_price=entry_price,
+            mark_price=fill_price,
+        )
 
         return {
             "time": str(current_time),
@@ -654,7 +674,7 @@ class CodeBacktestCore:
             "entry_time": str(entry_time),
             "entry_price": float(entry_price),
             "entry_raw_price": float(entry_raw_price),
-            "liquidation_price": float(liquidation_price),
+            "liquidation_price": float(fill_price),
             "trigger_price": float(trigger_price),
             "trigger_field": trigger_field,
             "equity_before": float(entry_equity),
@@ -662,7 +682,7 @@ class CodeBacktestCore:
             "entry_margin": float(entry_margin),
             "entry_notional": float(entry_notional),
             "open_fee": float(entry_open_fee),
-            "liquidation_fee": float(abs(position * liquidation_price) * self.liquidation_fee_rate),
+            "liquidation_fee": float(abs(position * fill_price) * self.liquidation_fee_rate),
             "leverage": int(self.leverage),
             "position_size": float(self.position_size),
             "maintenance_margin_rate": float(self.maintenance_margin_rate),

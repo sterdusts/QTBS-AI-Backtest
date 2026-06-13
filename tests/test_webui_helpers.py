@@ -172,12 +172,15 @@ def test_route_v2():
     assert resolve_strategy_route(V2_HEDGE, "BTC") == (2, ["BTCUSDT", "ETHUSDT"])
 
 
-def test_route_v2_dedups_symbols():
+def test_route_v2_duplicate_symbols_rejected():
+    # 重复标的不再静默去重：策略代码按原始 SYMBOLS 建权重列，
+    # 去重后的面板与重复列的权重表在引擎深处对不上
     code = V2_HEDGE.replace(
         'SYMBOLS = ["BTCUSDT", "ETHUSDT"]',
         'SYMBOLS = ["BTCUSDT", "BTCUSDT", "ETHUSDT"]',
     )
-    assert resolve_strategy_route(code, "BTC") == (2, ["BTCUSDT", "ETHUSDT"])
+    with pytest.raises(ValueError, match="重复"):
+        resolve_strategy_route(code, "BTC")
 
 
 def test_route_v2_bad_symbol_format_raises():

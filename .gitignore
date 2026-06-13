@@ -68,3 +68,7 @@ desktop.ini
 gradio_cached_examples/
 # Claude Code session data
 .claude/
+
+# 原子写暂存目录（临时文件，永不提交）
+.staging/
+*.tmp

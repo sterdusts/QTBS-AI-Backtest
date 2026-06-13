@@ -19,6 +19,7 @@ from pyecharts import options as opts
 from pyecharts.charts import Grid, Line, Scatter
 
 from module.modules.file_naming import build_timestamped_filename
+from module.modules.Load_real_kline import get_base_asset
 from module.modules.generic_chart import (
     _apply_responsive,
     _apply_switcher_block,
@@ -169,7 +170,7 @@ def plot_portfolio_result(
     bar_count = len(x_data)
     time_to_pos = {t: i for i, t in enumerate(x_data)}
 
-    base_names = [s.replace("USDT", "") for s in symbols]
+    base_names = [get_base_asset(s) for s in symbols]
     title = f"{' + '.join(base_names)} {timeframe} {_t(language, 'title')}".strip()
 
     # ---------- 全分辨率序列 ----------

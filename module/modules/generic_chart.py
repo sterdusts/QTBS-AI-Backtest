@@ -137,6 +137,19 @@ LANG_TEXT = {
 }
 
 
+# 图表标题模板的唯一出处：Python 首次渲染与注入页面的 JS 语言切换
+# 共用同一份（此前两侧各写一份格式串，JS 版在页面 load 后必定覆盖
+# Python 版，只改一侧的修改 0.4 秒后就被静默冲掉）
+CHART_TITLE_TEMPLATES = {
+    "zh": "{symbol} {interval} 策略回测图表",
+    "en": "{symbol} {interval} Strategy Backtest Chart",
+    "ko": "{symbol} {interval} 전략 백테스트 차트",
+    "ja": "{symbol} {interval} 戦略バックテストチャート",
+    "ru": "{symbol} {interval} график бэктеста стратегии",
+    "ar": "{symbol} {interval} مخطط اختبار الاستراتيجية",
+}
+
+
 def make_translator(table):
     """
     图表文案查找工厂：generic 与 portfolio 共用同一回退语义——
@@ -206,19 +219,9 @@ def _infer_symbol_interval(result: dict, file_prefix: str):
 def _build_chart_title(result: dict, file_prefix: str, language: str, title: str):
     symbol, interval = _infer_symbol_interval(result, file_prefix)
 
-    if symbol and interval:
-        if language == "zh":
-            return f"{symbol} {interval} 策略回测图表"
-        if language == "en":
-            return f"{symbol} {interval} Strategy Backtest Chart"
-        if language == "ko":
-            return f"{symbol} {interval} 전략 백테스트 차트"
-        if language == "ja":
-            return f"{symbol} {interval} 戦略バックテストチャート"
-        if language == "ru":
-            return f"{symbol} {interval} график бэктеста стратегии"
-        if language == "ar":
-            return f"{symbol} {interval} مخطط اختبار الاستراتيجية"
+    template = CHART_TITLE_TEMPLATES.get(language)
+    if symbol and interval and template:
+        return template.format(symbol=symbol, interval=interval)
 
     return title if title else _t(language, "chart_title")
 
@@ -672,6 +675,7 @@ def _apply_responsive_and_multilingual(
         language_options += f'<option value="{code}" {selected}>{info["lang_name"]}</option>'
 
     translations_json = json.dumps(LANG_TEXT, ensure_ascii=False)
+    title_templates_json = json.dumps(CHART_TITLE_TEMPLATES, ensure_ascii=False)
     meta_json = json.dumps(
         {
             "symbol": symbol,
@@ -717,6 +721,7 @@ def _apply_responsive_and_multilingual(
 
 <script>
 const QTBS_TRANSLATIONS = {translations_json};
+const QTBS_TITLE_TEMPLATES = {title_templates_json};
 const QTBS_CHART_META = {meta_json};
 const QTBS_INITIAL_LANGUAGE = "{default_language}";
 let QTBS_CURRENT_LANGUAGE = QTBS_INITIAL_LANGUAGE;
@@ -744,14 +749,10 @@ function qtbsBuildTitle(lang) {{
     const t = QTBS_TRANSLATIONS[lang] || QTBS_TRANSLATIONS["zh"];
     const symbol = QTBS_CHART_META.symbol || "";
     const interval = QTBS_CHART_META.interval || "";
+    const template = QTBS_TITLE_TEMPLATES[lang];
 
-    if (symbol && interval) {{
-        if (lang === "zh") return symbol + " " + interval + " 策略回测图表";
-        if (lang === "en") return symbol + " " + interval + " Strategy Backtest Chart";
-        if (lang === "ko") return symbol + " " + interval + " 전략 백테스트 차트";
-        if (lang === "ja") return symbol + " " + interval + " 戦略バックテストチャート";
-        if (lang === "ru") return symbol + " " + interval + " график бэктеста стратегии";
-        if (lang === "ar") return symbol + " " + interval + " مخطط اختبار الاستراتيجية";
+    if (symbol && interval && template) {{
+        return template.replace("{{symbol}}", symbol).replace("{{interval}}", interval);
     }}
 
     return t.chart_title;

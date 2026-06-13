@@ -13,6 +13,37 @@ import numpy as np
 import pandas as pd
 
 
+def normalize_engine_params(
+    initial_cash,
+    fee_rate,
+    slippage,
+    leverage,
+    position_size,
+    maintenance_margin_rate,
+    liquidation_fee_rate,
+) -> dict:
+    """
+    两引擎共用的参数归一化（截断规则单源）：任一侧单独改截断规则会让
+    同一组 UI 输入在 v1/v2 下产生不同的有效参数，且报告回显各自实例
+    属性、看起来"参数一致"，分叉极难被发现。
+    """
+
+    lev = int(leverage)
+    if lev <= 0:
+        lev = 1
+
+    return {
+        "initial_cash": float(initial_cash),
+        "fee_rate": float(fee_rate),
+        "slippage": float(slippage),
+        "leverage": lev,
+        "position_size": min(max(float(position_size), 0.0), 1.0),
+        # rate ≥ 1 没有意义（开仓即触维持线）且会让强平价公式除零
+        "maintenance_margin_rate": min(max(float(maintenance_margin_rate), 0.0), 0.99),
+        "liquidation_fee_rate": max(float(liquidation_fee_rate), 0.0),
+    }
+
+
 def calculate_holding_hours(entry_time, exit_time) -> float:
     """持仓时长口径的唯一定义（两引擎共用，接受 Timestamp 或字符串）。"""
 
@@ -62,14 +93,23 @@ def calculate_metrics(
     else:
         total_return_pct = (final_equity / initial_cash - 1) * 100
 
-    worst_equity_values = np.array(
-        [x.get("equity_worst", x["equity"]) for x in equity_curve],
-        dtype=float,
-    )
+    # 一次遍历同时取 worst/best，避免对逐根 dict 列表扫两遍
+    worst_list = []
+    best_list = []
+    for x in equity_curve:
+        eq = x["equity"]
+        worst_list.append(x.get("equity_worst", eq))
+        best_list.append(x.get("equity_best", x.get("equity_close", eq)))
+
+    worst_equity_values = np.array(worst_list, dtype=float)
+    best_equity_values = np.array(best_list, dtype=float)
 
     if len(worst_equity_values) > 0:
-        peak = np.maximum.accumulate(worst_equity_values)
-        peak = np.where(peak == 0, np.nan, peak)
+        # 峰值取盘中最有利权益、谷底取盘中最不利权益：两侧都按对账户
+        # 最严苛的口径。峰值若也用 worst，由收盘/有利极值创出的真实峰
+        # 会被忽略，回撤被系统性低估
+        peak = np.maximum.accumulate(best_equity_values)
+        peak = np.where(peak <= 0, np.nan, peak)
         drawdown = (worst_equity_values - peak) / peak
         drawdown = drawdown[~np.isnan(drawdown)]
         max_drawdown_pct = float(drawdown.min() * 100) if len(drawdown) > 0 else 0.0
@@ -94,9 +134,20 @@ def calculate_metrics(
         duration_days = (end_time - start_time).total_seconds() / 86400
 
         if duration_days > 0 and initial_cash > 0 and final_equity > 0:
-            annual_return_pct = ((final_equity / initial_cash) ** (365.25 / duration_days) - 1) * 100
+            try:
+                annual_return_pct = ((final_equity / initial_cash) ** (365.25 / duration_days) - 1) * 100
+            except OverflowError:
+                # 极短窗口 + 高收益时指数爆出 float 上限：这种窗口下
+                # 年化本就没有统计意义，诚实地给 inf 而不是让整个
+                # 回测结果在指标阶段崩溃报废
+                annual_return_pct = float("inf")
 
-        returns = equity_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if (equity_series <= 0).any():
+            # 权益穿零后 pct_change 以负基数计算，收益序列符号全错，
+            # 夏普会变成错误符号的垃圾值：直接跳过（保持 0）
+            returns = pd.Series(dtype=float)
+        else:
+            returns = equity_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
 
         time_diffs = equity_df["time"].diff().dropna()
 

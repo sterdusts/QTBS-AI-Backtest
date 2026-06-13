@@ -28,10 +28,10 @@ import pandas as pd
 if int(pd.__version__.split(".")[0]) < 3:
     pd.set_option("mode.copy_on_write", True)
 
+from module.modules import fetch_queue
 from module.modules.kline_builder import KlineBuilder
 from module.modules.Load_real_kline import (
     KLINE_FILE_SUFFIX,
-    Obtain_K,
     get_kline_file_path,
     has_kline_data,
     normalize_symbol,
@@ -62,11 +62,47 @@ _KLINE_CACHE_MAX_ENTRIES = 32
 # A 标的的数据当成 B 返回并永久毒化重采样缓存。
 _LAST_BUILDER: dict = {"slot": None}
 
+# 本进程已做过增量补拉的标的：数据源停更/标的退市时不会每次回测都打 API
+_REFRESHED_SYMBOLS: set = set()
+
 
 def clear_cache() -> None:
     """清空 K 线缓存（主要用于测试）。"""
     _KLINE_CACHE.clear()
     _LAST_BUILDER["slot"] = None
+    _REFRESHED_SYMBOLS.clear()
+
+
+def _local_data_end(file_path: str):
+    """只读 CSV 尾部取最后一行的 open_time：避免为一次覆盖检查整读数百 MB。"""
+
+    try:
+        size = os.path.getsize(file_path)
+        with open(file_path, "rb") as f:
+            f.seek(max(0, size - 8192))
+            lines = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+    except OSError:
+        return None
+
+    if not lines:
+        return None
+
+    first_field = lines[-1].split(",")[0].strip().strip('"')
+
+    try:
+        ts = pd.Timestamp(int(float(first_field)), unit="ms")
+    except (ValueError, OverflowError):
+        try:
+            ts = pd.Timestamp(first_field)
+        except (ValueError, TypeError):
+            return None
+
+    # 遗留 CSV 的时间戳可能带时区（ISO +00:00）：统一剥成 tz-naive，
+    # 否则与 tz-naive 的 required_end 比较会抛 TypeError 让回测崩溃
+    if ts.tz is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+
+    return ts
 
 
 def list_local_symbols(data_dir: str = DEFAULT_DATA_DIR) -> list:
@@ -103,30 +139,70 @@ def _get_builder(symbol: str, file_path: str, mtime: float, data_dir: str) -> Kl
     return builder
 
 
-def _ensure_local_data(symbol: str, data_dir: str, auto_fetch: bool) -> None:
-    """确保本地有该标的的 1m 数据；拉取后必须验证文件确实落盘。"""
+def _ensure_local_data(
+    symbol: str,
+    data_dir: str,
+    auto_fetch: bool,
+    required_end=None,
+) -> None:
+    """确保本地有该标的的 1m 数据；拉取后必须验证文件确实落盘。
 
-    if has_kline_data(symbol, data_dir=data_dir):
+    required_end（日期字符串/时间戳）给出本次回测需要的数据截止点：
+    本地已有数据但覆盖不到时做一次增量补拉（下载器自带断点续传），
+    否则旧数据会被静默截断、回测窗口与请求窗口不一致。
+    """
+
+    if not has_kline_data(symbol, data_dir=data_dir):
+        if not auto_fetch:
+            raise FileNotFoundError(
+                f"找不到 {symbol} 的本地 K 线数据（目录: {data_dir}），且 auto_fetch=False"
+            )
+
+        print(f"正在拉取 {symbol} 数据")
+        # 本地完全无数据：必须阻塞等到首次拉取完成才能回测
+        _fetch_blocking(symbol, data_dir)
+
+        # 下载层吞掉网络异常时只会留下空手而归的目录：必须在这里把
+        # 「拉取失败」翻译成可行动的报错，而不是放任后续抛出指向
+        # 一个本就不该存在的文件的 FileNotFoundError
+        if not has_kline_data(symbol, data_dir=data_dir):
+            raise ValueError(
+                f"自动拉取 {symbol} 数据失败（交易对不存在或网络错误），"
+                "请检查标的名称与网络连接后重试。"
+            )
         return
 
-    if not auto_fetch:
-        raise FileNotFoundError(
-            f"找不到 {symbol} 的本地 K 线数据（目录: {data_dir}），且 auto_fetch=False"
-        )
+    # 已有数据但请求窗口超出本地覆盖：提交**非阻塞**后台增量更新，
+    # 回测立即用现有数据继续（摘要显示实际数据范围），不为补齐而卡顿。
+    # 下载器原子写，下次回测就能拿到更新后的完整数据。每进程每标的触发一次。
+    if not auto_fetch or required_end is None:
+        return
 
-    print(f"正在拉取 {symbol} 数据")
-    # 必须把 data_dir 透传给拉取函数，否则数据会下载到默认目录、
-    # 随后在 data_dir 里仍然找不到文件
-    Obtain_K(symbol, save_dir=data_dir)
+    key = (symbol, os.path.abspath(data_dir))
+    if key in _REFRESHED_SYMBOLS:
+        return
 
-    # 下载层吞掉网络异常时只会留下空手而归的目录：必须在这里把
-    # 「拉取失败」翻译成可行动的报错，而不是放任后续抛出指向
-    # 一个本就不该存在的文件的 FileNotFoundError
-    if not has_kline_data(symbol, data_dir=data_dir):
-        raise ValueError(
-            f"自动拉取 {symbol} 数据失败（交易对不存在或网络错误），"
-            "请检查标的名称与网络连接后重试。"
-        )
+    file_path = get_kline_file_path(symbol, data_dir=data_dir)
+    data_end = _local_data_end(file_path)
+
+    # gate 与 filter_df_by_date 用同一 end-of-day 口径：否则本地数据落在
+    # 请求当天内（如 data_end=当天00:00、窗口要到当天23:59）会被误判为
+    # 已覆盖而不更新
+    required_ts = _resolve_end_ts(required_end)
+    if data_end is not None and required_ts is not None and data_end >= required_ts:
+        return
+
+    _REFRESHED_SYMBOLS.add(key)
+    print(f"{symbol} 本地数据截止 {data_end}，后台增量更新中（回测用现有数据）")
+    fetch_queue.enqueue([symbol], data_dir)
+
+
+def _fetch_blocking(symbol: str, data_dir: str) -> None:
+    """本地完全无数据时的回测按需拉取：必须阻塞等到首次拉取完成才能回测。
+
+    与启动批量更新共用同一队列/去重/计数（不另起下载、不重复拉）。
+    """
+    fetch_queue.fetch_blocking(symbol, data_dir)
 
 
 def load_symbol_kline(
@@ -134,12 +210,14 @@ def load_symbol_kline(
     timeframe: str,
     data_dir: str = DEFAULT_DATA_DIR,
     auto_fetch: bool = True,
+    required_end=None,
 ) -> pd.DataFrame:
     """
     加载单标的、单周期 K 线。
 
     - 只构造请求的周期（多标的场景下避免 6 倍重采样开销）
     - 重采样结果按 CSV mtime 缓存，重复回测不再重读 CSV
+    - required_end 给出本次需要的数据截止点：本地覆盖不到时增量补拉
     """
 
     symbol = normalize_symbol(symbol)
@@ -149,7 +227,7 @@ def load_symbol_kline(
             f"不支持的周期: {timeframe}，可用周期: {list(TIMEFRAME_TO_PANDAS.keys())}"
         )
 
-    _ensure_local_data(symbol, data_dir, auto_fetch)
+    _ensure_local_data(symbol, data_dir, auto_fetch, required_end=required_end)
 
     file_path = get_kline_file_path(symbol, data_dir=data_dir)
     mtime = os.path.getmtime(file_path)
@@ -218,6 +296,7 @@ def load_aligned_panel(
     auto_fetch: bool = True,
     start_date: str | None = None,
     end_date: str | None = None,
+    required_end=None,
 ) -> dict:
     """
     加载多标的对齐数据面板：契约 v2 中 generate_signals(data) 的标准输入。
@@ -225,11 +304,17 @@ def load_aligned_panel(
     日期过滤在对齐之前逐标的执行：过滤是纯索引谓词，先过滤后对齐与
     先对齐后过滤结果完全等价，但对齐规模从全历史降到回测窗口。
 
+    required_end 缺省派生自 end_date：只传 end_date 的调用方也能触发
+    增量补拉，不会因为漏传 required_end 而退回「旧数据静默截断」的故障。
+
     返回：{symbol: DataFrame}，所有 DataFrame 索引完全相同。
     """
 
     if not symbols:
         raise ValueError("symbols 不能为空")
+
+    if required_end is None:
+        required_end = end_date
 
     # 归一化 + 去重（保持顺序）
     normalized = []
@@ -238,10 +323,10 @@ def load_aligned_panel(
         if s not in normalized:
             normalized.append(s)
 
-    # 缺数据的标的先串行拉取：并行打 Binance 接口会叠加请求权重
-    # 触发限频/封禁，下载失败的报错也要在进池之前就抛清楚
+    # 缺数据/覆盖不足的标的先串行拉取：并行打 Binance 接口会叠加请求
+    # 权重触发限频/封禁，下载失败的报错也要在进池之前就抛清楚
     for s in normalized:
-        _ensure_local_data(s, data_dir, auto_fetch)
+        _ensure_local_data(s, data_dir, auto_fetch, required_end=required_end)
 
     if len(normalized) == 1:
         s = normalized[0]
@@ -275,18 +360,19 @@ def filter_df_by_date(df: pd.DataFrame, start_str: str, end_str: str) -> pd.Data
     """
 
     start = start_str if start_str else None
-
-    end = None
-    if end_str:
-        end_ts = pd.Timestamp(end_str)
-        if end_ts == end_ts.normalize():
-            # 纯日期：包含当天整天（.loc 切片对 DatetimeIndex 是闭区间，
-            # 取「次日 0 点的前一瞬」）
-            end = end_ts + timedelta(days=1) - timedelta(microseconds=1)
-        else:
-            # 带时间分量：按精确时刻截止
-            end = end_ts
+    end = _resolve_end_ts(end_str)
 
     # 有序 DatetimeIndex 上 .loc 切片是 O(log n) 定位 + 惰性共享数据，
     # 不像布尔掩码那样物化两份全量拷贝
     return df.loc[start:end]
+
+
+def _resolve_end_ts(end_str):
+    """把结束日期解析成包含的最后时刻：纯日期→当天 23:59:59.999999，
+    带时间分量→精确时刻。增量补拉判断与过滤切片共用，避免两者口径差近一天。"""
+    if not end_str:
+        return None
+    end_ts = pd.Timestamp(end_str)
+    if end_ts == end_ts.normalize():
+        return end_ts + timedelta(days=1) - timedelta(microseconds=1)
+    return end_ts

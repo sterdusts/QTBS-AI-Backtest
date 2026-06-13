@@ -408,6 +408,63 @@ def test_close_allowed_when_equity_below_zero():
     assert result["metrics"]["final_equity"] == pytest.approx(-2000.0)
 
 
+def test_engine_param_normalization_identical():
+    """参数截断规则单源：同一组边界输入在两引擎得到完全相同的有效参数。"""
+    kwargs = dict(
+        initial_cash="1000", fee_rate=0.001, slippage=0.002,
+        leverage=0, position_size=1.7,
+        maintenance_margin_rate=2.0, liquidation_fee_rate=-1,
+    )
+
+    v1 = CodeBacktestCore(lambda d: d, **kwargs)
+    v2 = PortfolioBacktestCore(lambda d: d, **kwargs)
+
+    for attr in [
+        "initial_cash", "fee_rate", "slippage", "leverage",
+        "position_size", "maintenance_margin_rate", "liquidation_fee_rate",
+    ]:
+        assert getattr(v1, attr) == getattr(v2, attr)
+
+    assert v1.leverage == 1
+    assert v1.position_size == 1.0
+    assert v1.maintenance_margin_rate == pytest.approx(0.99)
+    assert v1.liquidation_fee_rate == 0.0
+
+
+def test_gap_liquidation_settles_at_open():
+    """跳空越过强平价：按本根开盘价结算（理论强平价该根从未成交），
+    两引擎同一规则。手算：强平价 9000/95≈94.74，本根开盘 80 已穿过 →
+    按 80 结算，权益 1000+100×(80−100) = −1000 → 地板 0。"""
+    opens = [100, 100, 80, 80]
+    lows = [100, 100, 70, 80]
+    targets = [1, 1, 1, 1]
+
+    kw = dict(initial_cash=1000.0, leverage=10, maintenance_margin_rate=0.05)
+
+    v1 = CodeBacktestCore(
+        strategy_func=strategy_from_targets(targets), **kw
+    ).run(make_df(opens, lows=lows))
+
+    v2 = run_portfolio({"BTCUSDT": make_df(opens, lows=lows)},
+                       [(t,) for t in targets], **kw)
+
+    assert v1["liquidation_events"][0]["liquidation_price"] == pytest.approx(80.0)
+    assert v2["liquidation_events"][0]["legs"][0]["liquidation_price"] == pytest.approx(80.0)
+
+    assert v1["metrics"]["final_equity"] == pytest.approx(0.0)
+    assert v2["metrics"]["final_equity"] == pytest.approx(0.0)
+
+
+def test_partial_nan_row_rejected():
+    """行内混合缺失（open 有值、close 为 NaN）必须在入口报错，
+    不能等持仓估值取到 None 在引擎深处炸 TypeError。"""
+    df = make_df([100, 100, 100])
+    df.loc[df.index[1], "close"] = float("nan")
+
+    with pytest.raises(ValueError, match="部分缺失"):
+        run_portfolio({"BTCUSDT": df}, [(0,)] * 3)
+
+
 def test_reopen_after_liquidation_when_not_stopping():
     """对账语义下强平后目标仍为非零 → 下一根重新开仓（v1/v2 一致，
     契约 §5.3/§10.5）；stop_on_liquidation=True（默认）则回测终止不受影响。"""
