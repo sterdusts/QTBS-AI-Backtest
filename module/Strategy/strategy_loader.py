@@ -9,6 +9,7 @@
 """
 
 import ast
+import builtins
 import os
 import types
 import uuid
@@ -18,6 +19,104 @@ from module.modules.file_naming import build_timestamped_filename
 
 # 策略代码审计留档目录（仅留档，不参与执行）
 STRATEGY_AUDIT_DIR = os.path.join("Past_data", "strategy_code")
+
+
+# AST import 白名单的唯一出处：validate_strategy_code 的静态检查与
+# 运行期受限 __import__（_make_restricted_import）共用同一集合，
+# 两侧不一致会出现「静态放行、运行期拒绝」之类的不对称行为。
+ALLOWED_IMPORT_ROOTS = ("pandas", "numpy")
+
+
+# exec 沙箱：策略以最小纯计算内置命名空间执行。
+#
+# 背景（修复高危 #4）：types.ModuleType.__dict__ 没有 '__builtins__' 键时，
+# CPython 在 exec 期会自动注入【完整】内置命名空间（open/getattr/__import__
+# 全部可用）。仅靠 FORBIDDEN_KEYWORDS 子串匹配（可被 'o'+'pen' 拼接绕过）
+# 与 ast.Import/ImportFrom 白名单（不审属性链与 __import__() 调用）拦不住，
+# 通过校验的策略可经 generate_signals.__globals__['__builtins__']['open']
+# 或 (1).__class__...__subclasses__() 回取 os 在 Past_data 写文件，击穿契约
+# §1/§6「纯函数不读写文件」承诺。
+#
+# 对策：exec 前显式把 module.__dict__['__builtins__'] 设为下面这份白名单，
+# 阻断 CPython 的完整注入。只放行无副作用、不能回取宿主对象的纯计算内置；
+# open/__import__/getattr/eval/exec/compile/vars/dir/globals/locals/input/
+# __build_class__/memoryview/breakpoint 等一律不放行。策略靠自身
+# `import pandas as pd` 取得依赖，因此唯一放行的「带副作用」内置是一个
+# 受限 __import__（见 _make_restricted_import），仅允许 ALLOWED_IMPORT_ROOTS。
+_SAFE_BUILTIN_NAMES = (
+    # 数值/聚合
+    "abs", "round", "min", "max", "sum", "pow", "divmod",
+    # 序列/迭代
+    "len", "range", "enumerate", "zip", "sorted", "reversed",
+    "map", "filter", "any", "all", "iter", "next", "slice",
+    # 类型构造与判定
+    "bool", "int", "float", "complex", "str", "bytes", "bytearray",
+    "list", "tuple", "dict", "set", "frozenset",
+    "isinstance", "issubclass", "callable", "hasattr",
+    # 表示/格式化/进制
+    "repr", "format", "hex", "oct", "bin", "ord", "chr", "ascii",
+    # 调试输出（写 stdout，不触及文件系统）
+    "print",
+    # 常量
+    "True", "False", "None", "NotImplemented", "Ellipsis",
+    # 异常体系（策略与引擎需要 raise / 捕获）
+    "Exception", "BaseException", "ValueError", "TypeError", "KeyError",
+    "IndexError", "RuntimeError", "ArithmeticError", "ZeroDivisionError",
+    "OverflowError", "FloatingPointError", "AttributeError", "NameError",
+    "StopIteration", "AssertionError", "NotImplementedError",
+    "Warning", "UserWarning", "DeprecationWarning",
+)
+
+
+def _make_restricted_import():
+    """
+    构造受限 __import__：仅允许 ALLOWED_IMPORT_ROOTS 内的模块及其子模块
+    （pandas/numpy，与 validate_strategy_code 的 AST 白名单同源），其余一律
+    ImportError。策略靠自身 `import pandas as pd` 取依赖，这是白名单里唯一
+    带副作用的内置；放任原生 __import__ 会让 `__import__('os')` 直接成立。
+    """
+
+    real_import = builtins.__import__
+
+    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0:
+            # 相对导入在受限沙箱里无意义（策略是无包顶层模块），直接拒绝
+            raise ImportError("策略代码不允许相对导入")
+        root = (name or "").split(".")[0]
+        if root not in ALLOWED_IMPORT_ROOTS:
+            raise ImportError(
+                f"策略代码不允许导入模块: {name}"
+                f"（仅允许 {' / '.join(ALLOWED_IMPORT_ROOTS)}）"
+            )
+        return real_import(name, globals, locals, fromlist, level)
+
+    return restricted_import
+
+
+def _build_sandbox_builtins() -> dict:
+    """
+    组装注入 exec 命名空间的最小 __builtins__ 字典（纯计算 + 受限 __import__）。
+    取自当前解释器的真实内置对象，避免硬编码引用失效。
+    """
+
+    safe = {}
+    for bname in _SAFE_BUILTIN_NAMES:
+        if hasattr(builtins, bname):
+            safe[bname] = getattr(builtins, bname)
+    safe["__import__"] = _make_restricted_import()
+    return safe
+
+
+# 即便 __builtins__ 已最小化，属性链仍可绕路回取宿主对象：
+# (1).__class__.__base__.__subclasses__() 能在不 import 的情况下枚举到
+# os 模块对象。这些 dunder 属性对正常量化策略毫无用处，AST 阶段直接拒绝，
+# 把基于属性链的逃逸在静态层就斩断（与受限 __import__ 形成两道独立防线）。
+FORBIDDEN_DUNDER_ATTRS = frozenset({
+    "__class__", "__bases__", "__base__", "__subclasses__", "__mro__",
+    "__globals__", "__builtins__", "__import__", "__dict__", "__getattribute__",
+    "__code__", "__closure__", "__func__", "__self__", "__module__",
+    "__loader__", "__spec__", "__init_subclass__", "__subclasshook__",
+})
 
 
 # 字符串黑名单只保留 AST import 白名单覆盖不到的危险调用。
@@ -63,13 +162,23 @@ def validate_strategy_code(code: str) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.split(".")[0] not in ("pandas", "numpy"):
+                if alias.name.split(".")[0] not in ALLOWED_IMPORT_ROOTS:
                     raise ValueError(f"禁止导入模块: {alias.name}")
 
         elif isinstance(node, ast.ImportFrom):
             root_module = (node.module or "").split(".")[0]
-            if root_module not in ("pandas", "numpy"):
+            if root_module not in ALLOWED_IMPORT_ROOTS:
                 raise ValueError(f"禁止 from {node.module} import ...")
+
+        # 危险 dunder 属性链（如 (1).__class__.__subclasses__()）能在不 import
+        # 的情况下回取 os 等宿主对象，绕开最小化 __builtins__。这些 dunder 对
+        # 正常量化策略无用，静态层直接拒绝——属性访问与显式名字两种形态都查。
+        elif isinstance(node, ast.Attribute):
+            if node.attr in FORBIDDEN_DUNDER_ATTRS:
+                raise ValueError(f"策略代码不允许访问危险属性: {node.attr}")
+        elif isinstance(node, ast.Name):
+            if node.id in FORBIDDEN_DUNDER_ATTRS:
+                raise ValueError(f"策略代码不允许引用危险名称: {node.id}")
 
     if not has_generate_signals:
         raise ValueError("策略代码必须包含 generate_signals(df) 函数")
@@ -263,6 +372,11 @@ def load_strategy_func_from_code(code: str):
 
     module_name = f"generated_strategy_{uuid.uuid4().hex}"
     module = types.ModuleType(module_name)
+
+    # 显式注入最小化 __builtins__，阻断 CPython 在 exec 期自动注入完整内置
+    # 命名空间（否则 open/getattr/__import__ 全部可用，详见模块顶部说明）。
+    # 必须在 exec 之前设置；每个模块独立一份，并发互不污染。
+    module.__dict__["__builtins__"] = _build_sandbox_builtins()
 
     compiled = compile(code, filename=f"<{module_name}>", mode="exec")
     exec(compiled, module.__dict__)

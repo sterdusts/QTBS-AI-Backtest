@@ -428,3 +428,82 @@ def test_v2_style_strategy_gets_actionable_hint():
     core = CodeBacktestCore(strategy_func=v2_style_strategy)
     with pytest.raises(ValueError, match="CONTRACT_VERSION"):
         core.run(make_df([100, 100, 100]))
+
+
+# =========================================================
+# 金样例 10：策略 dropna / 缩短行不改变回测窗口（reindex 回输入索引）
+# =========================================================
+
+def test_golden_strategy_dropna_does_not_truncate_window():
+    """修复 #5：策略对返回帧 dropna/缩短行（如 rolling 指标的前导 NaN
+    被 dropna 丢掉），引擎必须按【输入】索引重对齐，回测窗口仍为完整
+    输入区间——不再在更短窗口静默跑完、equity_curve 只覆盖剩余根数。
+
+    钉死：
+      - equity_curve / realized_equity_curve 长度 == 输入长度
+      - 曲线起止时间 == 输入起止时间（不被截断到策略返回帧的子区间）
+      - target_position 缺行按 ffill().fillna(0) 延续，与显式给出
+        重对齐后目标序列的非截断参照逐根一致
+    """
+    df = make_df([100, 100, 100, 100, 100, 100])
+    input_index = df.index
+
+    def dropna_strategy(d):
+        d = d.copy()
+        # 完整 6 行先给出目标，再丢掉前两行（模拟 rolling 指标 dropna 副作用）
+        d["target_position"] = [0, 1, 1, 1, 0, 0]
+        return d.iloc[2:]
+
+    core = CodeBacktestCore(strategy_func=dropna_strategy, initial_cash=1000.0)
+    result = core.run(df)
+
+    # 窗口锚定输入索引：曲线覆盖完整 6 根，而不是策略返回的 4 根
+    assert len(result["equity_curve"]) == len(input_index)
+    assert len(result["realized_equity_curve"]) == len(input_index)
+    assert result["equity_curve"][0]["time"] == str(input_index[0])
+    assert result["equity_curve"][-1]["time"] == str(input_index[-1])
+
+    # 缺行 ffill：前两行无前值兜底为 0，存活行沿用 → 重对齐后目标 [0,0,1,1,0,0]。
+    # 与「非截断地显式给出同一目标序列」的参照运行逐根一致，证明截断不改变结算。
+    reference = run_core(df, [0, 0, 1, 1, 0, 0])
+    got_close = [p["equity_close"] for p in result["equity_curve"]]
+    ref_close = [p["equity_close"] for p in reference["equity_curve"]]
+    assert got_close == pytest.approx(ref_close)
+    assert result["metrics"]["final_equity"] == pytest.approx(
+        reference["metrics"]["final_equity"]
+    )
+
+    # result["df"] 也回到完整输入索引（webUI/behavior_check 取自它）
+    assert list(result["df"].index) == list(input_index)
+
+
+def test_strategy_index_disjoint_from_input_rejected():
+    """策略 reset_index / 整体平移时间轴导致索引与输入完全不重叠时，
+    重对齐无源会静默全表回退 0、产出假「0 笔交易」报告——必须报错。"""
+
+    def shifted_strategy(d):
+        d = d.copy()
+        d["target_position"] = [0, 1, 1]
+        # 时间轴整体平移到与输入零交集
+        d.index = pd.date_range("2030-01-01", periods=len(d), freq="4h")
+        return d
+
+    core = CodeBacktestCore(strategy_func=shifted_strategy, initial_cash=1000.0)
+    with pytest.raises(ValueError, match="完全不重叠"):
+        core.run(make_df([100, 100, 100]))
+
+
+def test_equal_length_frame_reindex_is_noop():
+    """happy path 零影响显式回归：策略返回与输入等长同序帧时，
+    reindex 重对齐块整体跳过，逐根结算与未引入重对齐前完全一致
+    （由 strategy_from_targets 返回同索引帧，覆盖全部既有金样例的形状）。"""
+    df = make_df([100, 100, 100, 105, 110])
+    with_reindex = run_core(df, [0, 1, 1, 0, 0], fee_rate=0.001)
+
+    # 与金样例 1 的手算期望逐项一致：确认等长路径未被重对齐改写
+    trade = with_reindex["trades"][0]
+    assert trade["entry_price"] == pytest.approx(100.0)
+    assert trade["exit_price"] == pytest.approx(110.0)
+    assert trade["pnl"] == pytest.approx(97.9)
+    assert len(with_reindex["equity_curve"]) == len(df)
+    assert list(with_reindex["df"].index) == list(df.index)

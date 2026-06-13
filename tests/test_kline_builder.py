@@ -75,6 +75,62 @@ def test_ghost_timestamp_rows_dropped():
     assert builder.df_1m.index.min() == pd.Timestamp("2024-01-01 00:00")
 
 
+def test_tz_aware_string_open_time_stripped_to_naive():
+    """高危 #3 回归：遗留 tz-aware CSV（ISO "...+00:00"）的 open_time 必须在
+    清洗阶段统一剥成 tz-naive UTC，否则下游 2010 幽灵行过滤用 tz-naive
+    Timestamp 与 tz-aware 索引比较会在 pandas 3.0 抛 TypeError，回测在数据
+    加载即崩溃。"""
+    # 模拟 pd.read_csv 读出的带时区 ISO 字符串列（下载器写 numeric ms，
+    # 但遗留 CSV 可能是这种格式）
+    raw = make_1m_df("2024-01-01 00:00", 240)
+    raw["open_time"] = [
+        f"{t.strftime('%Y-%m-%d %H:%M:%S')}+00:00" for t in raw["open_time"]
+    ]
+
+    # 加载不崩溃
+    builder = KlineBuilder(raw)
+
+    # 索引统一为 tz-naive
+    assert isinstance(builder.df_1m.index, pd.DatetimeIndex)
+    assert builder.df_1m.index.tz is None
+    assert builder.df_1m.index.min() == pd.Timestamp("2024-01-01 00:00")
+    assert len(builder.df_1m) == 240
+
+
+def test_tz_aware_offset_normalized_to_utc():
+    """非 UTC 时区偏移（如 +08:00）剥 tz 前先 tz_convert('UTC')：
+    08:00+08:00 应落到 00:00 UTC，而不是把本地墙钟时间当成 UTC。"""
+    raw = make_1m_df("2024-01-01 08:00", 60)
+    raw["open_time"] = [
+        f"{t.strftime('%Y-%m-%d %H:%M:%S')}+08:00" for t in raw["open_time"]
+    ]
+
+    builder = KlineBuilder(raw)
+
+    assert builder.df_1m.index.tz is None
+    # +08:00 的 08:00 == UTC 00:00
+    assert builder.df_1m.index.min() == pd.Timestamp("2024-01-01 00:00")
+
+
+def test_tz_aware_ghost_row_filter_still_works():
+    """剥 tz 后 2010 幽灵行过滤照常生效：tz-aware 输入也不会让 1677 哨兵行
+    漏过过滤。"""
+    raw = make_1m_df("2024-01-01 00:00", 240)
+    ghost = raw.iloc[[0]].copy()
+    ghost["open_time"] = pd.Timestamp("1677-09-21 00:12:43.145224193")
+    raw = pd.concat([ghost, raw], ignore_index=True)
+    raw["open_time"] = [
+        f"{pd.Timestamp(t).strftime('%Y-%m-%d %H:%M:%S.%f')}+00:00"
+        for t in raw["open_time"]
+    ]
+
+    builder = KlineBuilder(raw)
+
+    assert builder.df_1m.index.tz is None
+    assert len(builder.df_1m) == 240
+    assert builder.df_1m.index.min() == pd.Timestamp("2024-01-01 00:00")
+
+
 def test_exact_boundary_bar_kept():
     """
     回归测试：数据恰好结束于周期边界前 1 分钟时（00:00-03:59），

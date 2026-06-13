@@ -3,6 +3,7 @@
 # 本文件 prompt 中的策略规则源自项目根目录 STRATEGY_CONTRACT.md（契约 v1）。
 # 修改任何规则必须与契约文档、tests/ 金样例测试保持同步。
 
+import ast
 import re
 
 from module.AI.api_config import make_client
@@ -48,12 +49,20 @@ FORBIDDEN_TIMEFRAME_TOKENS = [
 ]
 
 
+# 提取首个完整 markdown 代码围栏内的内容。
+# 兼容 ```python / ```py / ```Python / ``` 等围栏写法，
+# 允许围栏前后存在说明文字（如 "Sure! Here is the strategy:"），
+# 也能在出现多个代码块时只取第一个完整围栏，不会把破碎的中段拼进来。
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9]*[ \t]*\r?\n(.*?)\r?\n?```", re.S)
+
+
 def clean_python_code(content: str) -> str:
     """
-    清理 DeepSeek 返回内容：
-    - 去掉 ```python
-    - 去掉 ```
-    - 去掉前后空白
+    清理 DeepSeek 返回内容，抽取纯 Python 代码：
+    - 优先提取首个完整 ``` 代码围栏内的内容（兼容模型加前言/多代码块）。
+    - 没有围栏时退回原行为（仅剥首尾残留围栏 + strip）。
+    - 剥离后仍无法被解析为合法 Python 时，给出可行动的真因报错
+      （而非误导性的「语法错误: invalid syntax」）。
     """
 
     if not content:
@@ -61,11 +70,31 @@ def clean_python_code(content: str) -> str:
 
     content = content.strip()
 
-    # 去掉 markdown 代码块（兼容 ```python / ```py / ```Python / ``` 等写法）
-    content = re.sub(r"^```[a-zA-Z0-9]*\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
+    match = _FENCED_CODE_BLOCK_RE.search(content)
+    if match:
+        # 模型即使加了前言或多个代码块，也只取首个完整围栏内容
+        code = match.group(1)
+    else:
+        # 无完整围栏：退回原逻辑，剥掉 strip 后最开头/最末尾的残留围栏
+        code = re.sub(r"^```[a-zA-Z0-9]*\s*", "", content)
+        code = re.sub(r"\s*```$", "", code)
 
-    return content.strip()
+    code = code.strip()
+
+    if not code:
+        raise ValueError("DeepSeek 返回空内容，请重试。")
+
+    # 剥围栏后仍解析不了，多半是模型混入了说明文字或多个代码块，
+    # 残留 markdown 会让下游 ast.parse 报出误导性的「语法错误」。
+    # 在这里给出与 length 截断同样口径的可行动真因。
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        raise ValueError(
+            "AI 未按要求只输出纯 Python 代码，可能混入说明文字或多个代码块，请重试。"
+        )
+
+    return code
 
 
 def validate_generated_code(code: str) -> None:

@@ -12,6 +12,7 @@ from webUI import (
     filter_df_by_date,
     format_number,
     normalize_date,
+    parse_float_input,
     resolve_strategy_route,
     validate_backtest_params,
     validate_date_range,
@@ -108,6 +109,35 @@ def test_params_leverage_zero_means_1x():
 def test_params_invalid_raises(kwargs):
     params = dict(initial_cash=1000, leverage=1, position_size=100, fee=0.05, slip=0)
     params.update(kwargs)
+    with pytest.raises(ValueError):
+        validate_backtest_params(
+            params["initial_cash"], params["leverage"], params["position_size"],
+            params["fee"], params["slip"], "zh",
+        )
+
+
+# 修复 #6：parse_float_input 必须拦截 NaN/Inf（'nan'/'inf' 能被 float() 解析成功，
+# 但会一路穿透 <=0 / <0 校验产出全 NaN/∞ 报告）。
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "Inf", "+inf", "-inf", "infinity"])
+def test_parse_float_input_rejects_non_finite(raw):
+    with pytest.raises(ValueError):
+        parse_float_input(raw, 1.0, "zh")
+
+
+def test_parse_float_input_accepts_finite_and_default():
+    # 正常有限数值与空值默认行为不受影响
+    assert parse_float_input("1000.5", 1.0, "zh") == pytest.approx(1000.5)
+    assert parse_float_input("", 7.0, "zh") == pytest.approx(7.0)
+    assert parse_float_input(None, 7.0, "zh") == pytest.approx(7.0)
+    assert parse_float_input("-3.5", 1.0, "zh") == pytest.approx(-3.5)
+
+
+@pytest.mark.parametrize("field", ["initial_cash", "position_size", "fee", "slip"])
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan"])
+def test_params_non_finite_float_raises(field, bad):
+    # initial_cash=inf 旧逻辑下 >0 放行；NaN 让 <=0 恒 False；fee/slip/position 同理
+    params = dict(initial_cash=1000, leverage=1, position_size=100, fee=0.05, slip=0)
+    params[field] = bad
     with pytest.raises(ValueError):
         validate_backtest_params(
             params["initial_cash"], params["leverage"], params["position_size"],

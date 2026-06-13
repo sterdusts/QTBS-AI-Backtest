@@ -646,6 +646,16 @@ class PortfolioBacktestCore:
                 "请用数据面板的时间索引构造权重（如 data[SYMBOLS[0]].index）"
             )
 
+        # 行侧索引重复（同一时间多行权重）与缺列/多列/索引不重叠同属契约违例：
+        # 下面的 reindex(index=index) 在重复标签上会抛 pandas 原生
+        # "cannot reindex on an axis with duplicate labels"，经 webUI catch-all
+        # 显示为无法自查的内部错误，必须在此主动拦成契约级中文提示
+        if not raw_weights.index.is_unique:
+            raise ValueError(
+                "权重 DataFrame 的时间索引存在重复，请在返回前去重，"
+                '如 df[~df.index.duplicated(keep="last")]'
+            )
+
         weights = raw_weights.reindex(columns=symbols)
         weights = weights.apply(pd.to_numeric, errors="coerce")
 

@@ -279,6 +279,16 @@ def align_klines(kline_map: dict) -> dict:
 
         union_index = df.index if union_index is None else union_index.union(df.index)
 
+    # 兜底断言：全链路索引已在 KlineBuilder 清洗阶段统一剥成 tz-naive，
+    # 各标的索引同为 tz-naive 时 union 仍是 DatetimeIndex；一旦混入 tz-aware
+    # 与 tz-naive，union 会退化成 object 索引，下游 reindex/切片行为不可预期。
+    # 退化即立刻报清楚，而不是让错误在更深处以晦涩面目出现。
+    if not isinstance(union_index, pd.DatetimeIndex):
+        raise ValueError(
+            "对齐失败：K 线索引并集不是 DatetimeIndex（可能混入了 tz-aware "
+            "与 tz-naive 索引）。请确认各标的 K 线索引时区一致。"
+        )
+
     # 单调索引的 union 本身就有序：只对真正乱序的输入兜底排序
     if not union_index.is_monotonic_increasing:
         union_index = union_index.sort_values()

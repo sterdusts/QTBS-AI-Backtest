@@ -498,6 +498,23 @@ def test_weights_index_mismatch_raises():
         core.run(data)
 
 
+def test_weights_duplicate_index_raises():
+    """权重时间索引存在重复（行侧违例）：必须给契约级中文报错，
+    不能泄漏 pandas 原生 'cannot reindex on an axis with duplicate labels'
+    （与缺列/多列/索引不重叠一贯的入口拦截风格对称）。"""
+    data = {"BTCUSDT": make_df([100, 100, 100, 100, 100])}
+
+    def strategy(d):
+        idx = d["BTCUSDT"].index
+        # 第二根时间戳重复出现 → reindex(index=index) 会抛 pandas 原生报错
+        dup_index = idx.insert(2, idx[1])
+        return pd.DataFrame({"BTCUSDT": [0, 1, 1, 0, 0, 0]}, index=dup_index)
+
+    core = PortfolioBacktestCore(strategy_func=strategy)
+    with pytest.raises(ValueError, match="重复"):
+        core.run(data)
+
+
 # =========================================================
 # 金样例 P-滑点：slippage > 0 时单资产 v1/v2 仍逐根一致
 # =========================================================

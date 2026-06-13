@@ -52,6 +52,14 @@ class KlineBuilder:
         else:
             df["open_time"] = pd.to_datetime(df["open_time"])
 
+        # 遗留 tz-aware CSV（ISO "...+00:00"）会得到带时区的 datetime：统一剥成
+        # tz-naive UTC（与 data_panel._local_data_end 同口径），否则下游用
+        # tz-naive Timestamp 的比较（如 2010 幽灵行过滤、filter_df_by_date 切片、
+        # align_klines 的索引并集）在 pandas 3.0 会抛 TypeError 让回测在数据
+        # 加载即崩溃。numeric ms 路径产出的本就是 tz-naive，不受影响。
+        if getattr(df["open_time"].dt, "tz", None) is not None:
+            df["open_time"] = df["open_time"].dt.tz_convert("UTC").dt.tz_localize(None)
+
         # 只保留核心 OHLCV
         df = df[["open_time", "open", "high", "low", "close", "volume"]]
 

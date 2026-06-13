@@ -828,9 +828,14 @@ def parse_float_input(value, default_value: float, lang_code: str) -> float:
         return default_value
 
     try:
-        return float(value_str)
+        parsed = float(value_str)
     except Exception:
         raise ValueError(text["invalid_number_error"])
+
+    if not math.isfinite(parsed):
+        raise ValueError(text["invalid_number_error"])
+
+    return parsed
 
 
 def parse_int_input(value, default_value: int, lang_code: str) -> int:

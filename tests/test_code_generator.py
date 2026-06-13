@@ -59,6 +59,55 @@ def test_clean_python_code_empty_raises():
         clean_python_code("")
 
 
+# ---------------------------------------------------------
+# 修复 #8：稳健提取代码围栏（模型加前言 / 多代码块时不残留 markdown）
+# ---------------------------------------------------------
+
+# 围栏内必须是合法 Python，clean 后会做 ast.parse 真因校验
+_FENCE_INNER = (
+    "import pandas as pd\n"
+    "import numpy as np\n"
+    "\n"
+    "CONTRACT_VERSION = 1\n"
+)
+
+
+def test_clean_python_code_strips_preamble_before_fence():
+    # (a) 模型加了前言再给围栏：应只提取首个完整围栏内容，丢掉前言
+    raw = f"Sure! Here is the strategy:\n```python\n{_FENCE_INNER}```"
+    assert clean_python_code(raw) == _FENCE_INNER.strip()
+
+
+def test_clean_python_code_pure_code_without_fence_returned_asis():
+    # (b) 纯代码无围栏：原样返回（仅 strip）
+    assert clean_python_code(_FENCE_INNER) == _FENCE_INNER.strip()
+
+
+def test_clean_python_code_single_fence_extracted():
+    # (c) 单个正常围栏：提取围栏内容
+    raw = f"```python\n{_FENCE_INNER}```"
+    assert clean_python_code(raw) == _FENCE_INNER.strip()
+
+
+def test_clean_python_code_picks_first_of_multiple_blocks():
+    # 多代码块：只取首个完整围栏，不把第二块或破碎中段拼进来
+    raw = (
+        "先看代码：\n"
+        f"```python\n{_FENCE_INNER}```\n"
+        "另外还有一个例子：\n"
+        "```python\nx = 999\n```"
+    )
+    assert clean_python_code(raw) == _FENCE_INNER.strip()
+
+
+def test_clean_python_code_residual_markdown_raises_actionable_error():
+    # 残留 markdown / 混入说明文字导致无法解析时，给出可行动真因，
+    # 而非误导性的「语法错误: invalid syntax」
+    raw = "Sure! Here is the strategy I wrote for you, hope it helps."
+    with pytest.raises(ValueError, match="纯 Python 代码"):
+        clean_python_code(raw)
+
+
 # =========================================================
 # 生成代码验证（双契约）
 # =========================================================

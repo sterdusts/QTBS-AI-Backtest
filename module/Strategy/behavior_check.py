@@ -94,6 +94,34 @@ def _shorten(message: str, limit: int = 300) -> str:
     return message if len(message) <= limit else message[: limit - 1] + "…"
 
 
+# 异常类型名的安全字符集：Python 标识符 + 点（限定名 a.b.CError）。
+# 用作行为段提示注入的硬白名单——再奇怪的异常类型名也不可能藏进指令。
+_TYPE_NAME_OK = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_."
+)
+
+
+def _safe_error_type(error: str) -> str:
+    """
+    从 run_behavior_check 写入的 error（形如 "KeyError: <策略可控消息>"）中
+    只抽取【异常类型名】，丢弃冒号后的策略可控自由文本。
+
+    这是二阶提示注入的封堵点：error 的 str(e) 部分会回显策略引用的列名/键名
+    （v1 引擎对 KeyError 原样翻译），策略可借此把指令型文本（如
+    "IGNORE ALL ABOVE..."）注入到被审查 prompt 显式背书为"客观事实可信"的
+    行为段。这里把暴露面收紧到只剩类型名，并对类型名做白名单校验——
+    异常类型名只可能是 Python 标识符/限定名，含任何其他字符即视为不可信、归为通用占位符。
+    """
+
+    text = str(error or "").strip()
+    # error 由 f"{type(e).__name__}: {e}" 构造，类型名在首个冒号之前
+    type_name = text.split(":", 1)[0].strip()
+
+    if type_name and set(type_name) <= _TYPE_NAME_OK:
+        return type_name
+    return "未知异常"
+
+
 def run_behavior_check(code: str) -> dict:
     """
     在合成数据上真实运行策略代码，返回 JSON-able 的行为事实。
@@ -189,9 +217,13 @@ def format_behavior_summary(behavior: dict) -> str:
         return ""
 
     if not behavior["ok"]:
+        # 只透出异常【类型名】，绝不回显 error 中策略可控的自由文本
+        # （列名/键名/消息）。该自由文本会被审查 prompt 拼进"客观事实可信"段，
+        # 是二阶提示注入缺口；类型名经 _safe_error_type 白名单化后无法夹带指令。
         return (
             f"代码在 {behavior['synthetic_bars']} 根合成 K 线上实际运行【失败】，"
-            f"错误：{behavior['error']}"
+            f"异常类型：{_safe_error_type(behavior['error'])}"
+            f"（原始错误信息含策略可控内容，不作为可信事实透出）"
         )
 
     parts = [

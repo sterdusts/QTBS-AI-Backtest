@@ -59,6 +59,164 @@ def test_loaded_modules_are_isolated():
 
 
 # =========================================================
+# exec 沙箱：最小化 __builtins__ 白名单（修复高危 #4）
+# =========================================================
+# 背景：module.__dict__ 缺 '__builtins__' 时 CPython 在 exec 期自动注入完整
+# 内置命名空间（open/getattr/__import__ 全可用），一行属性链即任意文件写。
+# 修复后 exec 前注入最小纯计算白名单 + 受限 __import__（仅 pandas/numpy），
+# 并在 AST 拒绝危险 dunder 属性链。下列测试钉死「正常策略仍能跑、三类逃逸
+# 全被拦」。注意：净化作用域是策略源码本身——pandas/numpy 内部 import os
+# 走的是各自模块的真实 builtins，不受影响，所以下面正例必须真能加载执行。
+
+
+# 典型策略：自身 import pandas/numpy，并用到一批纯计算内置（len/range/
+# min/max/abs/round/enumerate/zip/sum/sorted/float/int/list/dict/isinstance/
+# print/ValueError）。修复后这些必须仍可用，否则会误杀合规历史策略。
+TYPICAL_STRATEGY_CODE = """
+import pandas as pd
+import numpy as np
+
+CONTRACT_VERSION = 1
+
+PERIODS = [int(p) for p in range(5, 21, 5)]
+
+
+def generate_signals(df):
+    df = df.copy()
+
+    windows = sorted(set(PERIODS))
+    longest = max(windows)
+    shortest = min(windows)
+
+    ma_fast = df["close"].rolling(window=shortest).mean()
+    ma_slow = df["close"].rolling(window=longest).mean()
+
+    rounded = [round(float(x), 2) for x in df["close"].tolist()]
+    total = sum(rounded)
+    assert isinstance(total, float)
+
+    for i, w in enumerate(windows):
+        if not isinstance(w, int):
+            raise ValueError("window 必须是整数")
+
+    signal = np.where(ma_fast > ma_slow, 1, 0)
+    df["target_position"] = pd.Series(signal, index=df.index).fillna(0).astype(int)
+
+    info = dict(zip(["fast", "slow"], [shortest, longest]))
+    print("windows", info, abs(-1), len(df))
+    return df
+"""
+
+
+def test_typical_strategy_with_imports_and_builtins_still_runs():
+    # 正例：自身 import + 一批纯计算内置的真实风格策略仍能加载并调用成功。
+    func = load_strategy_func_from_code(TYPICAL_STRATEGY_CODE)
+    result = func(make_df())
+    assert "target_position" in result.columns
+    assert result["target_position"].notna().all()
+
+
+def test_sandbox_has_no_open_or_dangerous_builtins():
+    # 注入的 __builtins__ 必须不含 open/__import__-放行 os 之外的危险内置；
+    # 直接检查策略函数闭包看到的 __builtins__ 是被最小化过的字典。
+    func = load_strategy_func_from_code(VALID_CODE)
+    sandbox_builtins = func.__globals__["__builtins__"]
+
+    assert isinstance(sandbox_builtins, dict)  # 不是完整内置模块
+    for forbidden in ("open", "eval", "exec", "compile", "getattr", "setattr",
+                      "globals", "locals", "vars", "dir", "input",
+                      "__build_class__", "breakpoint", "memoryview"):
+        assert forbidden not in sandbox_builtins, f"{forbidden} 不应出现在沙箱内置中"
+
+    # 受限 __import__ 在场（策略靠它 import pandas），但不是原生 __import__
+    import builtins as _b
+    assert "__import__" in sandbox_builtins
+    assert sandbox_builtins["__import__"] is not _b.__import__
+
+
+def test_escape_via_builtins_open_blocked():
+    # 反例 1：generate_signals.__globals__['__builtins__']['open'] 取回。
+    # __globals__ / __builtins__ 是被 AST 拒绝的危险 dunder，加载即被拦；
+    # 即便绕过，沙箱 __builtins__ 里也没有 open。
+    code = """
+import pandas as pd
+
+def generate_signals(df):
+    f = generate_signals.__globals__['__builtins__']['open']
+    f('escape_proof.txt', 'w').write('pwned')
+    return df
+"""
+    with pytest.raises(ValueError, match="危险属性|危险名称"):
+        load_strategy_func_from_code(code)
+
+
+def test_escape_via_subclasses_blocked():
+    # 反例 2：(1).__class__...__subclasses__() 回取 os。
+    # 不依赖 import，靠属性链回取宿主对象——AST 危险 dunder 检查直接拦下。
+    code = """
+import pandas as pd
+
+def generate_signals(df):
+    obj = (1).__class__.__base__.__subclasses__()
+    return df
+"""
+    with pytest.raises(ValueError, match="危险属性|危险名称"):
+        load_strategy_func_from_code(code)
+
+
+def test_escape_via_import_os_blocked():
+    # 反例 3：__import__('os')。FORBIDDEN_KEYWORDS 已拦字符串形态；
+    # 即便构造出调用，受限 __import__ 也会对 os 抛 ImportError（仅放行
+    # pandas/numpy）。这里验证静态校验先一步拦下。
+    code = """
+import pandas as pd
+
+def generate_signals(df):
+    __import__('os').system('echo pwned')
+    return df
+"""
+    with pytest.raises(ValueError, match="禁止|危险"):
+        load_strategy_func_from_code(code)
+
+
+def test_import_via_builtins_dict_rejected():
+    # 经 __builtins__['__import__'] 取回导入器是又一条逃逸向量。
+    # 这里 __builtins__ 与 __import__ 都命中 FORBIDDEN_KEYWORDS 子串黑名单，
+    # 在静态校验最先一层即被拒（早于 AST 危险 dunder 检查），加载阶段就拦下。
+    # 运行期受限 __import__ 本身由 test_restricted_import_rejects_os_allows_pandas 直接验证。
+    code = """
+import pandas as pd
+
+def generate_signals(df):
+    name = 'o' + 's'
+    mod = __builtins__['__import__'](name)
+    return df
+"""
+    with pytest.raises(ValueError, match="禁止|危险"):
+        load_strategy_func_from_code(code)
+
+
+def test_restricted_import_rejects_os_allows_pandas():
+    # 直接对受限 __import__ 做单元断言：放行 pandas/numpy，拒绝 os。
+    from module.Strategy.strategy_loader import _make_restricted_import
+
+    restricted = _make_restricted_import()
+
+    pandas_mod = restricted("pandas")
+    assert pandas_mod is not None
+
+    # pandas/numpy 子模块（与 AST 白名单一致）放行
+    restricted("numpy.linalg", fromlist=["norm"])
+
+    with pytest.raises(ImportError):
+        restricted("os")
+    with pytest.raises(ImportError):
+        restricted("subprocess")
+    with pytest.raises(ImportError):
+        restricted("importlib")
+
+
+# =========================================================
 # 安全校验
 # =========================================================
 

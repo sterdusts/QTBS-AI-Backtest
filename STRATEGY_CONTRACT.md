@@ -58,6 +58,21 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame
 - 信号无变化时应延续上一根的状态（推荐 `ffill().fillna(0)`）
 - 收尾必须保证：列中只含 `-1 / 0 / 1`，无 NaN（引擎会做 `fillna(0)` 兜底 + 非法值前置拦截）
 
+**回测窗口锚定输入索引（引擎 → 策略，引擎层承诺）**：
+
+回测窗口的唯一事实源是**引擎传入的输入索引**，与策略返回帧的行数/索引无关。
+策略对返回帧做 `dropna` 或其他缩短行操作时，引擎按输入索引重对齐
+（`reindex(input_index)`），与 v2 §10.2 的 `weights.reindex(index).ffill().fillna(0)`
+同口径，**不会**在更短窗口静默跑完：
+
+- **`target_position` 缺行（策略未返回的行）= 延续上一行（`ffill`）**，首段无前值兜底为 0；
+  策略明确返回的行中 NaN 仍按 `fillna(0)` 视为空仓
+- **行情列（OHLC）始终取自引擎输入帧**（真实市场数据）：策略缩短行情行不影响
+  回测窗口，equity_curve 始终覆盖完整输入区间，且行情值绝不被 `ffill` 造假
+- 策略返回帧与输入**等长同序**时（常规情形），重对齐为无操作，逐根行为完全不变
+- 策略返回帧索引与输入索引**完全不重叠**（`reset_index` / 整体平移时间轴）→ **报错**：
+  静默全表回退 0 会产出一份「0 笔交易」的假正常报告
+
 ## 4. 时序规则（防未来函数）
 
 1. 所有信号视为在**当前 K 线收盘后**确认
@@ -311,3 +326,4 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 | 2026-06-13 | v2 | 第六轮审查修复：data_panel 尾读时间戳剥时区（修带时区遗留 CSV 与 required_end 比较 TypeError 崩溃）；两引擎强平 bar 的 equity_best 也落地结算后权益（消除回撤新口径下的幽灵峰）；load_aligned_panel 的 required_end 缺省派生自 end_date（防新调用方漏传重现陈旧截断）；行为审查 v2 复用引擎透出的 raw_weights 而非二次调用策略（修模块级状态策略的事实漂移）；行为审查引擎参数全钉死；清理死代码（confidence 键/total_return_pct/.resample 冗余项/语言名别名）；指标层 worst/best 单遍提取、v1 open_price 移入强平分支 |
 | 2026-06-13 | v2 | 数据更新功能 + 第七轮全仓审查修复：新增 fetch_queue 统一拉取队列（启动自动更新/手动按钮/回测按需，串行+进度区+回测优先暂停）；第七轮重写 fetch_queue 并发模型为「持久 worker + Condition + generation」修一整类竞态（reset 双 worker、lost-wakeup 币种滞留、批次边界 TOCTOU 计数堆叠）；_DIR_OF 取最新目录修同名跨目录串扰；增量补拉 gate 改 end-of-day（与过滤切片同口径，修少近一天数据）；_REFRESHED 标记移到补拉后；启动自动更新去一次性 latch 改 is_running 守卫（首批失败可重试）；代码折叠面板标题随语言切换；删冗余 download_lock；tooltip/默认币种入队收敛单源；契约新增 §9.1 数据更新行为 |
 | 2026-06-13 | v2 | 更新与回测并行（原子写方案）：下载器改用 atomic_write_csv（.staging 暂存区写完整文件 + os.replace 原子覆盖 + Windows 占用重试），回测读文件永远完整、与后台更新真正并行；增量补拉改非阻塞后台 enqueue（回测对已有数据币种立即开跑，下次取更新后数据），仅本地完全无数据时才阻塞等首次拉取；移除回测优先暂停机制（_PRIORITY/_PAUSE_DEPTH，原子写后不再需要）；fetch_blocking 保留插队首优先；新增原子写并发安全测试（多读者+持续覆写零半截） |
+| 2026-06-13 | v1 | v1 引擎回测窗口锚定输入索引：`CodeBacktestCore.run` 在 `strategy_func` 返回后按【输入】索引重对齐（`reindex(input_index)`），修复策略 `dropna`/缩短行**静默截断回测窗口**（equity_curve 只覆盖剩余根数，与 webUI 取自完整输入索引的 kline_count/起止时间静默错配）；target_position 缺行按 `ffill().fillna(0)` 延续（与 v2 §10.2 同口径），行情列始终取自输入帧不被 ffill 造假，索引零交集报错（与 v2 _prepare_weights 一致）；返回帧等长同序时重对齐为无操作，单资产 v1≡v2/强平 α 退化/end_of_data/slippage>0 等金样例逐根不变；契约 §3 补「回测窗口锚定输入索引」引擎层承诺 |

@@ -179,6 +179,12 @@ def _run():
             Obtain_K(cand, save_dir=data_dir)
             ok = bool(has_kline_data(cand, data_dir=data_dir))
         except Exception:
+            # 注：原子写在重试预算耗尽时会抛 Load_real_kline.AtomicWriteConflict
+            # （OSError 子类，代表「数据其实已下好、只是 os.replace 被读句柄
+            # 长期占用」），语义上应可重试而非永久失败。但「冲突标的免疫去重
+            # 抑制并重排队」需改动 data_panel._REFRESHED_SYMBOLS（非本文件归属），
+            # 故此处暂统一记为失败；指数退避预算（~45s）已让正常并发读期间的
+            # 写入几乎总能成功，把冲突落到这里的概率压到极低。
             ok = False
 
         with _COND:

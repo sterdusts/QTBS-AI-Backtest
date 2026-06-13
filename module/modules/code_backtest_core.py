@@ -65,6 +65,14 @@ class CodeBacktestCore:
         # 浅拷贝即可防策略篡改：pandas 写时复制下任何写入只复制被改的块
         df = df.copy(deep=False)
 
+        # 回测窗口的唯一事实源是【输入】索引：策略对帧做 dropna / 缩短行
+        # 后，引擎必须按输入索引重对齐，否则会在更短窗口静默跑完，
+        # equity_curve 只覆盖剩余根数，且与 webUI 取自完整输入索引的
+        # kline_count / 起止时间静默错配（详见下方 reindex 重对齐块）。
+        # 行情列从输入帧取（真实市场数据），不依赖策略返回帧里的副本。
+        input_index = df.index
+        input_ohlc = df
+
         try:
             df = self.strategy_func(df)
         except KeyError as e:
@@ -90,6 +98,38 @@ class CodeBacktestCore:
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             raise ValueError(f"回测数据缺少必要字段: {missing_columns}")
+
+        # 策略返回帧重对齐回【输入】索引（与 v2 §10.2 / portfolio 引擎
+        # 的 weights.reindex(index).ffill().fillna(0) 对齐）。
+        # 策略 dropna 等副作用返回更短帧时，若直接遍历策略自身索引会让
+        # 回测窗口被静默截断；这里强制把窗口钉回完整输入区间。
+        #
+        # 关键：策略返回与输入【等长且同序】帧时（金样例的全部情形），
+        # df.index.equals(input_index) 为真，整块跳过 —— happy path 逐根
+        # 行为完全不变（单资产 v1≡v2、强平 α 退化、end_of_data、
+        # slippage>0 等金样例不受任何影响）。
+        if not df.index.equals(input_index):
+            # 索引与输入完全不重叠（reset_index / 时间整体偏移等）会让下面的
+            # ffill 无源、target 全部回退 0，静默产出一份「0 笔交易」的正常
+            # 报告——这类错误必须报出来而不是吞掉（与 v2 _prepare_weights 一致）
+            if df.index.intersection(input_index).empty:
+                raise ValueError(
+                    "策略返回帧的索引与输入 K 线索引完全不重叠，无法重对齐。"
+                    "策略应保留输入的时间索引（v1 推荐返回 df 本身并新增 "
+                    "target_position 列），不要 reset_index 或整体平移时间轴。"
+                )
+
+            # target_position 缺行视为「延续上一行」（ffill），与契约 §3 推荐
+            # 口径及 v2 §10.2 一致；首段无前值时兜底为 0（空仓）。
+            # 先按【输入】索引 reindex（缺行置 NaN），再在输入时间序上 ffill，
+            # 与 v2 的 weights.reindex(index).ffill().fillna(0) 完全同序。
+            target = df["target_position"].reindex(input_index).ffill().fillna(0)
+
+            # 行情列从【输入帧】恢复（真实市场数据），不 ffill 造假、也不信任
+            # 策略返回帧里可能被改写/缺失的副本。这样策略 dropna 缩短行情行
+            # 时回测窗口仍是完整输入区间，且行情值就是引擎自己的输入。
+            df = input_ohlc.copy(deep=False)
+            df["target_position"] = target
 
         # 合法值校验必须在整数转换之前：astype(int) 会把 0.5 向零截断成
         # 合法的 0、把 inf 炸成晦涩的 pandas 转换错误，校验就形同虚设

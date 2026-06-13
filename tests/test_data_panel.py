@@ -299,6 +299,75 @@ def test_filter_df_end_with_time_component():
     assert filtered.index.max() == pd.Timestamp("2024-01-01 12:00")
 
 
+def write_tz_aware_csv(data_dir, symbol, start, periods, tz_suffix="+00:00"):
+    """合成带时区 ISO 字符串 open_time 的遗留 CSV（高危 #3 复现）。"""
+    os.makedirs(data_dir, exist_ok=True)
+
+    idx = pd.date_range(start, periods=periods, freq="1min")
+    prices = 100.0 + np.arange(periods, dtype=float)
+
+    df = pd.DataFrame({
+        "open_time": [f"{t.strftime('%Y-%m-%d %H:%M:%S')}{tz_suffix}" for t in idx],
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": 1.0,
+    })
+
+    path = os.path.join(data_dir, kline_file_name(symbol))
+    df.to_csv(path, index=False)
+    return path
+
+
+def test_load_tz_aware_legacy_csv_does_not_crash(tmp_path):
+    """高危 #3 端到端回归：遗留 tz-aware CSV 经 KlineBuilder 剥 tz 后，
+    load_symbol_kline 全链路（清洗→重采样→缓存）不崩溃，索引为 tz-naive。"""
+    data_dir = str(tmp_path)
+    write_tz_aware_csv(data_dir, "BTCUSDT", "2024-01-01 00:00", 480)
+
+    df = load_symbol_kline("BTC", "4h", data_dir=data_dir, auto_fetch=False)
+
+    assert df.index.tz is None
+    assert len(df) == 2
+    assert df["open"].iloc[0] == pytest.approx(100.0)
+    assert df["close"].iloc[0] == pytest.approx(339.0)
+
+
+def test_filter_and_align_after_tz_strip(tmp_path):
+    """剥 tz 后 filter_df_by_date（tz-naive start/end 切片）与 align_klines
+    （索引并集仍是 DatetimeIndex）对遗留 tz-aware 数据正常工作。"""
+    data_dir = str(tmp_path)
+    write_tz_aware_csv(data_dir, "BTCUSDT", "2024-01-01 00:00", 2 * 1440)
+    write_tz_aware_csv(data_dir, "ETHUSDT", "2024-01-02 00:00", 1440)
+
+    panel = load_aligned_panel(
+        ["BTC", "ETH"], "1h", data_dir=data_dir, auto_fetch=False,
+        start_date="2024-01-02", end_date="2024-01-02",
+    )
+
+    for df in panel.values():
+        assert df.index.tz is None
+        assert df.index.min() == pd.Timestamp("2024-01-02 00:00")
+        assert df.index.max() == pd.Timestamp("2024-01-02 23:00")
+
+    assert isinstance(panel["BTCUSDT"].index, pd.DatetimeIndex)
+    assert panel["BTCUSDT"].index.equals(panel["ETHUSDT"].index)
+
+
+def test_align_klines_rejects_mixed_tz_index():
+    """兜底断言：万一混入 tz-aware 与 tz-naive 索引使 union 退化成 object
+    索引，align_klines 必须立刻报清楚而不是让错误潜伏到下游。"""
+    naive_idx = pd.date_range("2024-01-01 00:00", periods=5, freq="1h")
+    aware_idx = pd.date_range("2024-01-01 00:00", periods=5, freq="1h", tz="UTC")
+
+    naive = pd.DataFrame({"close": 100.0}, index=naive_idx)
+    aware = pd.DataFrame({"close": 10.0}, index=aware_idx)
+
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        align_klines({"BTCUSDT": naive, "ETHUSDT": aware})
+
+
 def test_load_aligned_panel_date_window(tmp_path):
     """日期过滤下沉到对齐之前，窗口语义包含 end 当天整天，对齐不受影响。"""
     data_dir = str(tmp_path)
