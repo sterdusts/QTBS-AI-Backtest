@@ -108,6 +108,26 @@ And generates:
 - Risk explanations
 - Strategy implementation notes
 
+Before the AI review, QTBS runs a **behavior check**: the generated code is
+actually executed by the engine on synthetic K-lines (uptrend / downtrend /
+range). Runtime errors are caught up front, and the observed facts (trade count,
+direction, exposure) are fed to the reviewer — so the score reflects what the
+code *does*, not just how it reads.
+
+---
+
+### Automatic Data Management
+
+K-line data is kept up to date automatically:
+
+- On startup QTBS scans locally available symbols and updates them in the
+  background; first use downloads a default set (BTC/ETH).
+- A manual **Update Data** button and a progress panel (total progress, current
+  symbol, hover list) sit next to the language selector.
+- Updates use an **atomic write** (staging file + atomic replace), so backtests
+  always read a complete file and run **in parallel** with ongoing updates — no
+  blocking, no half-written data.
+
 ---
 
 ### Visualized Backtesting
@@ -245,10 +265,12 @@ Current version already supports:
 - Natural-language strategy generation
 - Historical backtesting (single-asset and multi-asset portfolio engines)
 - Hedge / portfolio strategies via continuous target weights
+- Behavioral strategy review (runs generated code on synthetic data before the AI review)
+- Automatic K-line data update (atomic write; backtests run in parallel with updates)
 - Visualized chart systems (incl. portfolio view)
 - AI strategy match analysis
 - Multi-language UI support
-- A written AI↔engine strategy contract (`STRATEGY_CONTRACT.md`) locked by 150+ tests
+- A written AI↔engine strategy contract (`STRATEGY_CONTRACT.md`) locked by 190+ tests
 
 ---
 
@@ -258,7 +280,6 @@ Planned future features:
 
 - Intrabar trigger prices (stop-loss / take-profit at intraday levels)
 - Funding rates and borrowing costs
-- Behavioral strategy review (running generated code on synthetic data before the AI review)
 - Risk / robustness analysis modules (parameter sensitivity, in/out-of-sample)
 - Multi-strategy portfolios
 - AI-driven strategy optimization
@@ -427,6 +448,22 @@ QTBS 会自动分析：
 - 风险说明
 - 策略实现解释
 
+在交给 AI 审查之前，QTBS 会先做一次**行为检查**：把生成的代码用引擎在合成
+K 线（上涨 / 下跌 / 震荡）上真正跑一遍。运行时错误在此被提前拦截，实际行为
+（交易笔数、方向、敞口）也喂给审查 AI——所以评分反映的是代码**实际做了什么**，
+而不只是代码字面。
+
+---
+
+## 自动数据管理
+
+K 线数据自动保持最新：
+
+- 启动时扫描本地已有交易对并在后台更新；首次使用拉取默认币种（BTC/ETH）。
+- 语言选择旁边有**更新数据**手动按钮和进度区（总进度、当前币种、悬停清单）。
+- 更新采用**原子写**（暂存文件 + 原子替换），回测永远读到完整文件，可与更新
+  **并行**进行——不阻塞、不会读到写了一半的数据。
+
 ---
 
 ## 可视化回测系统
@@ -563,10 +600,12 @@ python -m pytest tests -q
 - 自然语言生成策略
 - 历史回测（单标的与多标的组合双引擎）
 - 连续目标权重的对冲 / 组合策略
+- 行为审查（生成代码先在合成数据上实际运行再交给 AI 审查）
+- 自动 K 线数据更新（原子写，回测与更新并行）
 - 图表可视化（含组合视图）
 - AI 策略匹配分析
 - 多语言 UI
-- 成文的 AI↔引擎策略契约（`STRATEGY_CONTRACT.md`），150+ 测试锁定
+- 成文的 AI↔引擎策略契约（`STRATEGY_CONTRACT.md`），190+ 测试锁定
 
 ---
 
@@ -576,7 +615,6 @@ python -m pytest tests -q
 
 - 盘中触发价（止损 / 止盈按盘中价位成交）
 - 资金费率与借币成本
-- 行为审查（生成代码先在合成数据上实际运行再交给 AI 审查）
 - 风险 / 稳健性分析模块（参数敏感性、样本内外）
 - 多策略组合
 - AI 自动优化策略
@@ -744,6 +782,25 @@ QTBS는 자동으로 분석합니다.
 - 리스크 설명
 - 전략 구현 설명
 
+AI 검토 전에 QTBS는 **행동 검사**를 수행합니다. 생성된 코드를 합성 K라인
+(상승 / 하락 / 횡보)에서 엔진으로 실제 실행해 봅니다. 런타임 오류를 미리
+잡아내고, 관측된 사실(거래 수, 방향, 노출)을 검토 AI에 전달합니다. 따라서
+점수는 코드가 어떻게 보이는지가 아니라 **실제로 무엇을 하는지**를 반영합니다.
+
+---
+
+## 자동 데이터 관리
+
+K라인 데이터는 자동으로 최신 상태로 유지됩니다.
+
+- 시작 시 로컬 종목을 스캔하여 백그라운드에서 업데이트하며, 최초 사용 시
+  기본 종목(BTC/ETH)을 다운로드합니다.
+- 언어 선택 옆에 **데이터 업데이트** 수동 버튼과 진행 패널(전체 진행률,
+  현재 종목, 호버 목록)이 있습니다.
+- 업데이트는 **원자적 쓰기**(스테이징 파일 + 원자적 교체)를 사용하므로
+  백테스트는 항상 완전한 파일을 읽고 업데이트와 **병렬로** 실행됩니다 —
+  차단 없음, 절반만 쓰인 데이터 없음.
+
 ---
 
 ## 시각화 백테스트 시스템
@@ -880,10 +937,12 @@ python -m pytest tests -q
 - 자연어 전략 생성
 - 과거 데이터 백테스트(단일 종목 + 멀티 종목 포트폴리오 듀얼 엔진)
 - 연속 목표 가중치 기반 헤지 / 포트폴리오 전략
+- 행동 검증(생성 코드를 합성 데이터에서 실제 실행 후 AI 검토)
+- 자동 K라인 데이터 업데이트(원자적 쓰기, 백테스트와 업데이트 병렬)
 - 시각화 차트 시스템(포트폴리오 뷰 포함)
 - AI 전략 일치도 분석
 - 다국어 UI 지원
-- 문서화된 AI↔엔진 전략 계약(`STRATEGY_CONTRACT.md`)과 150+ 테스트
+- 문서화된 AI↔엔진 전략 계약(`STRATEGY_CONTRACT.md`)과 190+ 테스트
 
 ---
 
@@ -893,7 +952,6 @@ python -m pytest tests -q
 
 - 장중 트리거 가격(손절 / 익절의 장중 체결)
 - 펀딩비 및 차입 비용
-- 행동 검증(생성 코드를 합성 데이터에서 실제 실행 후 AI 검토)
 - 리스크 / 강건성 분석 모듈(파라미터 민감도, 표본 내외)
 - 멀티 전략 포트폴리오
 - AI 기반 전략 자동 최적화
