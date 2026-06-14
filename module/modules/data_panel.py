@@ -31,8 +31,11 @@ if int(pd.__version__.split(".")[0]) < 3:
 from module.modules import fetch_queue
 from module.modules.kline_builder import KlineBuilder
 from module.modules.Load_real_kline import (
+    DEFAULT_FUNDING_DIR,
     KLINE_FILE_SUFFIX,
+    get_funding_file_path,
     get_kline_file_path,
+    has_funding_data,
     has_kline_data,
     normalize_symbol,
 )
@@ -386,3 +389,84 @@ def _resolve_end_ts(end_str):
     if end_ts == end_ts.normalize():
         return end_ts + timedelta(days=1) - timedelta(microseconds=1)
     return end_ts
+
+
+# =========================================================
+# 资金费率（funding）数据层（契约 §10.8）
+# =========================================================
+
+# 永续资金费率结算周期兜底（每 8h），实际从历史结算时间步长推断
+FUNDING_SETTLE_INTERVAL_SECONDS = 8 * 3600
+
+
+def _median_step_seconds(times, fallback: float) -> float:
+    """时间序列相邻步长的中位秒数（用于推断 bar 周期 / 结算周期）。"""
+    s = pd.Series(pd.to_datetime(pd.Index(times))).sort_values()
+    diffs = s.diff().dropna()
+    if len(diffs) == 0:
+        return fallback
+    med = diffs.median().total_seconds()
+    return med if med > 0 else fallback
+
+
+def load_funding_series(symbol, index, funding_dir: str = DEFAULT_FUNDING_DIR):
+    """把某标的的真实 8h 资金费率历史，连续摊销并防未来函数地对齐到 K 线索引，
+    返回「每根 K 线的资金费率」Series（契约 §10.8，供引擎 run(funding_rates=...)）；
+    本地无该标的费率数据返回 None。
+
+    - **防未来函数**：merge_asof(backward) —— 每根 bar 取 settle_time ≤ bar 的
+      最近一次【已结算】费率（只用过去数据）；首个结算点之前的 bar 费率为 0。
+    - **连续摊销**：`per_bar = settled_rate × (bar 周期秒 / 结算周期秒)`，使一个
+      结算周期内各 bar 之和 ≈ 一次真实 funding；引擎按 per_bar 逐根计提名义价值。
+      （bar 周期 ≥ 结算周期时一根跨多次结算，按最近已结算费率近似摊销。）
+    """
+    symbol = normalize_symbol(symbol)
+    if not has_funding_data(symbol, funding_dir=funding_dir):
+        return None
+    if not isinstance(index, pd.DatetimeIndex) or len(index) == 0:
+        return None
+
+    raw = pd.read_csv(get_funding_file_path(symbol, funding_dir=funding_dir))
+    if raw.empty or "funding_time" not in raw.columns or "funding_rate" not in raw.columns:
+        return None
+
+    ft = pd.to_numeric(raw["funding_time"], errors="coerce")
+    fr = pd.to_numeric(raw["funding_rate"], errors="coerce")
+    # funding_time(ms) → tz-naive UTC datetime，与全链路 K 线索引同口径
+    events = pd.DataFrame({
+        "settle_time": pd.to_datetime(ft, unit="ms", utc=True).dt.tz_localize(None),
+        "funding_rate": fr,
+    }).dropna().sort_values("settle_time")
+    if events.empty:
+        return None
+
+    # merge_asof(backward)：每根 bar 取最近一次已结算费率（防未来函数）。
+    # 两侧 datetime 必须同分辨率（pandas 3 下 index 可能是 [us]、to_datetime(ms)
+    # 是 [ms]，不一致会 MergeError）：把结算时间统一到索引的 dtype。
+    bars = pd.DataFrame({"bar_time": index}).sort_values("bar_time")
+    events["settle_time"] = events["settle_time"].astype(bars["bar_time"].dtype)
+    mapped = pd.merge_asof(
+        bars, events, left_on="bar_time", right_on="settle_time", direction="backward"
+    ).set_index("bar_time")
+    # 回到调用方原索引序，首个结算点之前无费率 → 0
+    settled = mapped["funding_rate"].reindex(index).fillna(0.0)
+
+    interval_s = _median_step_seconds(events["settle_time"], FUNDING_SETTLE_INTERVAL_SECONDS)
+    bar_s = _median_step_seconds(index, 0.0)
+    factor = (bar_s / interval_s) if interval_s > 0 else 0.0
+
+    return (settled * factor).rename(symbol)
+
+
+def build_funding_rates(symbols, index, funding_dir: str = DEFAULT_FUNDING_DIR):
+    """为面板构造 `{symbol: 每根费率 Series}`，供引擎 `run(funding_rates=...)`。
+
+    只纳入本地有费率数据的标的（其余标的引擎按 0 处理）；若没有任何标的有
+    本地费率数据，返回 None（⇒ 引擎完全不计 funding，逐根行为与无 funding 一致）。
+    """
+    out = {}
+    for s in symbols:
+        series = load_funding_series(s, index, funding_dir=funding_dir)
+        if series is not None:
+            out[normalize_symbol(s)] = series
+    return out or None

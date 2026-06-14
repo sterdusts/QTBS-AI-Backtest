@@ -16,6 +16,13 @@ import uuid
 # 下载」——所以不要在别处再手写这个后缀。
 KLINE_FILE_SUFFIX = "_1MIN_data.csv"
 
+# 资金费率（funding）历史文件命名的唯一出处（契约 §10.8）。funding 是
+# 「按时间点结算」的稀疏序列（永续每 8h 一次），不能并入 1m K 线 CSV——
+# KlineBuilder 清洗阶段会把 OHLCV 之外的列裁掉。因此独立并行文件存放，
+# schema：funding_time(ms 整数), funding_rate(float)。下载器写、data_panel
+# 读、目录扫描三方共用此后缀。
+FUNDING_FILE_SUFFIX = "_FUNDING.csv"
+
 # 原子写的暂存子目录（建在数据目录内，保证与目标文件同一文件系统，
 # os.replace 才是原子 rename）。平时为空：写完即 replace 移走临时文件。
 STAGING_DIRNAME = ".staging"
@@ -156,6 +163,29 @@ def get_kline_file_path(
     data_dir: str = "cryptocurrency_data/kline_data"
 ) -> str:
     return os.path.join(data_dir, kline_file_name(symbol))
+
+
+# 资金费率历史的默认目录（与 K 线目录并列的独立目录，契约 §10.8）
+DEFAULT_FUNDING_DIR = os.path.join("cryptocurrency_data", "funding_data")
+
+
+def funding_file_name(symbol: str) -> str:
+    return f"{normalize_symbol(symbol)}{FUNDING_FILE_SUFFIX}"
+
+
+def get_funding_file_path(
+    symbol: str,
+    funding_dir: str = DEFAULT_FUNDING_DIR,
+) -> str:
+    return os.path.join(funding_dir, funding_file_name(symbol))
+
+
+def has_funding_data(
+    symbol: str,
+    funding_dir: str = DEFAULT_FUNDING_DIR,
+) -> bool:
+    """本地是否存在某标的的资金费率历史文件。"""
+    return os.path.exists(get_funding_file_path(symbol, funding_dir=funding_dir))
 
 
 def normalize_symbol(user_input: str, quote: str = "USDT") -> str:
