@@ -33,6 +33,7 @@ strategy_func(data) 接收对齐的多标的 K 线面板：
 
 import math
 
+import numpy as np
 import pandas as pd
 
 from module.modules.backtest_metrics import (
@@ -82,8 +83,9 @@ class PortfolioBacktestCore:
     # 主流程
     # =========================================================
 
-    def run(self, data: dict) -> dict:
+    def run(self, data: dict, funding_rates=None) -> dict:
         symbols, index = self._validate_data(data)
+        funding_arr = self._prepare_funding_rates(funding_rates, symbols, index)
 
         # 浅拷贝即可防策略篡改：pandas 写时复制（CoW）下策略的任何写入
         # 只触发被改块的复制，原面板不受影响，深拷贝是纯浪费
@@ -98,6 +100,7 @@ class PortfolioBacktestCore:
         weights_arr = {s: weights[s].to_numpy(dtype=float) for s in symbols}
 
         cash = self.initial_cash
+        total_funding_cost = 0.0  # 累计资金费率净支出（正=净付出），契约 §10.8
         qty = {s: 0.0 for s in symbols}
         avg_entry = {s: None for s in symbols}
         avg_entry_raw = {s: None for s in symbols}  # raw 价移动平均成本，供 gross 口径
@@ -124,11 +127,17 @@ class PortfolioBacktestCore:
             ep["exit_price"] = float(exit_price)
             ep["exit_reason"] = exit_reason
 
-            pnl = ep["realized_pnl"] - ep["fees"]
+            # funding（契约 §10.8）作为持有期现金流计入单笔 net_pnl，与 v1 的
+            # net_pnl = equity_after - entry_equity（cash 已被 funding 扣减）口径
+            # 一致；gross_pnl 仍为 raw 价差、不含 funding。funding_cf 默认 0 ⇒
+            # 无 funding 时与原公式逐字节一致。
+            funding_cf = ep.get("funding_cf", 0.0)
+            pnl = ep["realized_pnl"] - ep["fees"] + funding_cf
             entry_equity = ep["entry_equity"]
 
             ep["pnl"] = float(pnl)
             ep["net_pnl"] = float(pnl)
+            ep["funding_pnl"] = float(funding_cf)
             ep["pnl_pct"] = float(pnl / entry_equity * 100) if entry_equity else 0.0
             ep["net_pnl_pct"] = ep["pnl_pct"]
             # gross = raw 价格口径的纯价格盈亏（不含滑点与手续费），与 v1 同口径
@@ -232,6 +241,7 @@ class PortfolioBacktestCore:
                         "realized_pnl": 0.0,
                         "realized_pnl_raw": 0.0,
                         "fees": fee,
+                        "funding_cf": 0.0,
                         "max_abs_qty": abs(remaining),
                     }
                     avg_entry[s] = fill_price
@@ -311,6 +321,26 @@ class PortfolioBacktestCore:
                 c = closes[s][i]
                 if not math.isnan(c):
                     last_close[s] = float(c)
+
+            # ---------- 资金费率结算（契约 §10.8）----------
+            # 在 MTM 与强平检测之前按持仓名义价值扣/加 cash，使 funding 拖低
+            # 权益后能自然参与本根强平判定。funding_arr 为 None 时整段跳过，
+            # 逐根行为与无 funding 完全一致（金样例零影响的硬门槛）。
+            if funding_arr is not None:
+                for s in symbols:
+                    q = qty[s]
+                    if q == 0.0 or last_close[s] is None:
+                        continue
+                    rate_i = funding_arr[s][i]
+                    if rate_i == 0.0:
+                        continue
+                    # 正费率：多头付（cash 减）、空头收（cash 增）
+                    funding_cf = -q * last_close[s] * rate_i
+                    cash += funding_cf
+                    total_funding_cost -= funding_cf
+                    ep = open_episodes[s]
+                    if ep is not None:
+                        ep["funding_cf"] += funding_cf
 
             mtm = compute_mtm(i)
             equity_close = mtm["equity_close"]
@@ -565,6 +595,7 @@ class PortfolioBacktestCore:
             rebalance_threshold=self.rebalance_threshold,
             fill_count=len(fills),
             symbols=list(symbols),
+            total_funding_cost=float(total_funding_cost),
         )
 
         return {
@@ -617,6 +648,39 @@ class PortfolioBacktestCore:
                 )
 
         return list(data.keys()), index
+
+    def _prepare_funding_rates(self, funding_rates, symbols, index):
+        """把可选的 per-symbol 资金费率序列归一化为 {symbol: np.array(len(index))}。
+
+        funding_rates[s] 是「每根 K 线的资金费率」（已由数据层从真实 8h 序列
+        连续摊销并对齐到 K 线索引，见契约 §10.8），正费率多头付空头收。
+        None 表示不计资金费率，引擎逐根行为与无 funding 完全一致（金样例
+        零影响的硬门槛）。缺失的标的按 0 处理；NaN 视为该根无费率（0）。
+        """
+        if funding_rates is None:
+            return None
+        if not isinstance(funding_rates, dict):
+            raise ValueError(
+                "funding_rates 必须是 {symbol: 每根费率序列} 的 dict，或 None"
+            )
+
+        n = len(index)
+        out = {}
+        for s in symbols:
+            series = funding_rates.get(s)
+            if series is None:
+                out[s] = np.zeros(n, dtype=float)
+                continue
+            if isinstance(series, pd.Series):
+                arr = series.reindex(index).to_numpy(dtype=float)
+            else:
+                arr = np.asarray(series, dtype=float)
+            if arr.shape[0] != n:
+                raise ValueError(
+                    f"{s} 的 funding_rates 长度 {arr.shape[0]} 与 K 线根数 {n} 不一致"
+                )
+            out[s] = np.nan_to_num(arr, nan=0.0)
+        return out
 
     def _prepare_weights(self, raw_weights, symbols, index):
         if not isinstance(raw_weights, pd.DataFrame):

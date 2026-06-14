@@ -173,7 +173,7 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 记录在案，避免误读回测结果：
 
 1. 止损/止盈通过信号表达，存在**一根 K 线的执行延迟**，且无法以盘中触发价成交
-2. 无资金费率、借币成本（做空结果偏乐观）
+2. 资金费率（funding）：引擎已支持（见 §10.8，v2.1，v1/v2 同口径，默认关闭）；借币成本（做空/杠杆借入利息）暂未建模
 3. 无部分成交、无流动性模型：任意规模均按开盘价全额成交
 4. 单标的、单仓位：无法表达对冲、组合、动态仓位
 5. 图表的「盘中最大偏离权益」在上下影**完全对称**的 K 线上，v1 与 v2 的
@@ -186,7 +186,8 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 |------|------|------|
 | v1 | 单标的、离散目标仓位 {-1, 0, 1}，引擎 `CodeBacktestCore` | **当前默认** |
 | v2 | 多标的连续目标权重，引擎 `PortfolioBacktestCore`（见第 10 节），解锁对冲/多资产/动态仓位/分批/Alpha/多因子/轮动；v1 策略不受影响，继续由现有引擎执行 | **已实现**（引擎 + AI 生成 + webUI 路由 + 组合图表） |
-| v2.x | 可选盘中触发价列（stop / take-profit），引擎用 high/low 判断盘中成交 | 规划 |
+| v2.1 | 资金费率/借币成本（持有成本现金流），引擎按持仓名义价值逐根计提，见 §10.8 | **引擎已实现**（v1/v2 同口径 + 金样例，默认关闭）；真实费率数据管线进行中 |
+| v2.2 | 可选盘中触发价列（stop / take-profit），引擎用 high/low 判断盘中成交 | 规划 |
 | v3 | 订单级事件引擎（限价/条件单），服务做T与精确网格 | 按需 |
 
 > v1.5（单标的连续仓位）已并入 v2：单标的连续权重就是 v2 的单列特例。
@@ -311,6 +312,39 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 3. `gross_pnl` 两引擎同口径：实际持仓 × raw 价差（不含滑点与手续费）
 4. `position_size < 1` 时两引擎语义**有意不同**（v1 一次性比例 / v2 持续再平衡），
    由说明性测试钉死，见 10.2 推论
+5. 资金费率 funding（§10.8）：`funding_rates=None`（或全零）时引擎逐根行为与无
+   funding 完全一致——上述 1–4 全部金样例 **bit-level 不变**（零影响硬门槛）
+
+### 10.8 资金费率与借币成本（funding / borrow cost，v2.1）
+
+永续合约的持有成本现金流。**默认全关闭**（`funding_rates=None`）；开启时不改
+权重/对账/强平几何，仅在持有期内按持仓名义价值逐根扣/加 `cash`，与手续费记账
+同构（fee 也只扣 cash），`equity = cash + 未实现盈亏` 自动跟随。
+
+- **入口**：`run(data, funding_rates=...)`（两引擎同名参数）
+  - v2：`{symbol: 每根 K 线的资金费率序列}`（与面板索引等长，pd.Series 或数组）
+  - v1：单标的的每根费率序列（与输入索引等长）
+  - 缺失的标的按 0 处理；NaN 视为该根无费率（0）；长度与 K 线根数不符报错
+- **结算口径**：在每根 K 线起点、**MTM 与强平检测之前**结算，使 funding 拖低
+  权益后能自然参与本根强平判定（funding 不进强平 α 公式，只改 α 求解的 cash
+  起点）。单腿现金流 `funding_cf = -signed_qty × close × rate_i`（`signed_qty`
+  正多负空）：**正费率 → 多头付（cash 减）、空头收（cash 增）**（照搬交易所约定）
+- **每根费率的来源**：数据层把真实 8h 离散费率序列**连续摊销**到每根 K 线并防
+  未来函数（每根取最近一次【已结算】费率，按 `rate × bar秒 / 结算周期秒` 摊销）；
+  引擎只消费「每根费率」，对数据来源无感（固定年化近似亦可作同形态输入）
+- **单笔 pnl 口径**：funding 作为持有期现金流**计入单笔 `net_pnl`**——v1 经
+  `net_pnl = equity_after − entry_equity` 天然含已扣 cash 的 funding；v2 在
+  `finish_episode` 显式 `pnl = realized_pnl − fees + funding_cf`，两引擎同口径。
+  单笔另出 `funding_pnl` 字段（持有期累计 funding 现金流，负=净付出）
+- **gross 神圣不变**：`gross_pnl` 仍为 raw 价差 × 持仓，**不含 funding**
+- **输出**：`metrics.total_funding_cost`（累计资金费率净支出，正=净付出）；funding
+  经 `equity_close` 自动进收益/回撤/夏普（长持有逐根负漂、夏普下降，即期望行为）
+- **借币成本**：v2.1 暂只做 funding；借币（做空/杠杆借入利息）作为同结构的第二
+  参数延后
+
+> **金样例**（`tests/test_funding.py`）锁定：零/None 退化、多头付/空头收符号与
+> 数值（v1≡v2 逐根一致）、gross 不受 funding 影响、funding 拖入强平（v1≡v2）、
+> per-symbol 各腿独立结算、单笔 net_pnl 含 funding。
 
 ## 11. 变更记录
 
@@ -327,3 +361,4 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 | 2026-06-13 | v2 | 数据更新功能 + 第七轮全仓审查修复：新增 fetch_queue 统一拉取队列（启动自动更新/手动按钮/回测按需，串行+进度区+回测优先暂停）；第七轮重写 fetch_queue 并发模型为「持久 worker + Condition + generation」修一整类竞态（reset 双 worker、lost-wakeup 币种滞留、批次边界 TOCTOU 计数堆叠）；_DIR_OF 取最新目录修同名跨目录串扰；增量补拉 gate 改 end-of-day（与过滤切片同口径，修少近一天数据）；_REFRESHED 标记移到补拉后；启动自动更新去一次性 latch 改 is_running 守卫（首批失败可重试）；代码折叠面板标题随语言切换；删冗余 download_lock；tooltip/默认币种入队收敛单源；契约新增 §9.1 数据更新行为 |
 | 2026-06-13 | v2 | 更新与回测并行（原子写方案）：下载器改用 atomic_write_csv（.staging 暂存区写完整文件 + os.replace 原子覆盖 + Windows 占用重试），回测读文件永远完整、与后台更新真正并行；增量补拉改非阻塞后台 enqueue（回测对已有数据币种立即开跑，下次取更新后数据），仅本地完全无数据时才阻塞等首次拉取；移除回测优先暂停机制（_PRIORITY/_PAUSE_DEPTH，原子写后不再需要）；fetch_blocking 保留插队首优先；新增原子写并发安全测试（多读者+持续覆写零半截） |
 | 2026-06-13 | v1 | v1 引擎回测窗口锚定输入索引：`CodeBacktestCore.run` 在 `strategy_func` 返回后按【输入】索引重对齐（`reindex(input_index)`），修复策略 `dropna`/缩短行**静默截断回测窗口**（equity_curve 只覆盖剩余根数，与 webUI 取自完整输入索引的 kline_count/起止时间静默错配）；target_position 缺行按 `ffill().fillna(0)` 延续（与 v2 §10.2 同口径），行情列始终取自输入帧不被 ffill 造假，索引零交集报错（与 v2 _prepare_weights 一致）；返回帧等长同序时重对齐为无操作，单资产 v1≡v2/强平 α 退化/end_of_data/slippage>0 等金样例逐根不变；契约 §3 补「回测窗口锚定输入索引」引擎层承诺 |
+| 2026-06-14 | v2.1 | 资金费率（funding）引擎支持：两引擎 `run(funding_rates=...)` 接收 per-symbol 每根费率序列，在 MTM/强平之前按 `-signed_qty×close×rate` 逐根扣/加 cash（正费率多头付空头收），纳入强平判定（不进 α 公式、只改 cash 起点）；funding 计入单笔 net_pnl（v1 天然含、v2 finish_episode 显式加 funding_cf），gross 仍为 raw 价差不含 funding；metrics 新增 total_funding_cost、单笔新增 funding_pnl；`funding_rates=None`/全零时逐根 bit-level 退化为无 funding（现有金样例零改动通过）；契约 §10.8 + §8.2 + §9（v2.1）+ §10.7 不变量 5 + `tests/test_funding.py` 9 条金样例。真实 8h 费率数据管线（下载器 + data_panel 连续摊销对齐）为下一步 |

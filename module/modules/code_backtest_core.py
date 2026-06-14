@@ -61,7 +61,7 @@ class CodeBacktestCore:
         self.enable_liquidation = bool(enable_liquidation)
         self.stop_on_liquidation = bool(stop_on_liquidation)
 
-    def run(self, df: pd.DataFrame) -> dict:
+    def run(self, df: pd.DataFrame, funding_rates=None) -> dict:
         # 浅拷贝即可防策略篡改：pandas 写时复制下任何写入只复制被改的块
         df = df.copy(deep=False)
 
@@ -145,6 +145,10 @@ class CodeBacktestCore:
 
         df["target_position"] = raw_target.astype(int)
 
+        # 资金费率序列（契约 §10.8）对齐到【输入】索引；策略缩短帧时 df
+        # 已 reindex 回 input_index，二者逐根对齐。None ⇒ 不计 funding。
+        funding_arr = self._prepare_funding_rates(funding_rates, input_index)
+
         cash = self.initial_cash
 
         position = 0.0
@@ -165,6 +169,8 @@ class CodeBacktestCore:
 
         realized_equity = self.initial_cash
         liquidated = False
+        total_funding_cost = 0.0       # 累计资金费率净支出（正=净付出），契约 §10.8
+        position_funding_cf = 0.0      # 当前持仓累计 funding 现金流（开仓时归零）
 
         for i in range(len(df)):
             current_time = df.index[i]
@@ -173,6 +179,20 @@ class CodeBacktestCore:
             high_price = float(df["high"].iloc[i])
             low_price = float(df["low"].iloc[i])
             close_price = float(df["close"].iloc[i])
+
+            # ---------- 资金费率结算（契约 §10.8）----------
+            # 在 MTM 与强平检测之前按持仓名义价值扣/加 cash，使 funding 能
+            # 参与本根强平判定。funding_arr 为 None 时整段跳过，逐根行为与无
+            # funding 完全一致。net_pnl = equity_after - entry_equity 天然含已扣
+            # cash 的 funding，与 v2 的单笔口径一致；gross 仍为 raw 价差不含 funding。
+            if funding_arr is not None and position_side != 0:
+                rate_i = funding_arr[i]
+                if rate_i != 0.0:
+                    # 正费率：多头付（cash 减）、空头收（cash 增）
+                    funding_cf = -(position * position_side) * close_price * rate_i
+                    cash += funding_cf
+                    total_funding_cost -= funding_cf
+                    position_funding_cf += funding_cf
 
             mtm = self._calculate_mtm_equity(
                 cash=cash,
@@ -227,6 +247,7 @@ class CodeBacktestCore:
                     exit_price=liquidation_price,
                     exit_raw_price=liquidation_price,
                     cash_after=cash,
+                    position_funding_cf=position_funding_cf,
                 )
 
                 trades.append(trade)
@@ -268,6 +289,7 @@ class CodeBacktestCore:
                 entry_margin = None
                 entry_notional = None
                 entry_open_fee = None
+                position_funding_cf = 0.0
 
                 liquidated = True
 
@@ -328,6 +350,7 @@ class CodeBacktestCore:
                     entry_open_fee=entry_open_fee,
                     exit_raw_price=exit_raw_price,
                     execute_time=execute_time,
+                    position_funding_cf=position_funding_cf,
                 )
 
                 cash = close_result["cash_after"]
@@ -343,6 +366,7 @@ class CodeBacktestCore:
                 entry_margin = None
                 entry_notional = None
                 entry_open_fee = None
+                position_funding_cf = 0.0
 
             # target 合法性已在 run() 入口统一校验，此处只需区分开仓与否；
             # 多空开仓除 side 外完全一致，合并为单一路径避免两份记账漂移
@@ -397,6 +421,7 @@ class CodeBacktestCore:
                 entry_open_fee=entry_open_fee,
                 close_fee=0.0,
                 equity_after=equity_now,
+                extra={"funding_pnl": float(position_funding_cf)},
             ))
 
         final_equity = equity_curve[-1]["equity_close"] if equity_curve else self.initial_cash
@@ -408,7 +433,10 @@ class CodeBacktestCore:
             final_equity=final_equity,
         )
 
-        attach_engine_metrics(metrics, self, len(liquidation_events), liquidated)
+        attach_engine_metrics(
+            metrics, self, len(liquidation_events), liquidated,
+            total_funding_cost=float(total_funding_cost),
+        )
 
         return {
             "df": df,
@@ -471,6 +499,7 @@ class CodeBacktestCore:
         entry_open_fee,
         exit_raw_price,
         execute_time,
+        position_funding_cf=0.0,
     ):
         if position_side == 1:
             exit_price = exit_raw_price * (1 - self.slippage)
@@ -500,6 +529,7 @@ class CodeBacktestCore:
             entry_open_fee=entry_open_fee,
             close_fee=close_fee,
             equity_after=cash_after,
+            extra={"funding_pnl": float(position_funding_cf)},
         )
 
         return {
@@ -744,6 +774,7 @@ class CodeBacktestCore:
         exit_price,
         exit_raw_price,
         cash_after,
+        position_funding_cf=0.0,
     ):
         return self._build_trade(
             exit_reason="liquidation",
@@ -766,8 +797,28 @@ class CodeBacktestCore:
                 "liquidation_price": float(event["liquidation_price"]),
                 "trigger_price": float(event["trigger_price"]),
                 "trigger_field": event["trigger_field"],
+                "funding_pnl": float(position_funding_cf),
             },
         )
+
+    def _prepare_funding_rates(self, funding_rates, index):
+        """把可选的资金费率序列归一化为 np.array(len(index))（契约 §10.8）。
+
+        funding_rates 是「每根 K 线的资金费率」（已由数据层从真实 8h 序列
+        连续摊销并对齐到 K 线索引），正费率多头付空头收。None 表示不计资金
+        费率，引擎逐根行为与无 funding 完全一致；NaN 视为该根无费率（0）。
+        """
+        if funding_rates is None:
+            return None
+        if isinstance(funding_rates, pd.Series):
+            arr = funding_rates.reindex(index).to_numpy(dtype=float)
+        else:
+            arr = np.asarray(funding_rates, dtype=float)
+        if arr.shape[0] != len(index):
+            raise ValueError(
+                f"funding_rates 长度 {arr.shape[0]} 与 K 线根数 {len(index)} 不一致"
+            )
+        return np.nan_to_num(arr, nan=0.0)
 
     def _calculate_holding_hours(self, entry_time, exit_time) -> float:
         # 口径单源在 backtest_metrics，与组合引擎共用
