@@ -20,6 +20,7 @@ from module.modules.portfolio_backtest_core import PortfolioBacktestCore
 from module.modules import fetch_queue
 from module.modules.data_panel import (
     DEFAULT_DATA_DIR,
+    build_funding_rates,
     filter_df_by_date,
     list_local_symbols,
     load_aligned_panel,
@@ -1248,12 +1249,18 @@ def build_param_priority_html(text: dict) -> str:
     )
 
 
-def update_ui_language(lang_code: str):
+def update_ui_language(
+    lang_code: str,
+    market: str = "crypto",
+    timeframe: str = "4h",
+    initial_cash=1000,
+):
     text = get_ui_text(lang_code)
     _snap = fetch_queue.snapshot()  # 进度区与按钮共用一次快照
 
     return [
-        text["header"],
+        build_studio_header_markdown(lang_code),
+        build_status_cards_html(lang_code, market, timeframe, initial_cash),
         gr.update(
             label=text["strategy_label"],
             placeholder=text["strategy_placeholder"],
@@ -1506,10 +1513,15 @@ def run_backtest_from_ui(
         actual_start = str(data_index[0])
         actual_end = str(data_index[-1])
 
+        # 资金费率（契约 §10.8）：本地有 funding 历史的标的自动按 per-bar 摊销
+        # 费率参与回测；无本地费率数据时 build_funding_rates 返回 None ⇒ 引擎
+        # 不计 funding，逐根行为与无 funding 完全一致（不改变现有回测结果）。
+        funding_map = build_funding_rates(route_symbols, data_index)
+
         # ---- 跑引擎、出图：分支体只保留真正不同的部分 ----
 
         if route_version == 2:
-            result = PortfolioBacktestCore(**engine_kwargs).run(data)
+            result = PortfolioBacktestCore(**engine_kwargs).run(data, funding_rates=funding_map)
 
             base_names = "_".join(get_base_asset(s) for s in route_symbols[:4])
             html_path = plot_portfolio_result(
@@ -1521,7 +1533,9 @@ def run_backtest_from_ui(
                 auto_open=True,
             )
         else:
-            result = CodeBacktestCore(**engine_kwargs).run(df)
+            # v1 单标的：从 funding_map 取该标的的 per-bar 费率序列（无则 None）
+            v1_funding = funding_map.get(symbol) if funding_map else None
+            result = CodeBacktestCore(**engine_kwargs).run(df, funding_rates=v1_funding)
 
             html_path = plot_generic_equity_curves(
                 result=result,
@@ -1558,157 +1572,499 @@ def run_backtest_from_ui(
 
 
 # =========================================================
+# 工作台 UI 静态构件
+# =========================================================
+
+STUDIO_HEADERS = {
+    "zh": (
+        "QTBS AI 量化策略前端",
+        "用自然语言生成策略代码并运行历史回测",
+    ),
+    "en": (
+        "QTBS AI Quant Strategy Frontend",
+        "Generate executable strategy code from natural language and run historical backtests.",
+    ),
+    "ko": (
+        "QTBS AI 퀀트 전략 프론트엔드",
+        "자연어로 전략 코드를 생성하고 과거 데이터 백테스트를 실행합니다.",
+    ),
+    "ja": (
+        "QTBS AI 量的戦略フロントエンド",
+        "自然言語から戦略コードを生成し、履歴データでバックテストします。",
+    ),
+    "ar": (
+        "واجهة QTBS AI للاستراتيجيات الكمية",
+        "أنشئ كود الاستراتيجية من اللغة الطبيعية وشغّل الاختبار الخلفي التاريخي.",
+    ),
+    "ru": (
+        "QTBS AI фронтенд количественных стратегий",
+        "Создавайте код стратегии на естественном языке и запускайте исторический бэктест.",
+    ),
+}
+
+
+def build_studio_header_markdown(lang_code: str) -> str:
+    title, subtitle = STUDIO_HEADERS.get(lang_code, STUDIO_HEADERS["zh"])
+    return f"""
+<div class="studio-kicker">QTBS AI Studio</div>
+<h1>{html.escape(title)}</h1>
+<p>{html.escape(subtitle)}</p>
+"""
+
+
+def build_sidebar_html() -> str:
+    return """
+    <aside class="sidebar-shell">
+        <div>
+            <div class="sidebar-brand">QTBS AI Studio</div>
+            <nav class="sidebar-nav" aria-label="QTBS workspace navigation">
+                <div class="sidebar-nav-item active"><span></span>策略工作台</div>
+                <div class="sidebar-nav-item"><span></span>数据任务</div>
+                <div class="sidebar-nav-item"><span></span>回测报告</div>
+                <div class="sidebar-nav-item"><span></span>代码审查</div>
+            </nav>
+        </div>
+        <div class="sidebar-foot">自然语言策略生成与回测平台</div>
+    </aside>
+    """
+
+
+def format_status_cash(value) -> str:
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError
+    except Exception:
+        number = 1000.0
+
+    if number.is_integer():
+        formatted = f"{number:,.0f}"
+    else:
+        formatted = f"{number:,.2f}".rstrip("0").rstrip(".")
+    return f"{formatted} USDT"
+
+
+def build_status_cards_html(
+    lang_code: str = "zh",
+    market: str = "crypto",
+    timeframe: str = "4h",
+    initial_cash=1000,
+) -> str:
+    text = get_ui_text(lang_code)
+    market_display = text["market_choice"] if market == "crypto" else str(market or "-")
+    timeframe_display = str(timeframe or "4h")
+    cash_display = format_status_cash(initial_cash)
+
+    return f"""
+    <div class="top-status-grid">
+        <div class="top-status-item">
+            <span>{html.escape(text["market_label"])}</span>
+            <strong>{html.escape(market_display)}</strong>
+        </div>
+        <div class="top-status-item">
+            <span>{html.escape(text["timeframe_label"])}</span>
+            <strong>{html.escape(timeframe_display)}</strong>
+        </div>
+        <div class="top-status-item">
+            <span>{html.escape(text["initial_cash_label"])}</span>
+            <strong>{html.escape(cash_display)}</strong>
+        </div>
+    </div>
+    """
+
+
+def update_status_cards(
+    lang_code: str,
+    market: str,
+    timeframe: str,
+    initial_cash,
+) -> str:
+    return build_status_cards_html(lang_code, market, timeframe, initial_cash)
+
+
+def build_section_header_html(title: str, subtitle: str | None = None) -> str:
+    subtitle_html = f"<p>{html.escape(subtitle)}</p>" if subtitle else ""
+    return f"""
+    <div class="section-heading">
+        <h2>{html.escape(title)}</h2>
+        {subtitle_html}
+    </div>
+    """
+
+
+# =========================================================
 # 页面 CSS
 # =========================================================
 
 custom_css = """
-#main-container {
-    max-width: 1500px;
-    margin: 0 auto;
+:root {
+    --qtbs-bg: #f4f6f8;
+    --qtbs-panel: #ffffff;
+    --qtbs-line: #d9dee7;
+    --qtbs-muted: #667085;
+    --qtbs-text: #172033;
+    --qtbs-blue: #2563eb;
+    --qtbs-orange: #f97316;
+    --qtbs-dark: #171a22;
+    --qtbs-ui-scale: 1;
+    --qtbs-screen-px: 1px;
+    --qtbs-screen-px: clamp(0.96px, 0.052vw, 1.16px);
+    --qtbs-radius: clamp(7px, calc(var(--qtbs-screen-px) * 8), 10px);
+    --qtbs-font-xxs: clamp(10px, calc(var(--qtbs-screen-px) * 11), 13px);
+    --qtbs-font-xs: clamp(11px, calc(var(--qtbs-screen-px) * 12), 14px);
+    --qtbs-font-sm: clamp(12px, calc(var(--qtbs-screen-px) * 13), 15px);
+    --qtbs-font-md: clamp(13px, calc(var(--qtbs-screen-px) * 14), 16px);
+    --qtbs-font-lg: clamp(15px, calc(var(--qtbs-screen-px) * 18), 21px);
+    --qtbs-font-xl: clamp(22px, calc(var(--qtbs-screen-px) * 30), 36px);
+    --qtbs-page-pad: clamp(8px, calc(var(--qtbs-screen-px) * 18), 26px);
+    --qtbs-gap: clamp(8px, calc(var(--qtbs-screen-px) * 14), 20px);
+    --qtbs-panel-pad: clamp(10px, calc(var(--qtbs-screen-px) * 16), 24px);
+    --qtbs-sidebar-width: clamp(180px, calc(var(--qtbs-screen-px) * 208), 250px);
+    --qtbs-content-max: min(2440px, calc(100vw - var(--qtbs-page-pad) * 2));
 }
 
-.review-behavior {
-    font-size: 12.5px;
-    margin: 8px 0 2px 0;
+body,
+.gradio-container {
+    background: var(--qtbs-bg) !important;
+    color: var(--qtbs-text) !important;
+    font-size: var(--qtbs-font-md) !important;
+}
+
+body {
+    margin: 0 !important;
+    overflow-x: hidden;
+}
+
+.gradio-container {
+    max-width: none !important;
+    width: 100% !important;
+}
+
+body > gradio-app,
+gradio-app,
+.gradio-container,
+.gradio-container > .main,
+.gradio-container .main,
+.gradio-container .contain,
+.gradio-container .wrap {
+    max-width: none !important;
+}
+
+.gradio-container > .main,
+.gradio-container .main,
+.gradio-container .contain {
+    width: 100% !important;
+}
+
+#app-shell {
+    width: var(--qtbs-content-max) !important;
+    max-width: var(--qtbs-content-max) !important;
+    margin: 0 auto !important;
+    padding: var(--qtbs-page-pad) 0 calc(var(--qtbs-page-pad) + 4px);
+    gap: var(--qtbs-gap) !important;
+    align-items: stretch;
+    box-sizing: border-box;
+    zoom: var(--qtbs-ui-scale);
+}
+
+#sidebar-col {
+    flex: 0 0 var(--qtbs-sidebar-width) !important;
+    max-width: var(--qtbs-sidebar-width) !important;
+    min-width: 160px !important;
+}
+
+#studio-sidebar {
+    height: 100%;
+}
+
+#studio-sidebar,
+#studio-sidebar .html-container,
+#studio-sidebar .prose {
+    overflow: visible !important;
+}
+
+.sidebar-shell {
+    min-height: calc(100vh - var(--qtbs-page-pad) * 2);
     display: flex;
-    align-items: flex-start;
-    justify-content: flex-end;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: var(--qtbs-panel-pad);
+    border: 1px solid var(--qtbs-line);
+    border-radius: 8px;
+    background: #ffffff;
+}
+
+.sidebar-brand {
+    padding: 8px 8px 18px;
+    font-size: 17px;
+    font-weight: 800;
+    letter-spacing: 0;
+    color: #111827;
+}
+
+.sidebar-nav {
+    display: grid;
     gap: 6px;
 }
 
-/* 颜色直接钉到内部 span 并 !important：否则被 Gradio prose 的 span 颜色覆盖成灰 */
-.review-behavior.behavior-pass,
-.review-behavior.behavior-pass > span {
-    color: #2da44e !important;
-}
-
-.review-behavior.behavior-fail,
-.review-behavior.behavior-fail > span {
-    color: #d64545 !important;
+.sidebar-nav-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-height: 38px;
+    padding: 0 10px;
+    border-radius: 8px;
+    color: #4b5563;
+    font-size: 14px;
     font-weight: 600;
 }
 
-/* 行为检查的 "!" 气泡是绝对定位后代：整条祖先链不能裁切 */
+.sidebar-nav-item span {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #cbd5e1;
+}
+
+.sidebar-nav-item.active {
+    background: #fff7ed;
+    color: #c2410c;
+}
+
+.sidebar-nav-item.active span {
+    background: var(--qtbs-orange);
+}
+
+.sidebar-foot {
+    padding: 12px 8px 4px;
+    border-top: 1px solid #e5e7eb;
+    color: var(--qtbs-muted);
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+#main-container {
+    min-width: 0;
+    max-width: none !important;
+    width: 100% !important;
+}
+
+.studio-panel {
+    background: var(--qtbs-panel);
+    border: 1px solid var(--qtbs-line);
+    border-radius: 8px;
+    padding: var(--qtbs-panel-pad) !important;
+}
+
+#top-bar {
+    align-items: stretch;
+    gap: var(--qtbs-gap) !important;
+    margin-bottom: var(--qtbs-gap);
+}
+
+#header-panel,
+#top-right-panel {
+    background: var(--qtbs-panel);
+    border: 1px solid var(--qtbs-line);
+    border-radius: 8px;
+    padding: var(--qtbs-panel-pad) !important;
+}
+
+#studio-header-md,
+#studio-header-md .prose {
+    margin: 0 !important;
+}
+
+#studio-header-md .studio-kicker {
+    margin-bottom: 7px;
+    color: var(--qtbs-blue);
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0;
+}
+
+#studio-header-md h1 {
+    margin: 0 !important;
+    color: #111827;
+    font-size: clamp(22px, 1.8vw, 32px) !important;
+    line-height: 1.2 !important;
+    letter-spacing: 0 !important;
+}
+
+#studio-header-md p {
+    margin: 8px 0 0 !important;
+    color: var(--qtbs-muted);
+    font-size: 14px !important;
+    line-height: 1.55 !important;
+}
+
+#top-right-panel {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: var(--qtbs-gap);
+}
+
+#language-select label {
+    color: #344054 !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+}
+
+#language-select .wrap,
+#right-panel .wrap,
+#strategy-panel .wrap,
+#output-stage .wrap {
+    border-radius: 8px !important;
+}
+
+.top-status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
+    gap: 8px;
+}
+
+.top-status-item {
+    min-width: 0;
+    padding: 10px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+
+.top-status-item span {
+    display: block;
+    color: #667085;
+    font-size: 11px;
+    line-height: 1.3;
+}
+
+.top-status-item strong {
+    display: block;
+    margin-top: 4px;
+    overflow: hidden;
+    color: #111827;
+    font-size: 14px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#data-status-bar {
+    align-items: stretch;
+    gap: var(--qtbs-gap) !important;
+    margin: var(--qtbs-gap) 0 4px;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: clamp(8px, calc(var(--qtbs-screen-px) * 10), 14px) !important;
+}
+
+#fetch-progress-col,
+#fetch-action-col {
+    justify-content: center;
+}
+
+#fetch-progress-wrap,
+#fetch-progress-wrap .html-container,
+#fetch-progress-wrap .prose,
+#param-priority-wrap,
+#param-priority-wrap .html-container,
+#param-priority-wrap .prose,
 #review-output,
 #review-output .html-container,
 #review-output .prose {
     overflow: visible !important;
 }
 
-/* 气泡是绝对定位的后代元素：从组件到气泡的整条祖先链都不能裁切，
-   否则悬停时只剩 help 光标、看不到内容 */
-#param-priority-wrap,
-#param-priority-wrap .html-container,
-#param-priority-wrap .prose {
-    overflow: visible !important;
-}
-
-#param-priority-note {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    line-height: 1.4;
-    color: #8a8f99;
-    margin: 0 0 4px 2px;
-}
-
-/* 防溢出的裁切只作用于短句文本本身，不碰气泡所在的兄弟节点 */
-#param-priority-note > span:first-child {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* ---- 数据拉取进度区 ---- */
-#fetch-progress-wrap,
-#fetch-progress-wrap .html-container,
-#fetch-progress-wrap .prose {
-    overflow: visible !important;
-}
-
 #fetch-progress {
+    margin: 0;
+    color: #4b5563;
     font-size: 12px;
-    color: #6b7280;
-    margin: 6px 2px 2px 2px;
 }
 
 .fetch-head {
     display: flex;
     align-items: center;
-    gap: 6px;
-    margin-bottom: 4px;
+    gap: 7px;
+    margin-bottom: 8px;
 }
 
 .fetch-status {
-    font-weight: 600;
-    color: #4b5563;
+    color: #344054;
+    font-weight: 700;
 }
 
 #fetch-progress.fetch-active .fetch-status {
-    color: #2563eb;
+    color: var(--qtbs-blue);
 }
 
 .fetch-total-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
 }
 
 .fetch-total-track {
     flex: 1;
-    height: 7px;
+    height: 8px;
     border-radius: 4px;
-    background: #e5e7eb;
+    background: #e8eef8;
     overflow: hidden;
 }
 
 .fetch-total-bar {
     height: 100%;
     border-radius: 4px;
-    background: linear-gradient(90deg, #34d399, #2563eb);
+    background: var(--qtbs-blue);
     transition: width 0.4s ease;
 }
 
 .fetch-total-num {
+    min-width: 48px;
+    color: #667085;
     font-variant-numeric: tabular-nums;
-    color: #6b7280;
-    min-width: 42px;
     text-align: right;
 }
 
 .fetch-current-label {
-    margin-top: 4px;
-    color: #6b7280;
+    margin-top: 7px;
+    color: #667085;
 }
 
 .fetch-pulse-track {
-    margin-top: 3px;
-    height: 5px;
-    border-radius: 3px;
-    background: #e5e7eb;
-    overflow: hidden;
     position: relative;
+    height: 5px;
+    margin-top: 4px;
+    border-radius: 3px;
+    background: #e8eef8;
+    overflow: hidden;
 }
 
 .fetch-pulse-bar {
     position: absolute;
     height: 100%;
-    width: 35%;
+    width: 36%;
     border-radius: 3px;
-    background: linear-gradient(90deg, rgba(37,99,235,0.2), #2563eb, rgba(37,99,235,0.2));
+    background: var(--qtbs-blue);
     animation: fetch-pulse 1.1s ease-in-out infinite;
 }
 
 @keyframes fetch-pulse {
-    0%   { left: -35%; }
+    0% { left: -36%; }
     100% { left: 100%; }
 }
 
 #fetch-update-button {
-    margin-top: 6px;
-    font-size: 12px !important;
-    min-height: 30px !important;
+    width: 100%;
+    min-height: 38px !important;
+    border-radius: 8px !important;
+    border-color: #bfd3ff !important;
+    background: #eef4ff !important;
+    color: #1d4ed8 !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
 }
 
 .qtbs-tooltip {
@@ -1721,14 +2077,14 @@ custom_css = """
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 15px;
-    height: 15px;
-    border: 1px solid #a8abb2;
+    width: 16px;
+    height: 16px;
+    border: 1px solid #aab3c2;
     border-radius: 50%;
-    font-size: 10px;
-    font-weight: 700;
-    color: #8a8f99;
+    color: #667085;
     cursor: help;
+    font-size: 10px;
+    font-weight: 800;
     user-select: none;
 }
 
@@ -1736,20 +2092,20 @@ custom_css = """
     visibility: hidden;
     opacity: 0;
     position: absolute;
-    top: 130%;
+    top: 132%;
     right: -8px;
     z-index: 1000;
     width: 360px;
-    max-width: 70vw;
+    max-width: 72vw;
     padding: 10px 12px;
     border-radius: 8px;
-    background: rgba(40, 44, 52, 0.96);
-    color: #f0f2f5;
+    background: rgba(23, 26, 34, 0.96);
+    color: #f7f8fb;
     font-size: 12px;
     line-height: 1.6;
     white-space: normal;
     text-align: start;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.24);
     transition: opacity 0.15s ease;
     pointer-events: none;
 }
@@ -1759,118 +2115,69 @@ custom_css = """
     opacity: 1;
 }
 
-#top-bar {
-    align-items: flex-start;
-    margin-bottom: 8px;
-}
-
-#header-panel {
-    padding-right: 20px;
-}
-
-/* 右上区：进度模块（左）+ 语言选择（右）并排等高 */
-#top-right-panel {
-    margin-left: auto;
-    padding-top: 6px;
-}
-
-#top-right-row {
+#strategy-workspace {
     align-items: stretch;
+    gap: var(--qtbs-gap) !important;
+    margin-bottom: var(--qtbs-gap);
 }
 
-/* 语言列垂直居中，与左侧进度模块顶底对齐看起来等高 */
-#lang-col {
-    justify-content: center;
+.section-heading {
+    margin-bottom: 12px;
 }
 
-#language-select {
-    max-width: 200px;
+.section-heading h2 {
+    margin: 0 !important;
+    color: #111827;
+    font-size: 18px !important;
+    line-height: 1.25 !important;
+    letter-spacing: 0 !important;
 }
 
-#language-select label {
-    font-size: 13px !important;
-}
-
-#language-select input {
-    font-size: 13px !important;
-}
-
-#language-select .wrap {
-    min-height: 36px !important;
+.section-heading p {
+    margin: 4px 0 0 !important;
+    color: #667085;
+    font-size: 12px !important;
+    line-height: 1.5 !important;
 }
 
 #strategy-box textarea {
-    min-height: 430px !important;
-    font-size: 18px !important;
-    border-radius: 18px !important;
-    background: #f4fbfc !important;
-    border: 1px solid #dceff2 !important;
+    min-height: clamp(300px, 42vh, 520px) !important;
+    border: 1px solid #cfd7e3 !important;
+    border-radius: 8px !important;
+    background: #fbfcfe !important;
+    color: #111827 !important;
+    font-size: 15px !important;
+    line-height: 1.65 !important;
     box-shadow: none !important;
     outline: none !important;
 }
 
 #strategy-box textarea:focus {
-    border: 1px solid #cfe7ec !important;
-    box-shadow: 0 0 0 2px rgba(207, 231, 236, 0.35) !important;
-    outline: none !important;
+    border-color: #93b4ff !important;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14) !important;
 }
 
-#right-panel {
-    padding-top: 20px;
-}
-
-.param-row {
-    gap: 12px !important;
-    margin-bottom: 2px !important;
-}
-
-#right-panel input,
-#right-panel textarea {
-    font-size: 14px !important;
-}
-
-#right-panel .wrap {
-    min-height: 38px !important;
-}
-
-#button-row {
-    gap: 12px !important;
-    margin-top: 12px !important;
-}
-
-#generate-button, #backtest-button {
-    height: 48px;
-    font-size: 18px;
-    border-radius: 14px;
-}
-
-#output-code textarea {
-    font-size: 14px !important;
-}
-
-#result-box textarea {
-    font-size: 15px !important;
-}
-
-/* AI 策略审查评分卡 */
-#review-output {
+#review-block-title {
     margin-top: 14px;
+}
+
+#review-output {
     width: 100%;
 }
 
 .review-card {
-    background: #1f1f22;
-    border: 1px solid #3a3a40;
-    border-radius: 12px;
+    min-height: 150px;
     padding: 16px;
-    color: #f2f2f2;
-    min-height: 160px;
+    border: 1px solid #2a3040;
+    border-radius: 8px;
+    background: var(--qtbs-dark);
+    color: #f4f6fb;
 }
 
 .review-layout {
     display: grid;
     grid-template-columns: 6fr 4fr;
-    gap: 14px;
+    gap: 16px;
     align-items: start;
 }
 
@@ -1879,14 +2186,16 @@ custom_css = """
 }
 
 .review-right {
-    border-left: 1px solid #3a3a40;
-    padding-left: 14px;
+    min-width: 0;
+    padding-left: 16px;
+    border-left: 1px solid #303747;
 }
 
 .review-title {
-    font-size: 15px;
-    font-weight: 700;
     margin-bottom: 12px;
+    color: #f8fafc;
+    font-size: 14px;
+    font-weight: 800;
 }
 
 .score-row {
@@ -1897,51 +2206,417 @@ custom_css = """
 
 .score-bar-bg {
     flex: 1;
-    height: 12px;
-    background: #3a3a40;
-    border-radius: 999px;
+    height: 10px;
+    border-radius: 8px;
+    background: #303747;
     overflow: hidden;
 }
 
 .score-bar-fill {
     height: 100%;
-    background: linear-gradient(90deg, #f97316, #22c55e);
-    border-radius: 999px;
+    border-radius: 8px;
+    background: #22c55e;
 }
 
 .score-number {
-    width: 68px;
+    width: 70px;
+    color: #f8fafc;
+    font-weight: 800;
     text-align: right;
+}
+
+.review-behavior {
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 6px;
+    margin: 10px 0 0;
+    font-size: 12.5px;
+}
+
+.review-behavior.behavior-pass,
+.review-behavior.behavior-pass > span {
+    color: #4ade80 !important;
+}
+
+.review-behavior.behavior-fail,
+.review-behavior.behavior-fail > span {
+    color: #fb7185 !important;
     font-weight: 700;
-    color: #f3f4f6;
 }
 
 .review-summary-title {
-    font-size: 13px;
-    font-weight: 700;
-    color: #e5e7eb;
     margin-bottom: 8px;
+    color: #e5e7eb;
+    font-size: 13px;
+    font-weight: 800;
 }
 
 .review-summary {
-    font-size: 12px;
-    color: #b8b8b8;
-    line-height: 1.6;
     margin-bottom: 8px;
+    color: #cbd5e1;
+    font-size: 12px;
+    line-height: 1.65;
 }
 
 .review-note {
     margin-top: 8px;
     padding-top: 8px;
-    border-top: 1px solid #3a3a40;
+    border-top: 1px solid #303747;
+    color: #aab3c2;
     font-size: 12px;
     line-height: 1.6;
-    color: #9ca3af;
 }
 
 .review-empty {
+    color: #aab3c2;
     font-size: 13px;
-    color: #9ca3af;
+}
+
+#right-panel {
+    min-width: 0;
+}
+
+#param-priority-note {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border: 1px solid #e0e7ff;
+    border-radius: 8px;
+    background: #f5f8ff;
+    color: #475467;
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+#param-priority-note > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.param-row {
+    gap: 10px !important;
+    margin-bottom: 2px !important;
+}
+
+#right-panel label,
+#strategy-panel label,
+#output-stage label {
+    color: #344054 !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+}
+
+#right-panel input,
+#right-panel textarea {
+    color: #111827 !important;
+    font-size: 13px !important;
+}
+
+#right-panel .wrap {
+    min-height: 38px !important;
+}
+
+#button-row {
+    gap: 10px !important;
+    margin-top: 12px !important;
+}
+
+#generate-button,
+#backtest-button {
+    min-height: 44px !important;
+    border-radius: 8px !important;
+    font-size: 15px !important;
+    font-weight: 800 !important;
+}
+
+#generate-button {
+    border-color: var(--qtbs-orange) !important;
+    background: var(--qtbs-orange) !important;
+    color: #ffffff !important;
+}
+
+#backtest-button {
+    border-color: #d0d5dd !important;
+    background: #f3f4f6 !important;
+    color: #1f2937 !important;
+}
+
+#output-stage {
+    margin-bottom: 4px;
+}
+
+#output-grid {
+    gap: var(--qtbs-gap) !important;
+    align-items: stretch;
+}
+
+#output-code textarea,
+#result-box textarea {
+    border-radius: 8px !important;
+    font-size: 13px !important;
+    line-height: 1.55 !important;
+}
+
+#result-box textarea {
+    min-height: clamp(260px, 36vh, 460px) !important;
+}
+
+#chart-file-output {
+    margin-top: 10px;
+}
+
+button,
+input,
+textarea,
+.wrap {
+    letter-spacing: 0 !important;
+}
+
+/* Width-led responsive sizing. Keep the workspace using the available
+   monitor width, while spacing and typography scale gently with it. */
+#header-panel {
+    min-width: min(calc(var(--qtbs-screen-px) * 320), 100%) !important;
+}
+
+#top-right-panel {
+    min-width: min(calc(var(--qtbs-screen-px) * 300), 100%) !important;
+}
+
+#strategy-panel {
+    min-width: min(calc(var(--qtbs-screen-px) * 460), 100%) !important;
+}
+
+#right-panel {
+    min-width: min(calc(var(--qtbs-screen-px) * 330), 100%) !important;
+}
+
+.sidebar-brand {
+    padding: calc(var(--qtbs-screen-px) * 8) calc(var(--qtbs-screen-px) * 8) calc(var(--qtbs-screen-px) * 18);
+    font-size: var(--qtbs-font-lg);
+}
+
+.sidebar-nav {
+    gap: clamp(5px, calc(var(--qtbs-screen-px) * 6), 8px);
+}
+
+.sidebar-nav-item {
+    gap: clamp(7px, calc(var(--qtbs-screen-px) * 9), 12px);
+    min-height: clamp(34px, calc(var(--qtbs-screen-px) * 38), 46px);
+    padding: 0 clamp(8px, calc(var(--qtbs-screen-px) * 10), 14px);
+    border-radius: var(--qtbs-radius);
+    font-size: var(--qtbs-font-md);
+}
+
+.sidebar-nav-item span {
+    width: clamp(7px, calc(var(--qtbs-screen-px) * 8), 10px);
+    height: clamp(7px, calc(var(--qtbs-screen-px) * 8), 10px);
+}
+
+.sidebar-foot,
+#fetch-progress,
+.section-heading p,
+.review-summary,
+.review-note,
+#param-priority-note,
+#right-panel label,
+#strategy-panel label,
+#output-stage label {
+    font-size: var(--qtbs-font-xs) !important;
+}
+
+#studio-header-md .studio-kicker,
+#language-select label,
+.top-status-item span {
+    font-size: var(--qtbs-font-xs) !important;
+}
+
+#studio-header-md h1 {
+    font-size: var(--qtbs-font-xl) !important;
+}
+
+#studio-header-md p,
+.top-status-item strong,
+.review-title,
+#right-panel input,
+#right-panel textarea,
+#output-code textarea,
+#result-box textarea {
+    font-size: var(--qtbs-font-md) !important;
+}
+
+.section-heading h2 {
+    font-size: var(--qtbs-font-lg) !important;
+}
+
+.top-status-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: clamp(6px, calc(var(--qtbs-screen-px) * 8), 12px);
+}
+
+.top-status-item {
+    padding: clamp(8px, calc(var(--qtbs-screen-px) * 10), 14px);
+    border-radius: var(--qtbs-radius);
+}
+
+#strategy-box textarea {
+    min-height: clamp(calc(var(--qtbs-screen-px) * 300), 42vh, calc(var(--qtbs-screen-px) * 560)) !important;
+    font-size: var(--qtbs-font-md) !important;
+}
+
+.review-card {
+    min-height: clamp(132px, calc(var(--qtbs-screen-px) * 150), 180px);
+    padding: clamp(12px, calc(var(--qtbs-screen-px) * 16), 22px);
+}
+
+.review-layout {
+    gap: clamp(12px, calc(var(--qtbs-screen-px) * 16), 22px);
+}
+
+.review-right {
+    padding-left: clamp(12px, calc(var(--qtbs-screen-px) * 16), 22px);
+}
+
+.param-row,
+#button-row {
+    gap: clamp(8px, calc(var(--qtbs-screen-px) * 10), 14px) !important;
+}
+
+#fetch-update-button {
+    min-height: clamp(34px, calc(var(--qtbs-screen-px) * 38), 46px) !important;
+    font-size: var(--qtbs-font-sm) !important;
+}
+
+#generate-button,
+#backtest-button {
+    min-height: clamp(40px, calc(var(--qtbs-screen-px) * 44), 54px) !important;
+    font-size: var(--qtbs-font-md) !important;
+}
+
+#result-box textarea {
+    min-height: clamp(calc(var(--qtbs-screen-px) * 260), 36vh, calc(var(--qtbs-screen-px) * 500)) !important;
+}
+
+@media (max-height: 760px) and (min-width: 1101px) {
+    #strategy-box textarea {
+        min-height: clamp(calc(var(--qtbs-screen-px) * 230), 34vh, calc(var(--qtbs-screen-px) * 390)) !important;
+    }
+
+    #result-box textarea {
+        min-height: clamp(calc(var(--qtbs-screen-px) * 210), 30vh, calc(var(--qtbs-screen-px) * 360)) !important;
+    }
+}
+
+@media (max-width: 1280px) {
+    :root {
+        --qtbs-sidebar-width: clamp(160px, calc(var(--qtbs-screen-px) * 184), 220px);
+    }
+
+    #strategy-workspace {
+        align-items: flex-start;
+    }
+}
+
+@media (max-width: 1100px) {
+    #app-shell {
+        width: calc(100vw - 20px);
+        max-width: calc(100vw - 20px);
+        flex-direction: column !important;
+    }
+
+    #sidebar-col {
+        flex: 1 1 auto !important;
+        max-width: none !important;
+        min-width: 0 !important;
+    }
+
+    .sidebar-shell {
+        min-height: auto;
+        flex-direction: row;
+        gap: var(--qtbs-gap);
+        align-items: center;
+    }
+
+    .sidebar-nav {
+        grid-template-columns: repeat(4, max-content);
+        overflow-x: auto;
+    }
+
+    .sidebar-foot {
+        max-width: 220px;
+        border-top: 0;
+        border-left: 1px solid #e5e7eb;
+        padding: 4px 8px 4px 14px;
+    }
+}
+
+@media (max-width: 760px) {
+    #app-shell {
+        width: calc(100vw - 12px);
+        max-width: calc(100vw - 12px);
+        padding-top: 6px;
+    }
+
+    #top-bar,
+    #strategy-workspace,
+    #output-grid,
+    #data-status-bar {
+        flex-direction: column !important;
+    }
+
+    #header-panel,
+    #top-right-panel,
+    .studio-panel,
+    #data-status-bar {
+        padding: 12px !important;
+    }
+
+    #studio-header-md h1 {
+        font-size: clamp(21px, 6vw, 25px) !important;
+    }
+
+    .top-status-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .sidebar-shell {
+        display: block;
+    }
+
+    .sidebar-nav {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .sidebar-foot {
+        max-width: none;
+        margin-top: 10px;
+        border-left: 0;
+        border-top: 1px solid #e5e7eb;
+        padding: 10px 8px 2px;
+    }
+
+    .review-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .review-right {
+        padding-left: 0;
+        padding-top: 12px;
+        border-left: 0;
+        border-top: 1px solid #303747;
+    }
+
+    #strategy-box textarea {
+        min-height: 300px !important;
+    }
+
+    .param-row {
+        flex-direction: column !important;
+    }
 }
 """
 
@@ -1950,286 +2625,418 @@ custom_css = """
 # Gradio 前端
 # =========================================================
 
+custom_head = """
+<script>
+(() => {
+    const DESIGN_WIDTH = 2200;
+    const DESIGN_HEIGHT = 1500;
+    const VIEWPORT_PAD = 32;
+    const MIN_SCALE = 0.70;
+    const MAX_SCALE = 1.00;
+
+    function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+    }
+
+    function applyQtbsViewportScale() {
+        const root = document.documentElement;
+        const viewportWidth = window.innerWidth || root.clientWidth || DESIGN_WIDTH;
+        const viewportHeight = window.innerHeight || root.clientHeight || DESIGN_HEIGHT;
+        const availableWidth = Math.max(360, viewportWidth - VIEWPORT_PAD);
+        const availableHeight = Math.max(360, viewportHeight - VIEWPORT_PAD);
+        const widthScale = availableWidth / DESIGN_WIDTH;
+        const heightScale = availableHeight / DESIGN_HEIGHT;
+        const scale = clamp(Math.min(widthScale, heightScale), MIN_SCALE, MAX_SCALE);
+        const contentWidth = Math.min(DESIGN_WIDTH, availableWidth / scale);
+
+        root.style.setProperty("--qtbs-ui-scale", scale.toFixed(4));
+        root.style.setProperty("--qtbs-content-max", `${contentWidth.toFixed(1)}px`);
+        root.dataset.qtbsUiScale = scale.toFixed(4);
+    }
+
+    let resizeFrame = 0;
+    function scheduleScale() {
+        window.cancelAnimationFrame(resizeFrame);
+        resizeFrame = window.requestAnimationFrame(applyQtbsViewportScale);
+    }
+
+    window.addEventListener("resize", scheduleScale, { passive: true });
+    window.addEventListener("orientationchange", scheduleScale, { passive: true });
+    document.addEventListener("DOMContentLoaded", applyQtbsViewportScale);
+    applyQtbsViewportScale();
+    window.setTimeout(applyQtbsViewportScale, 80);
+    window.setTimeout(applyQtbsViewportScale, 400);
+    window.setTimeout(applyQtbsViewportScale, 1200);
+})();
+</script>
+"""
+
 default_lang = "zh"
 default_text = get_ui_text(default_lang)
 
 with gr.Blocks(
     title="QTBS AI Quant Strategy Frontend",
+    css=custom_css,
+    head=custom_head,
 ) as demo:
 
-    with gr.Column(elem_id="main-container"):
+    with gr.Row(elem_id="app-shell"):
 
-        with gr.Row(elem_id="top-bar"):
+        with gr.Column(scale=1, min_width=160, elem_id="sidebar-col"):
+            gr.HTML(build_sidebar_html(), elem_id="studio-sidebar")
 
-            with gr.Column(scale=6, elem_id="header-panel"):
-                header_md = gr.Markdown(default_text["header"])
+        with gr.Column(scale=12, elem_id="main-container"):
 
-            # 右上：数据进度模块（左）+ 语言选择（右）并排等高
-            with gr.Column(scale=6, min_width=420, elem_id="top-right-panel"):
-                with gr.Row(equal_height=True, elem_id="top-right-row"):
-                    with gr.Column(scale=3, min_width=220, elem_id="fetch-col"):
-                        fetch_progress = gr.HTML(
-                            build_fetch_progress_html(fetch_queue.snapshot(), default_lang),
-                            elem_id="fetch-progress-wrap",
-                        )
-                        fetch_button = gr.Button(
-                            value=get_fetch_text(default_lang)["button"],
-                            elem_id="fetch-update-button",
-                            size="sm",
-                        )
+            with gr.Row(elem_id="top-bar", equal_height=True):
 
-                    with gr.Column(scale=2, min_width=150, elem_id="lang-col"):
-                        language_select = gr.Dropdown(
-                            label=default_text["language_label"],
-                            choices=LANGUAGE_CHOICES,
-                            value=default_lang,
-                            interactive=True,
-                            elem_id="language-select",
-                        )
-
-                fetch_timer = gr.Timer(1.0)
-
-        with gr.Row():
-            with gr.Column(scale=7, min_width=650):
-                strategy_input = gr.Textbox(
-                    label=default_text["strategy_label"],
-                    placeholder=default_text["strategy_placeholder"],
-                    lines=18,
-                    elem_id="strategy-box",
-                )
-
-                review_output = gr.HTML(
-                    value=build_review_html(None, default_lang),
-                    elem_id="review-output",
-                )
-
-            with gr.Column(scale=3, min_width=420, elem_id="right-panel"):
-
-                param_priority_note = gr.HTML(
-                    build_param_priority_html(default_text),
-                    elem_id="param-priority-wrap",
-                )
-
-                market_select = gr.Dropdown(
-                    label=default_text["market_label"],
-                    choices=[(default_text["market_choice"], "crypto")],
-                    value="crypto",
-                    interactive=False,
-                )
-
-                with gr.Row(elem_classes=["param-row"]):
-                    symbol_input = gr.Textbox(
-                        label=default_text["symbol_label"],
-                        value="BTC",
-                        placeholder=default_text["symbol_placeholder"],
-                        scale=1,
+                with gr.Column(scale=7, min_width=320, elem_id="header-panel"):
+                    header_md = gr.HTML(
+                        build_studio_header_markdown(default_lang),
+                        elem_id="studio-header-md",
                     )
 
-                    timeframe_select = gr.Dropdown(
-                        label=default_text["timeframe_label"],
-                        choices=["1m", "5m", "15m", "1h", "4h", "1d"],
-                        value="4h",
+                with gr.Column(scale=5, min_width=300, elem_id="top-right-panel"):
+                    language_select = gr.Dropdown(
+                        label=default_text["language_label"],
+                        choices=LANGUAGE_CHOICES,
+                        value=default_lang,
                         interactive=True,
-                        scale=1,
+                        elem_id="language-select",
+                    )
+                    status_strip = gr.HTML(
+                        build_status_cards_html(
+                            default_lang,
+                            "crypto",
+                            "4h",
+                            1000,
+                        ),
+                        elem_id="status-strip",
                     )
 
-                with gr.Row(elem_classes=["param-row"]):
-                    start_date = gr.DateTime(
-                        label=default_text["start_label"],
-                        value="2017-01-01",
-                        include_time=False,
-                        type="string",
-                        timezone="UTC",
-                        scale=1,
+            with gr.Row(elem_id="strategy-workspace", equal_height=True):
+                with gr.Column(
+                    scale=7,
+                    min_width=460,
+                    elem_id="strategy-panel",
+                    elem_classes=["studio-panel"],
+                ):
+                    gr.HTML(
+                        build_section_header_html(
+                            "策略输入",
+                            "自然语言到可执行策略代码",
+                        )
                     )
 
-                    end_date = gr.DateTime(
-                        label=default_text["end_label"],
-                        value=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                        include_time=False,
-                        type="string",
-                        timezone="UTC",
-                        scale=1,
+                    strategy_input = gr.Textbox(
+                        label=default_text["strategy_label"],
+                        placeholder=default_text["strategy_placeholder"],
+                        lines=18,
+                        elem_id="strategy-box",
                     )
 
-                with gr.Row(elem_classes=["param-row"]):
-                    initial_cash_input = gr.Number(
-                        label=default_text["initial_cash_label"],
-                        value=1000,
-                        precision=2,
-                        minimum=0.01,
-                        step=100,
-                        scale=1,
+                    gr.HTML(
+                        build_section_header_html(
+                            "代码审查",
+                            "AI 匹配度和行为检查",
+                        ),
+                        elem_id="review-block-title",
                     )
 
-                    leverage_input = gr.Number(
-                        label=default_text["leverage_label"],
-                        value=1,
-                        precision=0,
-                        minimum=0,
-                        maximum=200,
-                        step=1,
-                        scale=1,
+                    review_output = gr.HTML(
+                        value=build_review_html(None, default_lang),
+                        elem_id="review-output",
                     )
 
-                with gr.Row(elem_classes=["param-row"]):
-                    position_size_input = gr.Number(
-                        label=default_text["position_size_label"],
-                        value=100,
-                        precision=2,
-                        minimum=0,
-                        maximum=100,
-                        step=1,
-                        scale=1,
+                with gr.Column(
+                    scale=4,
+                    min_width=330,
+                    elem_id="right-panel",
+                    elem_classes=["studio-panel"],
+                ):
+                    gr.HTML(
+                        build_section_header_html(
+                            "回测控制台",
+                            "市场、时间窗口、资金与交易成本",
+                        )
                     )
 
-                    fee_rate_input = gr.Number(
-                        label=default_text["fee_rate_label"],
-                        value=0.05,
-                        precision=4,
-                        minimum=0,
-                        step=0.01,
-                        scale=1,
+                    param_priority_note = gr.HTML(
+                        build_param_priority_html(default_text),
+                        elem_id="param-priority-wrap",
                     )
 
-                with gr.Row(elem_classes=["param-row"]):
+                    market_select = gr.Dropdown(
+                        label=default_text["market_label"],
+                        choices=[(default_text["market_choice"], "crypto")],
+                        value="crypto",
+                        interactive=False,
+                    )
+
+                    with gr.Row(elem_classes=["param-row"]):
+                        symbol_input = gr.Textbox(
+                            label=default_text["symbol_label"],
+                            value="BTC",
+                            placeholder=default_text["symbol_placeholder"],
+                            scale=1,
+                        )
+
+                        timeframe_select = gr.Dropdown(
+                            label=default_text["timeframe_label"],
+                            choices=["1m", "5m", "15m", "1h", "4h", "1d"],
+                            value="4h",
+                            interactive=True,
+                            scale=1,
+                        )
+
+                    with gr.Row(elem_classes=["param-row"]):
+                        start_date = gr.DateTime(
+                            label=default_text["start_label"],
+                            value="2017-01-01",
+                            include_time=False,
+                            type="string",
+                            timezone="UTC",
+                            scale=1,
+                        )
+
+                        end_date = gr.DateTime(
+                            label=default_text["end_label"],
+                            value=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                            include_time=False,
+                            type="string",
+                            timezone="UTC",
+                            scale=1,
+                        )
+
+                    with gr.Row(elem_classes=["param-row"]):
+                        initial_cash_input = gr.Number(
+                            label=default_text["initial_cash_label"],
+                            value=1000,
+                            precision=2,
+                            minimum=0.01,
+                            step=100,
+                            scale=1,
+                        )
+
+                        leverage_input = gr.Number(
+                            label=default_text["leverage_label"],
+                            value=1,
+                            precision=0,
+                            minimum=0,
+                            maximum=200,
+                            step=1,
+                            scale=1,
+                        )
+
+                    with gr.Row(elem_classes=["param-row"]):
+                        position_size_input = gr.Number(
+                            label=default_text["position_size_label"],
+                            value=100,
+                            precision=2,
+                            minimum=0,
+                            maximum=100,
+                            step=1,
+                            scale=1,
+                        )
+
+                        fee_rate_input = gr.Number(
+                            label=default_text["fee_rate_label"],
+                            value=0.05,
+                            precision=4,
+                            minimum=0,
+                            step=0.01,
+                            scale=1,
+                        )
+
                     slippage_input = gr.Number(
                         label=default_text["slippage_label"],
                         value=0,
                         precision=4,
                         minimum=0,
                         step=0.01,
-                        scale=1,
                     )
 
-                    with gr.Column(scale=1):
-                        gr.Markdown("")
+                    with gr.Row(elem_id="button-row"):
+                        generate_button = gr.Button(
+                            value=default_text["generate_button"],
+                            variant="primary",
+                            elem_id="generate-button",
+                            scale=1,
+                        )
 
-                with gr.Row(elem_id="button-row"):
-                    generate_button = gr.Button(
-                        value=default_text["generate_button"],
-                        variant="primary",
-                        elem_id="generate-button",
-                        scale=1,
+                        backtest_button = gr.Button(
+                            value=default_text["backtest_button"],
+                            variant="secondary",
+                            elem_id="backtest-button",
+                            scale=1,
+                        )
+
+            with gr.Column(elem_id="output-stage", elem_classes=["studio-panel"]):
+                gr.HTML(
+                    build_section_header_html(
+                        "输出台",
+                        "策略代码、回测摘要与图表文件",
+                    )
+                )
+
+                with gr.Row(elem_id="output-grid", equal_height=True):
+                    with gr.Column(scale=6, min_width=360):
+                        with gr.Accordion(
+                            default_text["code_output_label"],
+                            open=False,
+                        ) as code_accordion:
+                            strategy_code_output = gr.Code(
+                                label="",
+                                language="python",
+                                lines=26,
+                                elem_id="output-code",
+                            )
+
+                    with gr.Column(scale=5, min_width=340):
+                        backtest_result_output = gr.Textbox(
+                            label=default_text["result_output_label"],
+                            lines=20,
+                            elem_id="result-box",
+                        )
+
+                        chart_file_output = gr.File(
+                            label=default_text["chart_file_label"],
+                            elem_id="chart-file-output",
+                        )
+
+            with gr.Row(elem_id="data-status-bar", equal_height=True):
+                with gr.Column(scale=9, min_width=260, elem_id="fetch-progress-col"):
+                    fetch_progress = gr.HTML(
+                        build_fetch_progress_html(fetch_queue.snapshot(), default_lang),
+                        elem_id="fetch-progress-wrap",
+                    )
+                with gr.Column(scale=2, min_width=130, elem_id="fetch-action-col"):
+                    fetch_button = gr.Button(
+                        value=get_fetch_text(default_lang)["button"],
+                        elem_id="fetch-update-button",
+                        size="sm",
                     )
 
-                    backtest_button = gr.Button(
-                        value=default_text["backtest_button"],
-                        variant="secondary",
-                        elem_id="backtest-button",
-                        scale=1,
-                    )
+                fetch_timer = gr.Timer(1.0)
 
-        with gr.Accordion(default_text["code_output_label"], open=False) as code_accordion:
-            strategy_code_output = gr.Code(
-                label="",
-                language="python",
-                lines=26,
-                elem_id="output-code",
+            language_select.change(
+                fn=update_ui_language,
+                inputs=[
+                    language_select,
+                    market_select,
+                    timeframe_select,
+                    initial_cash_input,
+                ],
+                outputs=[
+                    header_md,
+                    status_strip,
+                    strategy_input,
+                    language_select,
+                    market_select,
+                    symbol_input,
+                    timeframe_select,
+                    param_priority_note,
+                    start_date,
+                    end_date,
+                    initial_cash_input,
+                    leverage_input,
+                    position_size_input,
+                    fee_rate_input,
+                    slippage_input,
+                    generate_button,
+                    backtest_button,
+                    code_accordion,
+                    review_output,
+                    backtest_result_output,
+                    chart_file_output,
+                    fetch_progress,
+                    fetch_button,
+                ],
+                api_name="update_language",
             )
 
-        backtest_result_output = gr.Textbox(
-            label=default_text["result_output_label"],
-            lines=20,
-            elem_id="result-box",
-        )
-
-        chart_file_output = gr.File(
-            label=default_text["chart_file_label"],
-        )
-
-        language_select.change(
-            fn=update_ui_language,
-            inputs=[language_select],
-            outputs=[
-                header_md,
-                strategy_input,
-                language_select,
+            for status_source in [
                 market_select,
-                symbol_input,
                 timeframe_select,
-                param_priority_note,
-                start_date,
-                end_date,
                 initial_cash_input,
-                leverage_input,
-                position_size_input,
-                fee_rate_input,
-                slippage_input,
-                generate_button,
-                backtest_button,
-                code_accordion,
-                review_output,
-                backtest_result_output,
-                chart_file_output,
-                fetch_progress,
-                fetch_button,
-            ],
-        )
+            ]:
+                status_source.change(
+                    fn=update_status_cards,
+                    inputs=[
+                        language_select,
+                        market_select,
+                        timeframe_select,
+                        initial_cash_input,
+                    ],
+                    outputs=[status_strip],
+                    show_progress=False,
+                )
 
-        generate_button.click(
-            fn=generate_code_from_ui,
-            inputs=[
-                strategy_input,
-                language_select,
-                market_select,
-                symbol_input,
-                timeframe_select,
-                start_date,
-                end_date,
-                initial_cash_input,
-                leverage_input,
-                position_size_input,
-                fee_rate_input,
-                slippage_input,
-            ],
-            outputs=[
-                strategy_code_output,
-                review_output,
-            ],
-        )
+            generate_button.click(
+                fn=generate_code_from_ui,
+                inputs=[
+                    strategy_input,
+                    language_select,
+                    market_select,
+                    symbol_input,
+                    timeframe_select,
+                    start_date,
+                    end_date,
+                    initial_cash_input,
+                    leverage_input,
+                    position_size_input,
+                    fee_rate_input,
+                    slippage_input,
+                ],
+                outputs=[
+                    strategy_code_output,
+                    review_output,
+                ],
+                api_name="generate_strategy_code",
+            )
 
-        backtest_button.click(
-            fn=run_backtest_from_ui,
-            inputs=[
-                strategy_code_output,
-                language_select,
-                market_select,
-                symbol_input,
-                timeframe_select,
-                start_date,
-                end_date,
-                initial_cash_input,
-                leverage_input,
-                position_size_input,
-                fee_rate_input,
-                slippage_input,
-            ],
-            outputs=[
-                backtest_result_output,
-                chart_file_output,
-            ],
-        )
+            backtest_button.click(
+                fn=run_backtest_from_ui,
+                inputs=[
+                    strategy_code_output,
+                    language_select,
+                    market_select,
+                    symbol_input,
+                    timeframe_select,
+                    start_date,
+                    end_date,
+                    initial_cash_input,
+                    leverage_input,
+                    position_size_input,
+                    fee_rate_input,
+                    slippage_input,
+                ],
+                outputs=[
+                    backtest_result_output,
+                    chart_file_output,
+                ],
+                api_name="run_backtest",
+            )
 
-        # ---- 数据拉取进度区：Timer 轮询全局状态、手动更新、启动自动更新 ----
+            # ---- 数据拉取进度区：Timer 轮询全局状态、手动更新、启动自动更新 ----
 
-        fetch_timer.tick(
-            fn=refresh_fetch_progress,
-            inputs=[language_select],
-            outputs=[fetch_progress, fetch_button],
-        )
+            fetch_timer.tick(
+                fn=refresh_fetch_progress,
+                inputs=[language_select],
+                outputs=[fetch_progress, fetch_button],
+            )
 
-        fetch_button.click(
-            fn=on_manual_update,
-            inputs=[language_select],
-            outputs=[fetch_progress, fetch_button],
-        )
+            fetch_button.click(
+                fn=on_manual_update,
+                inputs=[language_select],
+                outputs=[fetch_progress, fetch_button],
+                api_name="update_market_data",
+            )
 
-        demo.load(
-            fn=on_app_start,
-            inputs=[language_select],
-            outputs=[fetch_progress, fetch_button],
-        )
+            demo.load(
+                fn=on_app_start,
+                inputs=[language_select],
+                outputs=[fetch_progress, fetch_button],
+            )
 
 
 # =========================================================
@@ -2241,5 +3048,4 @@ if __name__ == "__main__":
         server_name="127.0.0.1",
         server_port=7860,
         inbrowser=True,
-        css=custom_css,
     )
