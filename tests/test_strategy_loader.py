@@ -179,6 +179,51 @@ def generate_signals(df):
         load_strategy_func_from_code(code)
 
 
+def test_escape_via_pandas_numpy_io_blocked():
+    # 反例 4（round-9）：pandas/numpy 自带 I/O 方法绕过沙箱——它们既非 dunder、
+    # 也不含 open(/eval( 子串。逐个验证 AST 按方法名静态拒绝（任意文件读写 /
+    # read_pickle 反序列化 RCE / read_csv(url) SSRF）。
+    io_snippets = [
+        "df.to_csv('/tmp/pwned.csv')",
+        "pd.read_csv('/etc/passwd')",
+        "pd.read_pickle('payload.pkl')",
+        "df.to_pickle('x.pkl')",
+        "pd.read_parquet('x.parquet')",
+        "pd.read_csv('http://evil.example/x')",
+        "np.savetxt('x.txt', df.values)",
+        "np.load('x.npy')",
+        "df.values.tofile('x.bin')",
+    ]
+    for snippet in io_snippets:
+        code = (
+            "import pandas as pd\n"
+            "import numpy as np\n\n"
+            "def generate_signals(df):\n"
+            f"    {snippet}\n"
+            "    return df\n"
+        )
+        with pytest.raises(ValueError, match="文件/网络 I/O"):
+            load_strategy_func_from_code(code)
+
+
+def test_legit_pandas_numpy_compute_not_blocked_by_io_guard():
+    # 正例：常用纯计算方法（to_numpy/to_dict/to_frame/rolling/ewm/shift 等）
+    # 不被 I/O 守卫误杀，典型策略仍可加载执行。
+    code = """
+import pandas as pd
+import numpy as np
+
+def generate_signals(df):
+    arr = df['close'].to_numpy()
+    ma = df['close'].rolling(3).mean().shift(1).fillna(0)
+    d = df.to_dict()
+    df['target_position'] = (df['close'] > ma).astype(int)
+    return df
+"""
+    func = load_strategy_func_from_code(code)
+    assert callable(func)
+
+
 def test_import_via_builtins_dict_rejected():
     # 经 __builtins__['__import__'] 取回导入器是又一条逃逸向量。
     # 这里 __builtins__ 与 __import__ 都命中 FORBIDDEN_KEYWORDS 子串黑名单，

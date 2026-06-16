@@ -132,12 +132,17 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 
 `module/Strategy/strategy_loader.py` 在加载前强制检查：
 
-- 只允许 `import pandas` / `import numpy`（含其子模块，如 `pandas.api.types`）
+- 只允许 `import pandas` / `import numpy`（含其子模块，如 `pandas.api.types`）；运行期受限 `__import__` 仅放行这两个根模块
 - `ast.walk` 全树遍历，函数体内隐藏 import 同样拦截
-- 字符串黑名单（仅 AST 白名单覆盖不到的危险调用）：`open(`、`eval(`、`exec(`、`__import__`、`compile(`、`globals(`、`locals(`；所有 import 形式统一由 AST 白名单拦截，不依赖字符串匹配
+- **最小化 `__builtins__`**：exec 前显式注入纯计算内置白名单（len/range/min/max/abs/sum/sorted/float/int/str/list/dict/isinstance/print/异常体系等），**不含** `open`/`getattr`/`setattr`/`eval`/`exec`/`compile`/`globals`/`locals`/`vars`/`dir`/`input`/`__build_class__`，阻断 CPython 自动注入完整内置
+- **AST 拒绝危险 dunder 属性链**（`__class__`/`__subclasses__`/`__globals__`/`__builtins__`/`__getattribute__`/`__code__` 等）：防 `(1).__class__...__subclasses__()` 不 import 回取宿主对象
+- **AST 拒绝 pandas/numpy 文件/网络 I/O 方法**（`read_csv`/`read_pickle`/`read_parquet`/`to_csv`/`to_pickle`/`np.save`/`savetxt`/`load`/`fromfile`/`tofile` 等）：策略被允许 import pandas/numpy，但其自带 I/O 方法既非 dunder 也不含黑名单子串，否则可任意读写文件、`read_pickle` 反序列化 RCE、`read_csv(url)` SSRF
+- 字符串黑名单（仅 AST 白名单覆盖不到的危险调用）：`open(`、`eval(`、`exec(`、`__import__`、`compile(`、`globals(`、`locals(`
 - 必须存在顶层 `generate_signals` 函数
 - 策略代码从**内存**编译加载，不经过共享文件路径（并发安全）；
   实际参与回测的代码会以时间戳文件留档到 `Past_data/strategy_code/`（仅审计，不加载）
+
+> **边界说明**：以上是**单用户本地驾驶舱**（`demo.launch` 绑 127.0.0.1、策略来自用户自己 prompt 的 DeepSeek 生成）下的务实加固，足以挡住 AI 生成代码意外/被提示注入诱导的越权。**生产级隔离**（策略跑在独立进程 + 无网络 namespace + 只读文件系统）是平台化阶段（多用户）的目标，静态黑名单不是绝对沙箱。
 
 ## 7. AI 生成约束（prompt 同步清单)
 
@@ -186,7 +191,7 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 |------|------|------|
 | v1 | 单标的、离散目标仓位 {-1, 0, 1}，引擎 `CodeBacktestCore` | **当前默认** |
 | v2 | 多标的连续目标权重，引擎 `PortfolioBacktestCore`（见第 10 节），解锁对冲/多资产/动态仓位/分批/Alpha/多因子/轮动；v1 策略不受影响，继续由现有引擎执行 | **已实现**（引擎 + AI 生成 + webUI 路由 + 组合图表） |
-| v2.1 | 资金费率/借币成本（持有成本现金流），引擎按持仓名义价值逐根计提，见 §10.8 | **引擎已实现**（v1/v2 同口径 + 金样例，默认关闭）；真实费率数据管线进行中 |
+| v2.1 | 资金费率/借币成本（持有成本现金流），引擎按持仓名义价值逐根计提，见 §10.8 | **引擎 + 真实数据读取管线均已实现**（v1/v2 同口径 + 金样例，默认关闭；funding 数据需手动跑 `funding_rate_data.py` 下载，无则回测不计 funding）；借币成本仍未做 |
 | v2.2 | 可选盘中触发价列（stop / take-profit），引擎用 high/low 判断盘中成交 | 规划 |
 | v3 | 订单级事件引擎（限价/条件单），服务做T与精确网格 | 按需 |
 
@@ -361,4 +366,6 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 | 2026-06-13 | v2 | 数据更新功能 + 第七轮全仓审查修复：新增 fetch_queue 统一拉取队列（启动自动更新/手动按钮/回测按需，串行+进度区+回测优先暂停）；第七轮重写 fetch_queue 并发模型为「持久 worker + Condition + generation」修一整类竞态（reset 双 worker、lost-wakeup 币种滞留、批次边界 TOCTOU 计数堆叠）；_DIR_OF 取最新目录修同名跨目录串扰；增量补拉 gate 改 end-of-day（与过滤切片同口径，修少近一天数据）；_REFRESHED 标记移到补拉后；启动自动更新去一次性 latch 改 is_running 守卫（首批失败可重试）；代码折叠面板标题随语言切换；删冗余 download_lock；tooltip/默认币种入队收敛单源；契约新增 §9.1 数据更新行为 |
 | 2026-06-13 | v2 | 更新与回测并行（原子写方案）：下载器改用 atomic_write_csv（.staging 暂存区写完整文件 + os.replace 原子覆盖 + Windows 占用重试），回测读文件永远完整、与后台更新真正并行；增量补拉改非阻塞后台 enqueue（回测对已有数据币种立即开跑，下次取更新后数据），仅本地完全无数据时才阻塞等首次拉取；移除回测优先暂停机制（_PRIORITY/_PAUSE_DEPTH，原子写后不再需要）；fetch_blocking 保留插队首优先；新增原子写并发安全测试（多读者+持续覆写零半截） |
 | 2026-06-13 | v1 | v1 引擎回测窗口锚定输入索引：`CodeBacktestCore.run` 在 `strategy_func` 返回后按【输入】索引重对齐（`reindex(input_index)`），修复策略 `dropna`/缩短行**静默截断回测窗口**（equity_curve 只覆盖剩余根数，与 webUI 取自完整输入索引的 kline_count/起止时间静默错配）；target_position 缺行按 `ffill().fillna(0)` 延续（与 v2 §10.2 同口径），行情列始终取自输入帧不被 ffill 造假，索引零交集报错（与 v2 _prepare_weights 一致）；返回帧等长同序时重对齐为无操作，单资产 v1≡v2/强平 α 退化/end_of_data/slippage>0 等金样例逐根不变；契约 §3 补「回测窗口锚定输入索引」引擎层承诺 |
-| 2026-06-14 | v2.1 | 资金费率（funding）引擎支持：两引擎 `run(funding_rates=...)` 接收 per-symbol 每根费率序列，在 MTM/强平之前按 `-signed_qty×close×rate` 逐根扣/加 cash（正费率多头付空头收），纳入强平判定（不进 α 公式、只改 cash 起点）；funding 计入单笔 net_pnl（v1 天然含、v2 finish_episode 显式加 funding_cf），gross 仍为 raw 价差不含 funding；metrics 新增 total_funding_cost、单笔新增 funding_pnl；`funding_rates=None`/全零时逐根 bit-level 退化为无 funding（现有金样例零改动通过）；契约 §10.8 + §8.2 + §9（v2.1）+ §10.7 不变量 5 + `tests/test_funding.py` 9 条金样例。真实 8h 费率数据管线（下载器 + data_panel 连续摊销对齐）为下一步 |
+| 2026-06-14 | v2.1 | 资金费率（funding）引擎支持：两引擎 `run(funding_rates=...)` 接收 per-symbol 每根费率序列，在 MTM/强平之前按 `-signed_qty×close×rate` 逐根扣/加 cash（正费率多头付空头收），纳入强平判定（不进 α 公式、只改 cash 起点）；funding 计入单笔 net_pnl（v1 天然含、v2 finish_episode 显式加 funding_cf），gross 仍为 raw 价差不含 funding；metrics 新增 total_funding_cost、单笔新增 funding_pnl；`funding_rates=None`/全零时逐根 bit-level 退化为无 funding（现有金样例零改动通过）；契约 §10.8 + §8.2 + §9（v2.1）+ §10.7 不变量 5 + `tests/test_funding.py` 9 条金样例 |
+| 2026-06-14 | v2.1 | funding 真实数据读取管线（Stage B）：`cryptocurrency_data/funding_rate_data.py` 下载器（`futures_funding_rate` 手动分页 + 续传 + 原子写 `funding_data/{SYMBOL}_FUNDING.csv`）；`data_panel.load_funding_series`（merge_asof backward 防未来函数 + 按 bar/结算周期连续摊销）+ `build_funding_rates`；webUI 自动接线（本地有费率即按 per-bar 计入，无则不计）。**funding 走被动读取，依赖手动运行下载器保持新鲜——与 K 线的自动增量补拉不对称（有意，自动拉取留后续）**。`tests/test_funding_data.py` 8 条金样例 |
+| 2026-06-14 | v2.1 | 第九轮审查加固：exec 沙箱 AST 新增拒绝 pandas/numpy 文件/网络 I/O 方法（read_csv/read_pickle/to_csv/np.savetxt 等，封堵任意文件读写/反序列化 RCE/SSRF，§6 记录边界）；funding 回测窗口超本地覆盖时尾部退化为 0（不再无限前向外推末费率，与首段对称）；funding 单根 index 摊销因子兜底为一个结算周期（不再静默清零）；损坏 funding CSV 降级为不计 funding（不中断回测）；load_funding_series 对 tz-aware/重复时间戳 index 防御；funding_records_to_df schema 漂移退化空表；webUI 回测摘要展示 metrics.total_funding_cost（六语言）。studio 重构遗留的两处前端清理（死 header 文案、区块标题/侧栏未随语言切换）为纯 UI 维护项，留用户在其 studio 代码中处置；funding 自动补拉为产品决策，本轮以文档声明被动读取语义。267+ tests green |

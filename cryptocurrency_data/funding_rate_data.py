@@ -96,9 +96,14 @@ def funding_records_to_df(records) -> pd.DataFrame:
         return pd.DataFrame(columns=FUNDING_COLS)
 
     df = pd.DataFrame(records)
+    # schema 漂移（API 返回缺 fundingTime/fundingRate 键的记录）时退化为空表，
+    # 而非让 pd.to_numeric(None) 抛 TypeError（符合 funding_acquisition「失败返回
+    # 空 DataFrame」承诺；该函数在 _fetch_funding_pages 的 try 之外被调用）
+    if "fundingTime" not in df.columns or "fundingRate" not in df.columns:
+        return pd.DataFrame(columns=FUNDING_COLS)
     out = pd.DataFrame({
-        "funding_time": pd.to_numeric(df.get("fundingTime"), errors="coerce").astype("Int64"),
-        "funding_rate": pd.to_numeric(df.get("fundingRate"), errors="coerce"),
+        "funding_time": pd.to_numeric(df["fundingTime"], errors="coerce").astype("Int64"),
+        "funding_rate": pd.to_numeric(df["fundingRate"], errors="coerce"),
     })
     return out[out["funding_time"].notna() & out["funding_rate"].notna()]
 

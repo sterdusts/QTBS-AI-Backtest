@@ -426,7 +426,21 @@ def load_funding_series(symbol, index, funding_dir: str = DEFAULT_FUNDING_DIR):
     if not isinstance(index, pd.DatetimeIndex) or len(index) == 0:
         return None
 
-    raw = pd.read_csv(get_funding_file_path(symbol, funding_dir=funding_dir))
+    # 防御：正常链路 index 已是 tz-naive 且唯一（KlineBuilder 剥 tz、align_klines
+    # 去重排序）。直连 API 可能传 tz-aware（剥成 tz-naive UTC 再对齐，否则与 tz-naive
+    # settle_time 比较/merge 抛错）或重复索引（无法 reindex）——后者退化为不计
+    # funding（与「数据不可用 ⇒ 无 funding」一致，不让可选附件崩掉核心回测）。
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_convert("UTC").tz_localize(None)
+    if not index.is_unique:
+        return None
+
+    # 损坏/无法解析的可选 funding 文件不得中断核心回测：read 失败退化为不计
+    # funding（与下方 empty/缺列的 graceful-None 一致，符合 §10.7 不变量 5）。
+    try:
+        raw = pd.read_csv(get_funding_file_path(symbol, funding_dir=funding_dir))
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, ValueError, OSError):
+        return None
     if raw.empty or "funding_time" not in raw.columns or "funding_rate" not in raw.columns:
         return None
 
@@ -452,10 +466,20 @@ def load_funding_series(symbol, index, funding_dir: str = DEFAULT_FUNDING_DIR):
     settled = mapped["funding_rate"].reindex(index).fillna(0.0)
 
     interval_s = _median_step_seconds(events["settle_time"], FUNDING_SETTLE_INTERVAL_SECONDS)
-    bar_s = _median_step_seconds(index, 0.0)
+    # 单根/退化 index 无相邻步长：兜底取一个结算周期（factor→1，至少计提一次完整
+    # funding），而非 0（否则单 bar 回测 funding 被静默清零）
+    bar_s = _median_step_seconds(index, interval_s)
     factor = (bar_s / interval_s) if interval_s > 0 else 0.0
 
-    return (settled * factor).rename(symbol)
+    per_bar = settled * factor
+
+    # 尾部超出本地覆盖（末结算点 + 一个结算周期）的 bar 无数据 → 0：不把最后一笔
+    # 已结算费率无限前向外推（否则回测窗口超过本地 funding 覆盖时会静默偏置
+    # 收益/夏普/回撤，且与 K 线增量补拉路径不对称）。与首结算点之前为 0 对称。
+    coverage_end = events["settle_time"].max() + pd.Timedelta(seconds=interval_s)
+    per_bar = per_bar.where(per_bar.index <= coverage_end, 0.0)
+
+    return per_bar.rename(symbol)
 
 
 def build_funding_rates(symbols, index, funding_dir: str = DEFAULT_FUNDING_DIR):

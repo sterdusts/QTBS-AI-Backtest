@@ -347,6 +347,7 @@ SUMMARY_TEXTS = {
         "avg_holding_hours": "平均持仓时间（小时）",
         "fee_rate": "手续费率",
         "slippage": "滑点",
+        "funding_cost": "资金费率净支出",
         "chart_file": "图表文件",
         "chart_path_missing": "图表已生成，但 generic_chart.py 没有 return 文件路径。",
         "na": "无",
@@ -380,6 +381,7 @@ SUMMARY_TEXTS = {
         "avg_holding_hours": "평균 보유 시간（시간）",
         "fee_rate": "수수료율",
         "slippage": "슬리피지",
+        "funding_cost": "자금 조달 비용 순지출",
         "chart_file": "차트 파일",
         "chart_path_missing": "차트는 생성되었지만 generic_chart.py가 파일 경로를 반환하지 않았습니다.",
         "na": "없음",
@@ -413,6 +415,7 @@ SUMMARY_TEXTS = {
         "avg_holding_hours": "Average Holding Time（hours）",
         "fee_rate": "Fee Rate",
         "slippage": "Slippage",
+        "funding_cost": "Funding Cost (net)",
         "chart_file": "Chart File",
         "chart_path_missing": "The chart was generated, but generic_chart.py did not return a file path.",
         "na": "N/A",
@@ -446,6 +449,7 @@ SUMMARY_TEXTS = {
         "avg_holding_hours": "平均保有時間（時間）",
         "fee_rate": "手数料率",
         "slippage": "スリッページ",
+        "funding_cost": "資金調達コスト（純支出）",
         "chart_file": "チャートファイル",
         "chart_path_missing": "チャートは生成されましたが、generic_chart.py がファイルパスを返していません。",
         "na": "なし",
@@ -479,6 +483,7 @@ SUMMARY_TEXTS = {
         "avg_holding_hours": "متوسط مدة الاحتفاظ（بالساعات）",
         "fee_rate": "نسبة الرسوم",
         "slippage": "الانزلاق السعري",
+        "funding_cost": "تكلفة التمويل (صافي)",
         "chart_file": "ملف الرسم البياني",
         "chart_path_missing": "تم إنشاء الرسم البياني، لكن generic_chart.py لم يُرجع مسار الملف.",
         "na": "غير متاح",
@@ -512,6 +517,7 @@ SUMMARY_TEXTS = {
         "avg_holding_hours": "Среднее время удержания（часы）",
         "fee_rate": "Комиссия",
         "slippage": "Проскальзывание",
+        "funding_cost": "Стоимость финансирования (нетто)",
         "chart_file": "Файл графика",
         "chart_path_missing": "График создан, но generic_chart.py не вернул путь к файлу.",
         "na": "нет данных",
@@ -1213,6 +1219,7 @@ def build_backtest_summary(
 {text["annual_return"]}：{format_number(metrics.get("annual_return_pct"), 2, na)}%
 {text["max_drawdown"]}：{format_number(metrics.get("max_drawdown_pct"), 2, na)}%
 {text["sharpe_ratio"]}：{format_number(metrics.get("sharpe_ratio"), 2, na)}
+{text["funding_cost"]}：{format_number(metrics.get("total_funding_cost", 0.0), 2, na)}
 
 {text["trade_count"]}：{metrics.get("trade_count", 0)}
 {text["gross_win_rate"]}：{format_number(metrics.get("gross_win_rate"), 2, na)}%

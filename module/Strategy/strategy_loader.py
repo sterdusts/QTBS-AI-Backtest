@@ -119,6 +119,33 @@ FORBIDDEN_DUNDER_ATTRS = frozenset({
 })
 
 
+# pandas/numpy 自带的文件/网络 I/O 方法是绕过整套沙箱的真实越权通道：
+# 策略被允许 import pandas/numpy（ALLOWED_IMPORT_ROOTS），而这些 I/O 方法
+# 既不是 dunder（FORBIDDEN_DUNDER_ATTRS 不命中）、名字里也不含 open(/eval(
+# 之类子串（FORBIDDEN_KEYWORDS 不命中），于是 df.to_csv / pd.read_pickle /
+# np.savetxt / pd.read_csv(url) 可任意读写文件、read_pickle 反序列化 RCE、
+# read_csv(url) SSRF——直接击穿契约 §1/§6「纯函数、不读写文件、不联网」。
+# 正常量化策略的数据由引擎注入、结果通过返回值传出，绝不需要这些 I/O 方法，
+# 故在 AST 层按方法名静态拒绝（与 FORBIDDEN_DUNDER_ATTRS 同一道防线）。
+# 注：这是单用户本地驾驶舱的务实加固；生产级隔离（独立进程 + 无网络 + 只读 FS）
+# 是平台化阶段的目标（getattr/__getattribute__/eval/exec 已不可用，无法绕过属性名静态检查）。
+FORBIDDEN_IO_ATTRS = frozenset({
+    # pandas 读取（文件/网络）
+    "read_csv", "read_table", "read_fwf", "read_pickle", "read_parquet",
+    "read_feather", "read_orc", "read_hdf", "read_excel", "read_json",
+    "read_html", "read_xml", "read_sql", "read_sql_query", "read_sql_table",
+    "read_stata", "read_sas", "read_spss", "read_gbq", "read_clipboard",
+    # pandas 写出（文件/网络）
+    "to_csv", "to_pickle", "to_parquet", "to_feather", "to_orc", "to_hdf",
+    "to_excel", "to_json", "to_html", "to_xml", "to_sql", "to_stata",
+    "to_gbq", "to_clipboard",
+    "ExcelWriter", "HDFStore",
+    # numpy 文件 I/O
+    "save", "savez", "savez_compressed", "savetxt", "load", "loadtxt",
+    "fromfile", "tofile", "genfromtxt", "fromregex", "memmap",
+})
+
+
 # 字符串黑名单只保留 AST import 白名单覆盖不到的危险调用。
 # "import os" 这类字符串项不要再加回来：所有 import 形式都由
 # validate_strategy_code 里的 ast.walk 白名单拦截（且无法用换行/别名绕过），
@@ -176,6 +203,12 @@ def validate_strategy_code(code: str) -> None:
         elif isinstance(node, ast.Attribute):
             if node.attr in FORBIDDEN_DUNDER_ATTRS:
                 raise ValueError(f"策略代码不允许访问危险属性: {node.attr}")
+            # pandas/numpy 原生文件/网络 I/O 方法越权（见 FORBIDDEN_IO_ATTRS 说明）
+            if node.attr in FORBIDDEN_IO_ATTRS:
+                raise ValueError(
+                    f"策略代码不允许调用文件/网络 I/O 方法: {node.attr}（策略是纯函数，"
+                    "数据由引擎注入、结果经返回值传出，不得读写文件或联网，见契约 §1/§6）"
+                )
         elif isinstance(node, ast.Name):
             if node.id in FORBIDDEN_DUNDER_ATTRS:
                 raise ValueError(f"策略代码不允许引用危险名称: {node.id}")

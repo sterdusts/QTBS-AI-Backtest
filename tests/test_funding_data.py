@@ -195,3 +195,75 @@ def test_funding_series_feeds_engine_end_to_end(tmp_path):
     # 多头持仓且费率为正 ⇒ 净付出（total_funding_cost > 0）
     assert res["metrics"]["total_funding_cost"] > 0
     assert res["trades"][0]["funding_pnl"] < 0
+
+
+# =========================================================
+# round-9 加固：尾部覆盖 / 单根 / 损坏 CSV / tz-aware / 重复索引
+# =========================================================
+
+def test_funding_tail_beyond_coverage_zeroed(tmp_path):
+    # 费率仅覆盖到 16:00（每 8h），index 延伸到次日：超末结算点一个结算周期
+    # 以上的尾部 bar 退化为 0，不把最后费率无限前向外推（②）
+    _write_funding_csv(
+        tmp_path, "BTC",
+        ["2024-01-01 00:00", "2024-01-01 08:00", "2024-01-01 16:00"],
+        [0.001, 0.001, 0.001],
+    )
+    index = pd.date_range("2024-01-01 00:00", periods=12, freq="4h")  # 到次日 20:00
+    s = data_panel.load_funding_series("BTC", index, funding_dir=str(tmp_path))
+    by_time = {str(t): v for t, v in s.items()}
+    # 覆盖边界 = 末结算点 16:00 + 8h = 次日 00:00：边界内保留摊销值（一周期内允许外推）
+    assert by_time["2024-01-01 20:00:00"] == pytest.approx(0.0005)
+    assert by_time["2024-01-02 00:00:00"] == pytest.approx(0.0005)
+    # 超出一个结算周期 → 0
+    assert by_time["2024-01-02 04:00:00"] == pytest.approx(0.0)
+    assert by_time["2024-01-02 20:00:00"] == pytest.approx(0.0)
+
+
+def test_funding_single_bar_charges_full_period(tmp_path):
+    # 单根 index：摊销因子兜底为 1（结算周期/结算周期），计提一次完整 funding 而非 0（⑥）
+    _write_funding_csv(tmp_path, "BTC", ["2024-01-01 00:00", "2024-01-01 08:00"], [0.002, 0.003])
+    index = pd.DatetimeIndex(["2024-01-01 00:00"])
+    s = data_panel.load_funding_series("BTC", index, funding_dir=str(tmp_path))
+    assert s.iloc[0] == pytest.approx(0.002)
+
+
+def test_funding_corrupt_csv_degrades_to_none(tmp_path):
+    # 损坏/无法解析的 funding 文件不得中断核心回测，退化为 None（⑤）
+    path = get_funding_file_path("BTC", funding_dir=str(tmp_path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    index = pd.date_range("2024-01-01", periods=6, freq="4h")
+
+    open(path, "w").close()  # 空文件 → EmptyDataError
+    assert data_panel.load_funding_series("BTC", index, funding_dir=str(tmp_path)) is None
+
+    with open(path, "w", encoding="utf-8") as f:  # 列数不一致 → ParserError
+        f.write("funding_time,funding_rate\n1,0.5,EXTRA\n2,0.6,EXTRA2\n")
+    assert data_panel.load_funding_series("BTC", index, funding_dir=str(tmp_path)) is None
+
+
+def test_funding_tz_aware_index_handled(tmp_path):
+    # tz-aware index 内部剥成 tz-naive UTC 再对齐，不抛错（防御）
+    _write_funding_csv(
+        tmp_path, "BTC",
+        ["2024-01-01 04:00", "2024-01-01 12:00", "2024-01-01 20:00"],
+        [0.001, 0.002, 0.003],
+    )
+    index = pd.date_range("2024-01-01 00:00", periods=6, freq="4h", tz="UTC")
+    s = data_panel.load_funding_series("BTC", index, funding_dir=str(tmp_path))
+    assert s is not None
+    assert getattr(s.index, "tz", None) is None
+    assert s.tolist() == pytest.approx([0.0, 0.0005, 0.0005, 0.001, 0.001, 0.0015])
+
+
+def test_funding_duplicate_index_degrades_to_none(tmp_path):
+    # 重复时间戳 index 无法 reindex，退化为 None 而非晦涩 pandas 错误（防御）
+    _write_funding_csv(tmp_path, "BTC", ["2024-01-01 00:00"], [0.001])
+    dup = pd.DatetimeIndex(["2024-01-01 00:00", "2024-01-01 04:00", "2024-01-01 04:00"])
+    assert data_panel.load_funding_series("BTC", dup, funding_dir=str(tmp_path)) is None
+
+
+def test_funding_records_to_df_schema_drift_returns_empty():
+    # API 返回缺键记录 → 空表而非 TypeError（下载器健壮性）
+    assert frd.funding_records_to_df([{"foo": 1}, {"bar": 2}]).empty
+    assert frd.funding_records_to_df([{"fundingTime": 1}]).empty
