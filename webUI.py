@@ -2682,9 +2682,10 @@ default_lang = "zh"
 default_text = get_ui_text(default_lang)
 
 with gr.Blocks(
+    # Gradio 6 起 css/head 不再是 Blocks 构造参数（移到 launch()）：
+    # 传给 Blocks 会被静默丢弃（demo.css=None），整套 studio 样式不生效。
+    # 见文件底部 demo.launch(css=..., head=...)。
     title="QTBS AI Quant Strategy Frontend",
-    css=custom_css,
-    head=custom_head,
 ) as demo:
 
     with gr.Row(elem_id="app-shell"):
@@ -3051,8 +3052,12 @@ with gr.Blocks(
 # =========================================================
 
 if __name__ == "__main__":
+    # css/head 必须在 launch() 传入（Gradio 6 起；传给 gr.Blocks 会被丢弃，
+    # 导致 19KB studio 样式不生效、界面渲染为无样式）
     demo.launch(
         server_name="127.0.0.1",
         server_port=7860,
         inbrowser=True,
+        css=custom_css,
+        head=custom_head,
     )
