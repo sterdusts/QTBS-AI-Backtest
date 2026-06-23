@@ -218,3 +218,81 @@ def test_trigger_bar_includes_funding():
     tr = res["trades"][0]
     assert tr["exit_reason"] == "stop_loss"
     assert tr["funding_pnl"] < 0
+
+
+# =========================================================
+# v2 引擎：构造级全局百分比 stop_loss_pct / take_profit_pct
+# =========================================================
+
+from module.modules.portfolio_backtest_core import PortfolioBacktestCore  # noqa: E402
+from tests.helpers import weights_strategy  # noqa: E402
+
+
+def _run_v2(rows, data, symbols=("BTCUSDT",), **kw):
+    params = dict(initial_cash=1000.0)
+    params.update(kw)
+    return PortfolioBacktestCore(weights_strategy(rows, list(symbols)), **params).run(data)
+
+
+def test_v2_pct_zero_equals_baseline():
+    rows = [(1,), (1,), (1,), (0,), (0,)]
+    base = _run_v2(rows, {"BTCUSDT": make_df([100, 100, 100, 105, 110])})
+    zero = _run_v2(rows, {"BTCUSDT": make_df([100, 100, 100, 105, 110])},
+                   stop_loss_pct=0, take_profit_pct=0)
+    b = [p["equity_close"] for p in base["equity_curve"]]
+    assert [p["equity_close"] for p in zero["equity_curve"]] == pytest.approx(b)
+
+
+def test_v2_long_stop():
+    # entry 100、qty10；stop_loss_pct=0.05 ⇒ stop=95；bar2 low=92 → 按 95、pnl=-50
+    data = {"BTCUSDT": make_df([100, 100, 100, 100, 100], lows=[100, 100, 92, 100, 100])}
+    res = _run_v2([(1,), (1,), (0,), (0,), (0,)], data, stop_loss_pct=0.05)
+    e = res["trades"][0]
+    assert e["exit_reason"] == "stop_loss"
+    assert e["pnl"] == pytest.approx(-50.0)
+    assert res["metrics"]["final_equity"] == pytest.approx(950.0)
+
+
+def test_v2_long_take():
+    # take_profit_pct=0.05 ⇒ tp=105；bar2 high=108 → 按 105、pnl=+50
+    data = {"BTCUSDT": make_df([100, 100, 100, 100, 100], highs=[100, 100, 108, 100, 100])}
+    res = _run_v2([(1,), (1,), (0,), (0,), (0,)], data, take_profit_pct=0.05)
+    e = res["trades"][0]
+    assert e["exit_reason"] == "take_profit"
+    assert e["pnl"] == pytest.approx(50.0)
+
+
+def test_v2_short_stop():
+    # 空头 stop_loss_pct=0.05 ⇒ stop=105；bar2 high=108 → 按 105、pnl=-50
+    data = {"BTCUSDT": make_df([100, 100, 100, 100, 100], highs=[100, 100, 108, 100, 100])}
+    res = _run_v2([(-1,), (-1,), (0,), (0,), (0,)], data, stop_loss_pct=0.05)
+    e = res["trades"][0]
+    assert e["side"] == "short"
+    assert e["exit_reason"] == "stop_loss"
+    assert e["pnl"] == pytest.approx(-50.0)
+
+
+def test_v2_gap_stop_fills_at_open():
+    # stop=95，bar2 跳空低开 open=90 → 按 open=90 成交、pnl=-100
+    data = {"BTCUSDT": make_df(
+        [100, 100, 90, 100, 100],
+        highs=[100, 100, 92, 100, 100], lows=[100, 100, 85, 100, 100],
+        closes=[100, 100, 88, 100, 100],
+    )}
+    res = _run_v2([(1,), (1,), (0,), (0,), (0,)], data, stop_loss_pct=0.05)
+    e = res["trades"][0]
+    assert e["exit_reason"] == "stop_loss"
+    assert e["pnl"] == pytest.approx(-100.0)
+
+
+def test_v2_multileg_one_stops_other_continues():
+    # BTC 触发止损、ETH 未触发（逐腿独立）：BTC=stop_loss、ETH=signal（目标0平仓）
+    data = {
+        "BTCUSDT": make_df([100, 100, 100, 100, 100], lows=[100, 100, 92, 100, 100]),
+        "ETHUSDT": make_df([10, 10, 10, 10, 10]),
+    }
+    res = _run_v2([(0.5, 0.5), (0.5, 0.5), (0, 0), (0, 0), (0, 0)], data,
+                  symbols=("BTCUSDT", "ETHUSDT"), stop_loss_pct=0.05)
+    eps = {e["symbol"]: e for e in res["trades"]}
+    assert eps["BTCUSDT"]["exit_reason"] == "stop_loss"
+    assert eps["ETHUSDT"]["exit_reason"] == "signal"

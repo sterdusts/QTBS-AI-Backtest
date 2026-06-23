@@ -59,8 +59,16 @@ class PortfolioBacktestCore:
         maintenance_margin_rate: float = 0.0,
         stop_on_liquidation: bool = True,
         liquidation_fee_rate: float = 0.0,
+        stop_loss_pct=None,
+        take_profit_pct=None,
     ):
         self.strategy_func = strategy_func
+
+        # 盘中止损/止盈全局百分比（契约 §10.9，v2.2）：None=关闭（默认）⇒ 逐根行为
+        # 与无触发完全一致（bit-level 退化）。每腿触发价由 avg_entry×(1∓pct) 推导。
+        # 逐标的差异化触发价留 v3。负值无意义，截断为 ≥0；0 视为关闭（不触发）。
+        self.stop_loss_pct = max(float(stop_loss_pct), 0.0) if stop_loss_pct else None
+        self.take_profit_pct = max(float(take_profit_pct), 0.0) if take_profit_pct else None
 
         # 参数截断规则单源在 backtest_metrics，与单标的引擎完全一致
         params = normalize_engine_params(
@@ -469,6 +477,74 @@ class PortfolioBacktestCore:
                         break
 
                     continue
+
+            # ---------- 盘中止损/止盈检测（契约 §10.9，强平未触发时逐腿）----------
+            # 全局百分比按 avg_entry×(1∓pct) 推每腿触发价；命中腿单独平仓（其余腿
+            # 继续），跳空/方向几何复用强平、不加滑点、扣正常 fee_rate 平仓费。
+            # 同腿止损与止盈同时触及【保守优先止损】（先判止损）。两 pct 皆 None ⇒ 跳过。
+            if self.stop_loss_pct is not None or self.take_profit_pct is not None:
+                stop_triggered = False
+                for s in symbols:
+                    q = qty[s]
+                    if q == 0.0:
+                        continue
+                    entry = avg_entry[s]
+                    entry_raw = avg_entry_raw[s]
+                    adverse, favorable = leg_extremes(s, i)
+                    open_v = opens[s][i]
+                    hit = None  # (fill_price, exit_reason, trigger_price, trigger_field)
+
+                    if q > 0:  # 多头：止损在下方(adverse=low)、止盈在上方(favorable=high)
+                        if self.stop_loss_pct is not None:
+                            sp = entry * (1.0 - self.stop_loss_pct)
+                            if adverse <= sp:
+                                fill = sp if math.isnan(open_v) else min(sp, open_v)
+                                hit = (fill, "stop_loss", adverse, "low")
+                        if hit is None and self.take_profit_pct is not None:
+                            tp = entry * (1.0 + self.take_profit_pct)
+                            if favorable >= tp:
+                                fill = tp if math.isnan(open_v) else max(tp, open_v)
+                                hit = (fill, "take_profit", favorable, "high")
+                    else:  # 空头：止损在上方(adverse=high)、止盈在下方(favorable=low)
+                        if self.stop_loss_pct is not None:
+                            sp = entry * (1.0 + self.stop_loss_pct)
+                            if adverse >= sp:
+                                fill = sp if math.isnan(open_v) else max(sp, open_v)
+                                hit = (fill, "stop_loss", adverse, "high")
+                        if hit is None and self.take_profit_pct is not None:
+                            tp = entry * (1.0 - self.take_profit_pct)
+                            if favorable <= tp:
+                                fill = tp if math.isnan(open_v) else min(tp, open_v)
+                                hit = (fill, "take_profit", favorable, "low")
+
+                    if hit is None:
+                        continue
+
+                    fill_price, exit_reason, trig_price, trig_field = hit
+                    realized = q * (fill_price - entry)            # q 带符号
+                    realized_raw = q * (fill_price - entry_raw)    # gross 用 raw 成本价
+                    fee = abs(q) * fill_price * self.fee_rate
+                    cash += realized - fee
+
+                    ep = open_episodes[s]
+                    ep["realized_pnl"] += realized
+                    ep["realized_pnl_raw"] += realized_raw
+                    ep["fees"] += fee
+                    record_fill(s, ts, "sell" if q > 0 else "buy",
+                                abs(q), fill_price, fill_price, fee, realized, exit_reason)
+
+                    qty[s] = 0.0
+                    avg_entry[s] = None
+                    avg_entry_raw[s] = None
+                    finish_episode(s, ts, fill_price, exit_reason)
+                    stop_triggered = True
+
+                # 平掉部分腿后 cash/持仓已变：重算 mtm 使本根权益记录反映平仓后状态
+                if stop_triggered:
+                    mtm = compute_mtm(i)
+                    equity_close = mtm["equity_close"]
+                    equity_worst = mtm["equity_worst"]
+                    equity_best = mtm["equity_best"]
 
             # ---------- 正常权益记录 ----------
 

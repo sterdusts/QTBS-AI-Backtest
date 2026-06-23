@@ -262,7 +262,11 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 1. 用户只描述做多策略：开多条件 target_position = 1，平仓条件 target_position = 0。
 2. 用户明确描述做空或多空切换时才使用 -1。
-3. 用户没说止损止盈，不要自己添加；没说做空，不要做空；没说加仓，不要加仓。
+3. 用户没说做空，不要做空；没说加仓，不要加仓；用户没说止损/止盈就不要加。
+   - 用户**明确要求**止损/止盈时：新增 `stop_loss_price` / `take_profit_price` 列
+     （**绝对价格**，无触发单的 K 线填 `np.nan`）。引擎当根用 high/low 判触及、按触发价
+     盘中成交（跳空按开盘价、不加滑点）。**逐根读当根值**——要移动止损（trailing）
+     只需每根重报当根止损价。
 4. 信号没有变化时，target_position 延续上一根 K 线的状态。
 5. 最后必须处理 NaN，并确保 target_position 中只包含 -1、0、1。
 6. 如果用户明确点名了交易标的（例如"做多ETH"），额外声明 SYMBOLS = ["ETHUSDT"]；
