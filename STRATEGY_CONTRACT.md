@@ -128,6 +128,15 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame
 只保证 trade_count / 胜率不漏记这笔仓位（避免「0 笔交易却有收益」的矛盾报告）。
 v1 / v2 两引擎行为一致（金样例交叉验证）。
 
+### 5.6 盘中触发价执行模型（止损/止盈，v2.2）
+
+策略可为持仓指定止损/止盈触发价，引擎用**当根 K 线的 high/low 判断盘中是否触及、按触发价当根成交**（消除「信号表达止损 + 一根延迟」的旧局限）。详见 §10.9。要点：
+- **方向语义**：多头止损 `low ≤ stop`、止盈 `high ≥ tp`；空头止损 `high ≥ stop`、止盈 `low ≤ tp`
+- **跳空越过按本根 open 成交**（不加滑点）：止损在不利方向触发，跳空把成交价推向更不利的 open（`min(stop,open)` 多 / `max(stop,open)` 空，与强平 §5.3 同规则）；止盈在有利方向触发，跳空把成交价推向更有利的 open（`max(tp,open)` 多 / `min(tp,open)` 空，与限价单实际成交一致）
+- **触发 = 全平**该仓，`exit_reason ∈ {stop_loss, take_profit}`；触发后本根不再对账，下一根目标仍非零则自然重入（复用 §5.3）
+- **定序**：funding → MTM → **强平**（优先）→ **止损/止盈**（仅强平未触发时）→ 正常权益；同根止损与止盈同时触及时**保守优先止损**
+- **默认关闭**：策略不给触发价 ⇒ 逐根行为与无触发完全一致（bit-level，§10.7 不变量 6）
+
 ## 6. 安全边界（加载器强制执行）
 
 `module/Strategy/strategy_loader.py` 在加载前强制检查：
@@ -179,7 +188,7 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 
 记录在案，避免误读回测结果：
 
-1. 止损/止盈通过信号表达，存在**一根 K 线的执行延迟**，且无法以盘中触发价成交
+1. 止损/止盈：**v1 已支持盘中触发价成交**（策略返回 `stop_loss_price`/`take_profit_price` 列，当根 high/low 判触发、按触发价成交，见 §5.6/§10.9，v2.2，默认关闭）；v2 的逐标的触发价待 v3 订单级引擎（v2.2 阶段 v2 仅支持构造级全局百分比，**实现中**）。仅用信号表达仓位方向时仍有一根 K 线执行延迟
 2. 资金费率（funding）：引擎已支持（见 §10.8，v2.1，v1/v2 同口径，默认关闭）；借币成本（做空/杠杆借入利息）暂未建模
 3. 无部分成交、无流动性模型：任意规模均按开盘价全额成交
 4. 单标的、单仓位：无法表达对冲、组合、动态仓位
@@ -194,7 +203,7 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 | v1 | 单标的、离散目标仓位 {-1, 0, 1}，引擎 `CodeBacktestCore` | **当前默认** |
 | v2 | 多标的连续目标权重，引擎 `PortfolioBacktestCore`（见第 10 节），解锁对冲/多资产/动态仓位/分批/Alpha/多因子/轮动；v1 策略不受影响，继续由现有引擎执行 | **已实现**（引擎 + AI 生成 + webUI 路由 + 组合图表） |
 | v2.1 | 资金费率/借币成本（持有成本现金流），引擎按持仓名义价值逐根计提，见 §10.8 | **引擎 + 真实数据读取管线均已实现**（v1/v2 同口径 + 金样例，默认关闭；funding 数据需手动跑 `funding_rate_data.py` 下载，无则回测不计 funding）；借币成本仍未做 |
-| v2.2 | 可选盘中触发价列（stop / take-profit），引擎用 high/low 判断盘中成交 | 规划 |
+| v2.2 | 可选盘中触发价（止损/止盈），引擎用 high/low 判断盘中成交 | **v1 已实现**（策略返回 `stop_loss_price`/`take_profit_price` 可选列，支持移动止损 + 金样例，默认关闭）；v2 构造级全局百分比**实现中**，逐标的触发价留 v3 |
 | v3 | 订单级事件引擎（限价/条件单），服务做T与精确网格 | 按需 |
 
 > v1.5（单标的连续仓位）已并入 v2：单标的连续权重就是 v2 的单列特例。
@@ -321,6 +330,9 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
    由说明性测试钉死，见 10.2 推论
 5. 资金费率 funding（§10.8）：`funding_rates=None`（或全零）时引擎逐根行为与无
    funding 完全一致——上述 1–4 全部金样例 **bit-level 不变**（零影响硬门槛）
+6. 盘中触发价（§10.9）：v1 不给 `stop_loss_price`/`take_profit_price` 列（或全 NaN）、
+   v2 `stop_loss_pct`/`take_profit_pct=None` 时，引擎逐根行为与无触发完全一致——
+   上述 1–5 全部金样例 **bit-level 不变**（零影响硬门槛）
 
 ### 10.8 资金费率与借币成本（funding / borrow cost，v2.1）
 
@@ -353,6 +365,19 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 > 数值（v1≡v2 逐根一致）、gross 不受 funding 影响、funding 拖入强平（v1≡v2）、
 > per-symbol 各腿独立结算、单笔 net_pnl 含 funding。
 
+### 10.9 盘中触发价（止损/止盈，v2.2）
+
+策略为持仓指定止损/止盈触发价，引擎用当根 high/low 判触及、按触发价当根成交（消除「信号表达止损 + 一根延迟」旧局限）。**默认全关闭**时逐根行为与无触发完全一致（§10.7 不变量 6）。执行几何见 §5.6。
+
+- **v1 接口（已实现）**：策略在返回 df 上可选挂 `stop_loss_price` / `take_profit_price` 两列（**绝对价格**，`NaN`=该根无触发单）。**逐根读当根值、不 ffill**（与 `target_position` 有意不同）——故策略可每根重报、天然支持**移动止损 trailing**。两列都不给 ⇒ 整功能关闭。触发价随策略缩短帧时一并 `reindex(input_index)`（缺行为 NaN，不 ffill）
+- **v2 接口（实现中）**：构造级全局 `stop_loss_pct` / `take_profit_pct`（默认 `None`=关闭），引擎对每个持仓腿按 `avg_entry × (1∓pct)`（多）/`(1±pct)`（空）推导触发价。**逐标的、逐时刻差异化触发价留给 v3 订单级引擎**（v2 的「单一权重 DataFrame 返回」是简洁契约，不塞 per-symbol 触发价）
+- **成交几何**：方向语义与跳空越过按本根 open 成交（**不加滑点**），见 §5.6。触发成交扣正常 `fee_rate` 平仓费；`gross_pnl` 仍为 raw 价差不含触发损益修饰
+- **定序与交互**：funding（已扣 cash）→ MTM → 强平（**优先**）→ 止损/止盈（仅强平未触发时）→ 正常权益；同根止损+止盈同时触及**保守优先止损**；触发平仓那根仍计 funding（`funding_pnl` 含）；末根盘中触及仍按触发价成交（不退化 `end_of_data`）；触发后下根目标非零则重入（复用 §5.3）
+- **输出**：`trade`/`episode` 的 `exit_reason ∈ {stop_loss, take_profit}`（原有 `signal`/`liquidation`/`end_of_data` 之外），附 `trigger_price`（触及的 high/low 值）、`trigger_field`（'high'/'low'）；`liquidated` 仍为 False；全 JSON-able
+- **v1≡v2 说明**：v1 走逐根绝对价列、v2 走构造级全局百分比，**表达方式不同**，故触发场景下 v1≡v2 逐根一致**不作为硬不变量**（仅在 v1 每根重报与全局 pct 等价的常量价这一特例下成立）；硬门槛只是「默认关闭时各自 bit-level 退化」
+
+> **金样例**（`tests/test_intrabar_trigger.py`，v1）锁定：全 NaN 列退化、多/空止损止盈盘中触发、跳空越过取 open（止损更不利 / 止盈更有利）、强平优先、同根保守优先止损、末根不退化 end_of_data、触发后重入、触发根含 funding。
+
 ## 11. 变更记录
 
 | 日期 | 版本 | 变更 |
@@ -371,4 +396,5 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 | 2026-06-14 | v2.1 | 资金费率（funding）引擎支持：两引擎 `run(funding_rates=...)` 接收 per-symbol 每根费率序列，在 MTM/强平之前按 `-signed_qty×close×rate` 逐根扣/加 cash（正费率多头付空头收），纳入强平判定（不进 α 公式、只改 cash 起点）；funding 计入单笔 net_pnl（v1 天然含、v2 finish_episode 显式加 funding_cf），gross 仍为 raw 价差不含 funding；metrics 新增 total_funding_cost、单笔新增 funding_pnl；`funding_rates=None`/全零时逐根 bit-level 退化为无 funding（现有金样例零改动通过）；契约 §10.8 + §8(第2项) + §9（v2.1）+ §10.7 不变量 5 + `tests/test_funding.py` 9 条金样例 |
 | 2026-06-14 | v2.1 | funding 真实数据读取管线（Stage B）：`cryptocurrency_data/funding_rate_data.py` 下载器（`futures_funding_rate` 手动分页 + 续传 + 原子写 `funding_data/{SYMBOL}_FUNDING.csv`）；`data_panel.load_funding_series`（merge_asof backward 防未来函数 + 按 bar/结算周期连续摊销）+ `build_funding_rates`；webUI 自动接线（本地有费率即按 per-bar 计入，无则不计）。**funding 走被动读取，依赖手动运行下载器保持新鲜——与 K 线的自动增量补拉不对称（有意，自动拉取留后续）**。`tests/test_funding_data.py` 8 条金样例 |
 | 2026-06-14 | v2.1 | 第十轮审查加固：exec 沙箱封堵两条端到端实测 RCE——(1) pandas/numpy 子模块属性回取 stdlib 模块（pd.compat.os.system，FORBIDDEN_MODULE_ATTRS 拒 os/sys/subprocess/compat/io/f2py 等）、(2) df.query/df.eval 字符串表达式引擎执行属性链（FORBIDDEN_EXPR_ATTRS 拒 query/eval）；序列化 dunder（__reduce__/__setstate__/__class_getitem__ 等）纳入黑名单（纵深防御）；§6 同步。funding 引擎 _prepare_funding_rates 在 reindex 前统一 tz（修直连 API tz-aware 索引下 funding 被静默清零，生产路径不可达）。generic_chart kline_data 向量化（去 iterrows，约 58 倍）。round-10 验证：app 真实 launch + 回调全部正常、css/head 与 I/O 加固生效、funding 数学正确，无新 Gradio 6 运行期问题。沙箱按名黑名单属务实加固，治本（属性白名单 / OS 级进程隔离）留平台化。v1 generic_chart 无降采样仍属已知 1m 效率债延期项 |
+| 2026-06-14 | v2.2 | 盘中触发价（止损/止盈）v1 引擎：策略可选返回 `stop_loss_price`/`take_profit_price` 列（绝对价、逐根当根值【不 ffill】支持移动止损 trailing），引擎当根 high/low 判触及、按触发价成交（跳空越过按本根 open：止损更不利 min/max、止盈更有利 max/min；不加滑点、扣正常平仓费）；定序 funding→MTM→强平（优先）→止损/止盈→正常权益，同根止损+止盈保守优先止损，末根触发不退化 end_of_data，触发后复用 §5.3 重入；`exit_reason∈{stop_loss,take_profit}`+trigger_price/trigger_field（JSON-able）；默认不给列 bit-level 退化（§10.7 不变量 6）。契约 §5.6 + §10.9 + §8(第1项)改写 + §9(v2.2) + §10.7 不变量 6；`tests/test_intrabar_trigger.py` 12 条金样例。CONTRACT_VERSION 仍=2。**v2 构造级全局 stop_loss_pct/take_profit_pct + AI prompt 接线为下一步** |
 | 2026-06-14 | v2.1 | 第九轮审查加固：exec 沙箱 AST 新增拒绝 pandas/numpy 文件/网络 I/O 方法（read_csv/read_pickle/to_csv/np.savetxt 等，封堵任意文件读写/反序列化 RCE/SSRF，§6 记录边界）；funding 回测窗口超本地覆盖时尾部退化为 0（不再无限前向外推末费率，与首段对称）；funding 单根 index 摊销因子兜底为一个结算周期（不再静默清零）；损坏 funding CSV 降级为不计 funding（不中断回测）；load_funding_series 对 tz-aware/重复时间戳 index 防御；funding_records_to_df schema 漂移退化空表；webUI 回测摘要展示 metrics.total_funding_cost（六语言）。studio 重构遗留的两处前端清理（死 header 文案、区块标题/侧栏未随语言切换）为纯 UI 维护项，留用户在其 studio 代码中处置；funding 自动补拉为产品决策，本轮以文档声明被动读取语义。267+ tests green |

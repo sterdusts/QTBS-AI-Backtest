@@ -99,6 +99,14 @@ class CodeBacktestCore:
         if missing_columns:
             raise ValueError(f"回测数据缺少必要字段: {missing_columns}")
 
+        # 盘中触发价（契约 §10.9）：策略可选返回 stop_loss_price / take_profit_price
+        # 列（绝对价，逐根当根值，NaN=该根无触发单，支持移动止损 trailing）。在下方
+        # reindex 重对齐【之前】从策略返回帧捕获——重对齐会从输入帧重建 df、丢掉
+        # 策略新增列。两列都不存在 ⇒ 整功能关闭（数组为 None），主循环逐根分支跳过
+        # ⇒ bit-level 退化为无触发（金样例零影响硬门槛）。
+        _strat_stop = df["stop_loss_price"] if "stop_loss_price" in df.columns else None
+        _strat_take = df["take_profit_price"] if "take_profit_price" in df.columns else None
+
         # 策略返回帧重对齐回【输入】索引（与 v2 §10.2 / portfolio 引擎
         # 的 weights.reindex(index).ffill().fillna(0) 对齐）。
         # 策略 dropna 等副作用返回更短帧时，若直接遍历策略自身索引会让
@@ -148,6 +156,18 @@ class CodeBacktestCore:
         # 资金费率序列（契约 §10.8）对齐到【输入】索引；策略缩短帧时 df
         # 已 reindex 回 input_index，二者逐根对齐。None ⇒ 不计 funding。
         funding_arr = self._prepare_funding_rates(funding_rates, input_index)
+
+        # 触发价对齐到输入索引：逐根独立、缺行/缺列为 NaN，【不 ffill】（与
+        # target_position 有意不同——触发单只在策略给出值的那根有效；ffill 会把单根
+        # 触发单错误延续到后续每根）。
+        stop_arr = (
+            pd.to_numeric(_strat_stop.reindex(input_index), errors="coerce").to_numpy(dtype=float)
+            if _strat_stop is not None else None
+        )
+        take_arr = (
+            pd.to_numeric(_strat_take.reindex(input_index), errors="coerce").to_numpy(dtype=float)
+            if _strat_take is not None else None
+        )
 
         cash = self.initial_cash
 
@@ -297,6 +317,84 @@ class CodeBacktestCore:
                     break
 
                 continue
+
+            # ---------- 盘中止损/止盈检测（契约 §10.9）----------
+            # 强平未触发时才检测（强平优先）。触发=全平、不加滑点、按 fill_price
+            # 结算并扣正常 fee_rate 平仓费；权益落结算后 cash（照搬强平分支 worst/best）；
+            # continue 让下根对账看到空仓自然重入（复用 §5.3）。两数组皆 None ⇒ 整段跳过。
+            if (stop_arr is not None or take_arr is not None) and position_side != 0:
+                trig = self._check_stop_trigger(
+                    position_side=position_side,
+                    open_price=float(df["open"].iloc[i]),
+                    high_price=high_price,
+                    low_price=low_price,
+                    stop_price=(stop_arr[i] if stop_arr is not None else float("nan")),
+                    take_price=(take_arr[i] if take_arr is not None else float("nan")),
+                )
+                if trig is not None:
+                    fill_price = trig["fill_price"]
+                    close_fee = abs(position * fill_price) * self.fee_rate
+                    cash = self._equity_at_price(
+                        cash=cash, position=position, position_side=position_side,
+                        entry_price=entry_price, mark_price=fill_price,
+                    ) - close_fee
+
+                    trades.append(self._build_trade(
+                        exit_reason=trig["exit_reason"],
+                        position_side=position_side,
+                        position=position,
+                        entry_time=entry_time,
+                        exit_time=current_time,
+                        entry_price=entry_price,
+                        exit_price=fill_price,
+                        entry_raw_price=entry_raw_price,
+                        exit_raw_price=fill_price,   # 不加滑点：raw == 成交价
+                        entry_equity=entry_equity,
+                        entry_margin=entry_margin,
+                        entry_notional=entry_notional,
+                        entry_open_fee=entry_open_fee,
+                        close_fee=close_fee,
+                        equity_after=cash,
+                        extra={
+                            "trigger_price": float(trig["trigger_price"]),
+                            "trigger_field": trig["trigger_field"],
+                            "funding_pnl": float(position_funding_cf),
+                        },
+                    ))
+
+                    realized_equity = cash
+                    equity_curve.append({
+                        "time": str(current_time),
+                        "equity": float(cash),
+                        "equity_close": float(cash),
+                        "equity_at_high": float(mtm["equity_at_high"]),
+                        "equity_at_low": float(mtm["equity_at_low"]),
+                        "equity_worst": float(cash),
+                        "equity_best": float(cash),
+                        "price_high": float(high_price),
+                        "price_low": float(low_price),
+                        "price_close": float(close_price),
+                        "position_side": int(position_side),
+                        "liquidated": False,
+                        "liquidation_price": None,
+                    })
+                    realized_equity_curve.append({
+                        "time": str(current_time),
+                        "equity": float(cash),
+                    })
+
+                    position = 0.0
+                    position_side = 0
+                    entry_price = None
+                    entry_raw_price = None
+                    entry_time = None
+                    entry_equity = None
+                    entry_margin = None
+                    entry_notional = None
+                    entry_open_fee = None
+                    position_funding_cf = 0.0
+
+                    continue
 
             equity_for_chart = mtm["equity_intrabar_extreme"]
 
@@ -687,6 +785,61 @@ class CodeBacktestCore:
             return cash + unrealized_pnl
 
         return cash
+
+    def _check_stop_trigger(
+        self,
+        position_side,
+        open_price,
+        high_price,
+        low_price,
+        stop_price,
+        take_price,
+    ):
+        """盘中止损/止盈触发（契约 §10.9），几何复用强平：当根 high/low 判触及、
+        跳空越过按本根开盘价结算（不加滑点）。stop_price/take_price 为【当根】触发价
+        （NaN=无单，支持移动止损）。返回 {fill_price, trigger_price, trigger_field,
+        exit_reason} 或 None。同根止损与止盈同时触及时【保守优先止损】（先检测止损）。
+
+        跳空把成交价推向跳空方向：止损（在不利方向触发）跳空越过→更差价；止盈（在
+        有利方向触发）跳空越过→更好价（与限价单实际成交一致，金样例 D 钉死）。
+        """
+        if position_side == 0:
+            return None
+
+        has_stop = stop_price is not None and not np.isnan(stop_price)
+        has_take = take_price is not None and not np.isnan(take_price)
+        if not has_stop and not has_take:
+            return None
+
+        if position_side == 1:  # 多头
+            if has_stop and low_price <= stop_price:
+                # 跌破止损（在下方）；跳空低开越过 → 按更不利的 open 成交
+                return {
+                    "fill_price": min(stop_price, open_price),
+                    "trigger_price": low_price, "trigger_field": "low",
+                    "exit_reason": "stop_loss",
+                }
+            if has_take and high_price >= take_price:
+                # 涨破止盈（在上方）；跳空高开越过 → 按更有利的 open 成交
+                return {
+                    "fill_price": max(take_price, open_price),
+                    "trigger_price": high_price, "trigger_field": "high",
+                    "exit_reason": "take_profit",
+                }
+        else:  # 空头 position_side == -1（镜像）
+            if has_stop and high_price >= stop_price:
+                return {
+                    "fill_price": max(stop_price, open_price),
+                    "trigger_price": high_price, "trigger_field": "high",
+                    "exit_reason": "stop_loss",
+                }
+            if has_take and low_price <= take_price:
+                return {
+                    "fill_price": min(take_price, open_price),
+                    "trigger_price": low_price, "trigger_field": "low",
+                    "exit_reason": "take_profit",
+                }
+        return None
 
     def _check_liquidation(
         self,
