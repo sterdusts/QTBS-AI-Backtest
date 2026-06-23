@@ -267,3 +267,23 @@ def test_funding_records_to_df_schema_drift_returns_empty():
     # API 返回缺键记录 → 空表而非 TypeError（下载器健壮性）
     assert frd.funding_records_to_df([{"foo": 1}, {"bar": 2}]).empty
     assert frd.funding_records_to_df([{"fundingTime": 1}]).empty
+
+
+def test_engine_funding_tz_aware_index_not_silently_zeroed():
+    # round-10：直连 API 传 tz-aware K 线索引 + tz-naive funding 序列时，引擎
+    # _prepare_funding_rates 应统一 tz 后对齐，而非 reindex 全 NaN → funding 静默清零
+    from module.modules.portfolio_backtest_core import PortfolioBacktestCore
+    from tests.helpers import make_df, weights_strategy
+
+    idx_naive = pd.date_range("2024-01-01 00:00", periods=5, freq="4h")
+    idx_aware = idx_naive.tz_localize("UTC")
+    data = {"BTCUSDT": make_df([100] * 5).set_axis(idx_aware)}
+    funding = {"BTCUSDT": pd.Series([0.001] * 5, index=idx_naive)}  # data_panel 剥 tz 后口径
+
+    res = PortfolioBacktestCore(
+        weights_strategy([(1,), (1,), (1,), (0,), (0,)], ["BTCUSDT"]),
+        initial_cash=1000.0,
+    ).run(data, funding_rates=funding)
+
+    # funding 真实生效（多头付 → 净支出 > 0），而非被 tz 不匹配静默清零
+    assert res["metrics"]["total_funding_cost"] > 0

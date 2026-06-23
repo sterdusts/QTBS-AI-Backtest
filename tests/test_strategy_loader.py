@@ -224,6 +224,33 @@ def generate_signals(df):
     assert callable(func)
 
 
+def test_escape_via_pandas_submodule_module_attr_blocked():
+    # round-10 反例：pandas/numpy import 时把 stdlib 模块挂为子模块属性，
+    # pd.compat.os / pd.io.common.os / np.f2py.subprocess 是【真实 stdlib 模块】，
+    # 可经 pd.compat.os.system(...) 完整 RCE（实测）。模块属性名静态拒绝。
+    for snippet in ["pd.compat.os.getcwd()", "pd.io.common", "pd.compat.subprocess", "np.f2py"]:
+        code = (
+            "import pandas as pd\nimport numpy as np\n\n"
+            "def generate_signals(df):\n"
+            f"    y = {snippet}\n    return df\n"
+        )
+        with pytest.raises(ValueError, match="模块属性"):
+            load_strategy_func_from_code(code)
+
+
+def test_escape_via_df_query_blocked():
+    # round-10 反例：df.query 字符串表达式引擎可在字符串内执行属性链至 os.system
+    # （实测 RCE）；df.eval 已被 FORBIDDEN_KEYWORDS 的 'eval(' 子串拦。query 静态拒绝。
+    for snippet in ['df.query("close > open")', 'df.query("a.__class__.__mro__")']:
+        code = (
+            "import pandas as pd\n\n"
+            "def generate_signals(df):\n"
+            f"    {snippet}\n    return df\n"
+        )
+        with pytest.raises(ValueError, match="query|表达式"):
+            load_strategy_func_from_code(code)
+
+
 def test_import_via_builtins_dict_rejected():
     # 经 __builtins__['__import__'] 取回导入器是又一条逃逸向量。
     # 这里 __builtins__ 与 __import__ 都命中 FORBIDDEN_KEYWORDS 子串黑名单，

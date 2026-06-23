@@ -672,7 +672,18 @@ class PortfolioBacktestCore:
                 out[s] = np.zeros(n, dtype=float)
                 continue
             if isinstance(series, pd.Series):
-                arr = series.reindex(index).to_numpy(dtype=float)
+                # tz 容错：直连 API 可能传 tz-aware 索引，而 funding 序列已被
+                # data_panel 剥成 tz-naive——标签不匹配会让 reindex 全返回 NaN →
+                # funding 被静默清零（round-10）。两侧统一剥成 tz-naive UTC 再
+                # reindex；两侧本就 tz-naive 时此分支不触发，行为逐根不变。
+                target = index
+                if getattr(series.index, "tz", None) is not None:
+                    series = series.set_axis(
+                        series.index.tz_convert("UTC").tz_localize(None)
+                    )
+                if getattr(target, "tz", None) is not None:
+                    target = target.tz_convert("UTC").tz_localize(None)
+                arr = series.reindex(target).to_numpy(dtype=float)
             else:
                 arr = np.asarray(series, dtype=float)
             if arr.shape[0] != n:

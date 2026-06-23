@@ -116,6 +116,8 @@ FORBIDDEN_DUNDER_ATTRS = frozenset({
     "__globals__", "__builtins__", "__import__", "__dict__", "__getattribute__",
     "__code__", "__closure__", "__func__", "__self__", "__module__",
     "__loader__", "__spec__", "__init_subclass__", "__subclasshook__",
+    # 序列化/反射类 dunder：可作属性链回取宿主对象的新起点（纵深防御）
+    "__reduce__", "__reduce_ex__", "__setstate__", "__getstate__", "__class_getitem__",
 })
 
 
@@ -144,6 +146,25 @@ FORBIDDEN_IO_ATTRS = frozenset({
     "save", "savez", "savez_compressed", "savetxt", "load", "loadtxt",
     "fromfile", "tofile", "genfromtxt", "fromregex", "memmap",
 })
+
+
+# pandas/numpy import 时把自身依赖的标准库模块挂为子模块属性：pd.compat.os /
+# pd.io.common.os / numpy.f2py.subprocess 等【就是真实的标准库模块】。属性名
+# os/sys/subprocess 既非 dunder、不在 I/O 名单、也不含黑名单子串，可经
+# pd.compat.os.system(...) 完整 RCE（round-10 端到端实测写文件）。这些模块/包名
+# 作为属性对纯量化策略毫无用途，AST 静态拒绝其属性访问，斩断子模块回取标准库。
+FORBIDDEN_MODULE_ATTRS = frozenset({
+    "os", "sys", "subprocess", "socket", "shutil", "pathlib", "importlib",
+    "ctypes", "pickle", "marshal", "builtins", "compat", "io", "f2py",
+})
+
+
+# df.query / df.eval 接收【字符串表达式】，pandas 的 python 表达式引擎会执行其中
+# 的属性链调用（df.query("a.__class__...__subclasses__()[i].__init__.__globals__"
+# "['os'].system(...)")）实现 RCE（round-10 端到端实测写文件，默认 engine 亦成立）；
+# 表达式是 ast.Constant 字符串，AST dunder 防线对其内部失明。纯量化策略用向量化
+# 布尔索引即可，绝不需 query/eval，故静态拒绝。
+FORBIDDEN_EXPR_ATTRS = frozenset({"query", "eval"})
 
 
 # 字符串黑名单只保留 AST import 白名单覆盖不到的危险调用。
@@ -208,6 +229,18 @@ def validate_strategy_code(code: str) -> None:
                 raise ValueError(
                     f"策略代码不允许调用文件/网络 I/O 方法: {node.attr}（策略是纯函数，"
                     "数据由引擎注入、结果经返回值传出，不得读写文件或联网，见契约 §1/§6）"
+                )
+            # pandas/numpy 子模块属性回取标准库模块（pd.compat.os 等）→ 完整越权 RCE
+            if node.attr in FORBIDDEN_MODULE_ATTRS:
+                raise ValueError(
+                    f"策略代码不允许访问模块属性: {node.attr}（pandas/numpy 子模块会挂载 "
+                    "os/sys/subprocess 等标准库模块，可经此完整越权执行命令，见契约 §1/§6）"
+                )
+            # df.query/df.eval 字符串表达式引擎可在字符串内执行任意属性链调用 → RCE
+            if node.attr in FORBIDDEN_EXPR_ATTRS:
+                raise ValueError(
+                    f"策略代码不允许调用 {node.attr}()（pandas 表达式引擎会执行字符串内的"
+                    "任意属性链；纯量化策略请用向量化布尔索引代替 query/eval）"
                 )
         elif isinstance(node, ast.Name):
             if node.id in FORBIDDEN_DUNDER_ATTRS:
