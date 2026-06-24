@@ -21,6 +21,16 @@ V1_FLAT = (
     "import pandas as pd\nimport numpy as np\n\nCONTRACT_VERSION = 1\n\n"
     "def generate_signals(df):\n    df = df.copy()\n    df['target_position'] = 0\n    return df\n"
 )
+# 契约 v3 可参数化：mode=1 做多 / mode=-1 做空（PARAM_SPACE 静态声明）
+PARAM_LS = (
+    "import pandas as pd\nimport numpy as np\n\nCONTRACT_VERSION = 1\n"
+    'PARAM_SPACE = {"mode": [-1, 1]}\n\n'
+    "def generate_signals(df, params=None):\n"
+    "    p = params or {}\n"
+    "    df = df.copy()\n"
+    "    df['target_position'] = p.get('mode', 1)\n"
+    "    return df\n"
+)
 
 
 def _prep(df, code=V1_LONG):
@@ -164,3 +174,84 @@ def test_walk_forward_anchored_train_grows(tmp_path):
     )
     bars = [w["train"]["bars"] for w in res["windows"]]
     assert bars == sorted(bars) and bars[0] < bars[-1]  # 锚定 → 训练窗增长
+
+
+# =========================================================
+# scan_strategy_params（契约 v3 策略参数扫描）
+# =========================================================
+
+def test_scan_strategy_params_explicit_grid(tmp_path):
+    df = make_df(list(range(100, 110)))  # 上涨 10 根
+    prep = _prep(df, PARAM_LS)
+    res = robustness.scan_strategy_params(
+        PARAM_LS, "BTC", "4h", "s", "e", engine_params={"initial_cash": 1000.0},
+        param_grid={"mode": [-1, 1]}, metric="final_equity",
+        min_klines=1, prepared=prep, funding_dir=str(tmp_path),
+    )
+    assert res["scan_target"] == "strategy"
+    assert res["x_param"] == "mode" and res["x_values"] == [-1, 1]
+    assert res["y_param"] is None
+    assert len(res["matrix"]) == 1 and len(res["matrix"][0]) == 2
+    # mode=1（做多，上涨）final_equity > mode=-1（做空，上涨）
+    eq_short = next(c for c in res["cells"] if c["x"] == -1)["metrics"]["final_equity"]
+    eq_long = next(c for c in res["cells"] if c["x"] == 1)["metrics"]["final_equity"]
+    assert eq_long > eq_short
+    assert _json_ok(res)
+    # 与直接 strategy_params=mode:1 run 一致
+    direct = run_prepared(prep, {"initial_cash": 1000.0}, min_klines=1,
+                          funding_dir=str(tmp_path), strategy_params={"mode": 1})
+    assert eq_long == pytest.approx(direct["result"]["metrics"]["final_equity"])
+
+
+def test_scan_strategy_params_auto_uses_param_space(tmp_path):
+    df = make_df(list(range(100, 110)))
+    res = robustness.scan_strategy_params(
+        PARAM_LS, "BTC", "4h", "s", "e", engine_params={"initial_cash": 1000.0},
+        metric="final_equity", min_klines=1, prepared=_prep(df, PARAM_LS), funding_dir=str(tmp_path),
+    )
+    assert res["x_param"] == "mode" and res["x_values"] == [-1, 1]  # 取自 PARAM_SPACE
+
+
+def test_scan_strategy_params_no_space_raises(tmp_path):
+    df = make_df(list(range(100, 106)))
+    with pytest.raises(ValueError, match="PARAM_SPACE"):
+        robustness.scan_strategy_params(
+            V1_LONG, "BTC", "4h", "s", "e", min_klines=1,
+            prepared=_prep(df, V1_LONG), funding_dir=str(tmp_path))
+
+
+# =========================================================
+# walk_forward 真 WFO（IS 寻优 → OOS 评估）
+# =========================================================
+
+def test_walk_forward_true_wfo_optimizes_is(tmp_path):
+    df = make_df(list(range(100, 130)))  # 30 根上涨
+    res = robustness.walk_forward(
+        PARAM_LS, "BTC", "4h", "s", "e", engine_params={"initial_cash": 1000.0},
+        train_bars=8, test_bars=4, step_bars=4, optimize_metric="total_return_pct",
+        min_klines=1, prepared=_prep(df, PARAM_LS), funding_dir=str(tmp_path),
+    )
+    assert res["optimized"] is True
+    assert res["param_grid"] == {"mode": [-1, 1]}
+    assert res["optimize_metric"] == "total_return_pct"
+    assert len(res["windows"]) >= 1
+    for w in res["windows"]:
+        # 上涨段 IS 寻优必选做多（mode=1 正收益 > mode=-1 负收益）
+        assert w["train"]["chosen_params"] == {"mode": 1}
+        assert w["train"]["is_optimized"] is True
+        assert w["train"]["candidates_evaluated"] == 2  # 两候选都成交、都参选
+        if not w["test"].get("empty") and not w["test"].get("insufficient"):
+            assert w["test"]["metrics"]["total_return_pct"] > 0  # OOS 用做多 → 上涨正收益
+    assert _json_ok(res)
+
+
+def test_walk_forward_no_param_space_is_stability_scan(tmp_path):
+    df = make_df(list(range(100, 112)))
+    res = robustness.walk_forward(
+        V1_LONG, "BTC", "4h", "s", "e", engine_params={"initial_cash": 1000.0},
+        train_bars=4, test_bars=2, step_bars=2, min_klines=1,
+        prepared=_prep(df, V1_LONG), funding_dir=str(tmp_path),
+    )
+    assert res["optimized"] is False
+    assert res["param_grid"] is None
+    assert "chosen_params" not in res["windows"][0]["train"]  # 退化模式不寻优

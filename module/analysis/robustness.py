@@ -2,15 +2,17 @@
 稳健性分析（Phase 3）：架在 v1/v2 引擎之上的纯库分析/编排层，不改引擎执行数学。
 复用 backtest_runner（加载一次 → 切窗/换参跑多次）。全部返回 JSON-able dict。
 
-三个对外函数：
+对外函数：
 - split_in_out_sample：样本内/样本外切分（按 K 线根数切，比退化判过拟合）
 - scan_engine_params：引擎参数（fee/slippage/leverage/position_size/止损pct）网格扫描
-- walk_forward：滚动窗前推（本期【无 IS 寻优的分段 OOS 稳定性扫描】，因策略内部参数
-  尚不可调；契约 v3 让策略可参数化后升级为传统 WFO）
+- scan_strategy_params：策略内部参数（PARAM_SPACE，均线周期等）网格扫描——契约 v3 解锁
+- walk_forward：滚动窗前推。给定 param_grid（策略参数）时做【传统 WFO】：每窗先在样本
+  内（IS）按目标指标寻优、再用最优参数评样本外（OOS），IS 严格早于 OOS（无未来函数）。
+  不给 param_grid 时退化为「固定策略的分段 OOS 稳定性扫描」（向后兼容）。
 
-注：策略内部参数（均线周期等）无法在已加载的 func 上扫——运行期注入被沙箱封死
-（__globals__/__code__/eval/exec 全禁），只能走契约 v3 的 generate_signals(df, params)。
-本模块只做引擎参数 + 时间切分。
+注：策略内部参数（均线周期等）的扫描经契约 v3 的 generate_signals(df, params) 形参
+显式传入（沙箱封死 __globals__/__code__/eval/exec，运行期注入不可行）；本模块据策略
+模块级 PARAM_SPACE 取扫描空间，逐点 run_prepared(strategy_params=...)。
 
 输出卫生（_sanitize_metrics）：metrics 里 payoff_ratio/profit_factor/annual_return_pct
 可为 inf、trade_count==0 走全 0 精简分支——聚合（均值/方差/退化比）前必须把 inf/NaN
@@ -26,9 +28,11 @@ from module.Strategy.backtest_runner import (
     load_for_backtest,
     run_prepared,
 )
+from module.Strategy.strategy_loader import parse_strategy_metadata
 
-# 输出 schema 版本（供前端稳定消费，类比 CONTRACT_VERSION）
-ROBUSTNESS_CONTRACT = "robustness_v1"
+# 输出 schema 版本（供前端稳定消费，类比 CONTRACT_VERSION）。
+# v2：新增 scan_strategy_params（策略参数扫描）+ walk_forward 真 WFO（IS 寻优→OOS 评估）
+ROBUSTNESS_CONTRACT = "robustness_v2"
 
 # 退化对比关注的核心指标
 _DEGRADATION_METRICS = (
@@ -65,12 +69,15 @@ def _sanitize_metrics(metrics):
     return {k: _sanitize_value(v) for k, v in metrics.items()}
 
 
-def _run_window(prepared, engine_params, start_bar, end_bar, min_klines, funding_dir):
+def _run_window(prepared, engine_params, start_bar, end_bar, min_klines, funding_dir,
+                strategy_params=None):
     """按根数位置 [start_bar, end_bar) 切子窗并跑一次，返回 {metrics(sanitized),
-    start, end, kline_count, empty} 或 {insufficient: True, kline_count}（样本不足）。"""
+    start, end, kline_count, empty} 或 {insufficient: True, kline_count}（样本不足）。
+    strategy_params 透传给策略（契约 v3）；None ⇒ 走策略默认（bit-level 退化）。"""
     sub = _slice_prepared(prepared, start_bar, end_bar)
     try:
-        run = run_prepared(sub, engine_params, min_klines=min_klines, funding_dir=funding_dir)
+        run = run_prepared(sub, engine_params, min_klines=min_klines,
+                           funding_dir=funding_dir, strategy_params=strategy_params)
     except InsufficientKlinesError as e:
         return {"insufficient": True, "kline_count": e.kline_count}
 
@@ -83,6 +90,19 @@ def _run_window(prepared, engine_params, start_bar, end_bar, min_klines, funding
         # trade_count==0 ⇒ 空窗口：指标全 0 无意义，聚合时须剔除
         "empty": int(metrics.get("trade_count", 0) or 0) == 0,
     }
+
+
+def _cartesian(param_grid):
+    """{名:[值,...]} → [{名:值,...}, ...] 全笛卡尔积，键序/值序确定（无 Date/random，可复现）。"""
+    combos = [{}]
+    for k, values in param_grid.items():
+        combos = [dict(c, **{k: v}) for c in combos for v in values]
+    return combos
+
+
+def _param_space_of(strategy_code):
+    """取策略模块级 PARAM_SPACE（契约 v3）；无声明则 None。解析不执行策略。"""
+    return parse_strategy_metadata(strategy_code).get("param_space")
 
 
 def _ratio(out_v, in_v):
@@ -148,22 +168,12 @@ def split_in_out_sample(
     }
 
 
-def scan_engine_params(
-    strategy_code, ui_symbol, timeframe, start_str, end_str,
-    base_engine_params, param_grid, *, metric="sharpe_ratio",
-    min_klines=30, prepared=None,
-    data_dir=DEFAULT_DATA_DIR, funding_dir=DEFAULT_FUNDING_DIR,
-):
-    """引擎参数网格扫描（1~2 维）。param_grid: {参数名: [取值列表]}（离散列表，避免浮点
-    步长踩坑）。每点覆盖 base_engine_params 的被扫键 run 一次，matrix 填 metric 标量、
-    cells 保全套 metrics 供下钻。数据/策略循环外只加载一次。"""
+def _scan_2d(param_grid, metric, run_point):
+    """通用 1~2 维网格扫描骨架。run_point(point:dict)->window（_run_window 的返回）。
+    返回 {x_param,x_values,y_param,y_values,matrix,cells}。matrix[yi][xi]=metric 标量。"""
     keys = list(param_grid.keys())
     if not 1 <= len(keys) <= 2:
         raise ValueError("param_grid 仅支持 1~2 个参数（2 维=热力图）")
-    if prepared is None:
-        prepared = load_for_backtest(strategy_code, ui_symbol, timeframe, start_str, end_str, data_dir=data_dir)
-
-    n = len(_prepared_index(prepared))   # 全窗根数（参数扫描不切窗）
     x_param = keys[0]
     x_values = list(param_grid[x_param])
     y_param = keys[1] if len(keys) == 2 else None
@@ -174,47 +184,106 @@ def scan_engine_params(
     for yv in y_values:
         row = []
         for xv in x_values:
-            point = dict(base_engine_params or {})
-            point[x_param] = xv
+            point = {x_param: xv}
             if y_param is not None:
                 point[y_param] = yv
-            window = _run_window(prepared, point, 0, n, min_klines, funding_dir)
+            window = run_point(point)
             if window.get("insufficient"):
                 row.append(None)
-                cells.append({"x": xv, "y": yv, "params": _scanned(point, x_param, y_param), "insufficient": True})
+                cells.append({"x": xv, "y": yv, "params": dict(point), "insufficient": True})
             else:
                 m = window["metrics"]
                 row.append(m.get(metric))
-                cells.append({"x": xv, "y": yv, "params": _scanned(point, x_param, y_param),
+                cells.append({"x": xv, "y": yv, "params": dict(point),
                               "metrics": m, "empty": window["empty"]})
         matrix.append(row)
-
-    return {
-        "type": "param_scan",
-        "contract": ROBUSTNESS_CONTRACT,
-        "metric": metric,
-        "x_param": x_param, "x_values": x_values,
-        "y_param": y_param, "y_values": y_values if y_param else None,
-        "matrix": matrix,
-        "cells": cells,
-    }
+    return {"x_param": x_param, "x_values": x_values,
+            "y_param": y_param, "y_values": y_values if y_param else None,
+            "matrix": matrix, "cells": cells}
 
 
-def _scanned(point, x_param, y_param):
-    out = {x_param: point[x_param]}
-    if y_param is not None:
-        out[y_param] = point[y_param]
-    return out
+def scan_engine_params(
+    strategy_code, ui_symbol, timeframe, start_str, end_str,
+    base_engine_params, param_grid, *, metric="sharpe_ratio",
+    min_klines=30, prepared=None,
+    data_dir=DEFAULT_DATA_DIR, funding_dir=DEFAULT_FUNDING_DIR,
+):
+    """引擎参数网格扫描（1~2 维）。param_grid: {参数名: [取值列表]}（离散列表，避免浮点
+    步长踩坑）。每点覆盖 base_engine_params 的被扫键 run 一次，matrix 填 metric 标量、
+    cells 保全套 metrics 供下钻。数据/策略循环外只加载一次。"""
+    if prepared is None:
+        prepared = load_for_backtest(strategy_code, ui_symbol, timeframe, start_str, end_str, data_dir=data_dir)
+    n = len(_prepared_index(prepared))   # 全窗根数（参数扫描不切窗）
+
+    def run_point(point):
+        engine = dict(base_engine_params or {}, **point)
+        return _run_window(prepared, engine, 0, n, min_klines, funding_dir)
+
+    grid = _scan_2d(param_grid, metric, run_point)
+    return {"type": "param_scan", "scan_target": "engine",
+            "contract": ROBUSTNESS_CONTRACT, "metric": metric, **grid}
+
+
+def scan_strategy_params(
+    strategy_code, ui_symbol, timeframe, start_str, end_str,
+    engine_params=None, param_grid=None, *, metric="sharpe_ratio",
+    min_klines=30, prepared=None,
+    data_dir=DEFAULT_DATA_DIR, funding_dir=DEFAULT_FUNDING_DIR,
+):
+    """策略内部参数网格扫描（1~2 维，契约 v3）。param_grid 缺省时取策略模块级
+    PARAM_SPACE；策略未声明 PARAM_SPACE 且未显式给 grid ⇒ ValueError。engine_params
+    固定，每点以 strategy_params=该点 run 一次。"""
+    if prepared is None:
+        prepared = load_for_backtest(strategy_code, ui_symbol, timeframe, start_str, end_str, data_dir=data_dir)
+    if param_grid is None:
+        param_grid = _param_space_of(strategy_code)
+    if not param_grid:
+        raise ValueError("策略未声明 PARAM_SPACE 且未显式提供 param_grid，无可扫描的策略参数")
+    n = len(_prepared_index(prepared))
+
+    def run_point(point):
+        return _run_window(prepared, engine_params, 0, n, min_klines, funding_dir,
+                           strategy_params=dict(point))
+
+    grid = _scan_2d(param_grid, metric, run_point)
+    return {"type": "param_scan", "scan_target": "strategy",
+            "contract": ROBUSTNESS_CONTRACT, "metric": metric, **grid}
+
+
+def _optimize_is(prepared, engine_params, is_start, is_end, min_klines, funding_dir, combos, metric):
+    """在 IS 段对每个候选策略参数各跑一次，按 metric【越大越好】取最优（夏普/收益/盈亏比/
+    胜率都是越大越好；max_drawdown_pct 为负，max=最小回撤，亦自洽）。None/空窗/样本不足
+    不参选；全不可选时退化为首个候选并标 valid=False。返回 (best_combo, best_value, valid, evaluated)。"""
+    best = None  # (metric_value, combo)
+    evaluated = 0
+    for combo in combos:
+        w = _run_window(prepared, engine_params, is_start, is_end, min_klines, funding_dir,
+                        strategy_params=combo)
+        if w.get("insufficient") or w.get("empty"):
+            continue
+        mv = w["metrics"].get(metric)
+        if mv is None:
+            continue
+        evaluated += 1
+        if best is None or mv > best[0]:
+            best = (mv, combo)
+    if best is None:
+        return combos[0], None, False, evaluated
+    return best[1], best[0], True, evaluated
 
 
 def walk_forward(
     strategy_code, ui_symbol, timeframe, start_str, end_str,
     engine_params=None, *, train_bars, test_bars, step_bars=None, anchored=False,
+    param_grid=None, optimize_metric="sharpe_ratio",
     min_klines=30, prepared=None,
     data_dir=DEFAULT_DATA_DIR, funding_dir=DEFAULT_FUNDING_DIR,
 ):
-    """walk-forward 前推。【本期无 IS 寻优】（策略内部参数不可调）：退化为「固定策略在
-    多个滚动 OOS 段的分段稳定性扫描」——契约 v3 让策略可参数化后升级为传统 WFO。
+    """walk-forward 前推。
+    - 给定 param_grid（或策略声明了 PARAM_SPACE 自动取用）⇒【传统 WFO】：每窗先在 IS 段按
+      optimize_metric 寻优策略参数，再以最优参数评 OOS 段。IS 严格早于 OOS ⇒ 参数选择不含
+      未来函数（OOS 是真正的样本外）。
+    - 无可扫描参数 ⇒ 退化为「固定策略的分段 OOS 稳定性扫描」（向后兼容旧行为）。
     step_bars 默认=test_bars（不重叠 OOS）；anchored=True 时 IS 起点固定、窗口增长。"""
     if train_bars <= 0 or test_bars <= 0:
         raise ValueError("train_bars/test_bars 必须为正")
@@ -223,6 +292,11 @@ def walk_forward(
         raise ValueError("step_bars 必须为正")
     if prepared is None:
         prepared = load_for_backtest(strategy_code, ui_symbol, timeframe, start_str, end_str, data_dir=data_dir)
+
+    if param_grid is None:
+        param_grid = _param_space_of(strategy_code)
+    combos = _cartesian(param_grid) if param_grid else None
+    optimized = bool(combos)
 
     index = _prepared_index(prepared)
     n = len(index)
@@ -237,19 +311,31 @@ def walk_forward(
         if oos_end > n:
             break
 
-        oos_window = _run_window(prepared, engine_params, oos_start, oos_end, min_klines, funding_dir)
-        windows.append({
-            "index": k,
-            "train": {"start": str(index[is_start]), "end": str(index[is_end - 1]), "bars": is_end - is_start},
-            "test": oos_window,
-        })
+        train = {"start": str(index[is_start]), "end": str(index[is_end - 1]), "bars": is_end - is_start}
+        if optimized:
+            best_combo, best_val, valid, evaluated = _optimize_is(
+                prepared, engine_params, is_start, is_end, min_klines, funding_dir, combos, optimize_metric)
+            oos_window = _run_window(prepared, engine_params, oos_start, oos_end, min_klines, funding_dir,
+                                     strategy_params=best_combo)
+            train.update({"chosen_params": best_combo, "is_metric": best_val,
+                          "is_metric_name": optimize_metric, "is_optimized": valid,
+                          "candidates_evaluated": evaluated})
+        else:
+            oos_window = _run_window(prepared, engine_params, oos_start, oos_end, min_klines, funding_dir)
+
+        windows.append({"index": k, "train": train, "test": oos_window})
         k += 1
 
+    note = ("传统 WFO：每窗 IS 段寻优策略参数、最优参数评 OOS（IS 早于 OOS，无未来函数）"
+            if optimized else
+            "无可扫描策略参数（未声明 PARAM_SPACE / 未给 param_grid）：固定策略的分段 OOS 稳定性扫描")
     return {
         "type": "walk_forward",
         "contract": ROBUSTNESS_CONTRACT,
-        "wfo_note": "本期无 IS 寻优（策略内部参数尚不可调）：为固定策略的分段 OOS 稳定性扫描，"
-                    "非传统 WFO；契约 v3 策略可参数化后升级",
+        "optimized": optimized,
+        "optimize_metric": optimize_metric if optimized else None,
+        "param_grid": param_grid if optimized else None,
+        "wfo_note": note,
         "window_def": {"train_bars": train_bars, "test_bars": test_bars, "step_bars": step, "anchored": anchored},
         "windows": windows,
         "aggregate": _aggregate_walk_forward(windows),
