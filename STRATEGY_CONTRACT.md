@@ -24,11 +24,48 @@
 ## 1. 接口签名
 
 ```python
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame
+def generate_signals(df: pd.DataFrame) -> pd.DataFrame              # 历史签名（仍受支持）
+def generate_signals(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame   # v3 可参数化
 ```
 
 策略代码是一个**纯函数**：输入 K 线数据，输出带目标仓位列的数据。
 除此之外不做任何事情（不下单、不算钱、不读写文件、不联网）。
+
+**纯函数硬约束（v3 强化）**：同一输入两次调用必须返回逐根一致的结果——
+不得依赖模块级可变状态、`np.random`、时间/外部状态。`behavior_check` 会用同一
+合成数据连续调用两次比对（`deterministic` 事实），稳健性分析会对同一策略
+反复回测，非确定性策略的结论会漂移。
+
+### 1.1 可参数化策略（契约 v3）
+
+策略可声明**可选**第二形参 `params`，并在模块级声明 `PARAM_SPACE` 静态扫描空间：
+
+```python
+PARAM_SPACE = {"fast": [5, 10, 20], "slow": [50, 100, 200]}   # {参数名: [候选值,...]}
+
+def generate_signals(df, params=None):
+    p = params or {}                          # params=None ⇒ 策略走自身默认值
+    fast = p.get("fast", 10)
+    slow = p.get("slow", 100)
+    ...
+```
+
+约定与保证：
+
+- **签名按元数捕获分发**：引擎用 `inspect.signature` 判断策略是否接收第二个位置
+  参数。1 参历史策略按 `f(df)` 调用（`params` 被忽略，零行为变化）；2 参策略按
+  `f(df, params)` 调用。`call_strategy` 是唯一调用点（两引擎共用）。
+- **`params=None` ⇒ bit-level 退化**：不传 `params`（webUI 单次回测、所有历史路径）
+  时，2 参策略收到 `None` 并走自身 `.get(key, default)` 默认值，结果与未参数化时
+  逐位相同。这是「默认关闭 ⇒ 比特级退化」硬门禁的又一应用。
+- **`PARAM_SPACE` 是静态声明**（模块级字面量），由加载器 AST 解析，**不执行策略**：
+  - 形如 `{str 标识符: [数字,...]}`，候选列表非空、元素为 int/float（允许负号）；
+  - 任何不合规（值非列表、键非字符串标识符、空列表、顶层非 dict）⇒ 解析期 `ValueError`；
+  - 无 `PARAM_SPACE` ⇒ 元数据 `param_space=None`（策略不可被参数扫描，但可正常回测）。
+- **稳健性参数扫描**（§9.2 / robustness `scan_engine_params` 的策略侧推广）据
+  `PARAM_SPACE` 笛卡尔积逐点重载策略并以 `params=该点` 回测；策略内部参数**不能**
+  靠运行时注入 `__globals__`（沙箱封死 `__globals__`/`__code__`/`eval`/`exec`），
+  故必须经由本约定的形参显式传入。
 
 ## 2. 输入保证（引擎 → 策略）
 
@@ -248,12 +285,15 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 ### 10.1 接口签名
 
 ```python
-def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
+def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame                     # 历史签名
+def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.DataFrame  # v3 可参数化
 ```
 
 - 输入 `data`：`{标的: K线DataFrame}`，由 `data_panel.load_aligned_panel` 构造，
   **所有 DataFrame 索引完全相同**（索引并集对齐）
 - 输出：目标权重 DataFrame，index = 相同时间索引，columns = 标的
+- **可参数化（v3）**：与 v1 相同，第二形参 `params` 可选、`PARAM_SPACE` 模块级声明，
+  规则见 §1.1（同一套 `call_strategy` 分发、`params=None` 比特级退化、纯函数硬约束）。
 
 ### 10.2 权重语义
 
@@ -399,3 +439,4 @@ def generate_signals(data: dict[str, pd.DataFrame]) -> pd.DataFrame
 | 2026-06-14 | v2.2 | 盘中触发价（止损/止盈）v1 引擎：策略可选返回 `stop_loss_price`/`take_profit_price` 列（绝对价、逐根当根值【不 ffill】支持移动止损 trailing），引擎当根 high/low 判触及、按触发价成交（跳空越过按本根 open：止损更不利 min/max、止盈更有利 max/min；不加滑点、扣正常平仓费）；定序 funding→MTM→强平（优先）→止损/止盈→正常权益，同根止损+止盈保守优先止损，末根触发不退化 end_of_data，触发后复用 §5.3 重入；`exit_reason∈{stop_loss,take_profit}`+trigger_price/trigger_field（JSON-able）；默认不给列 bit-level 退化（§10.7 不变量 6）。契约 §5.6 + §10.9 + §8(第1项)改写 + §9(v2.2) + §10.7 不变量 6；`tests/test_intrabar_trigger.py` 12 条金样例。CONTRACT_VERSION 仍=2。**v2 构造级全局 stop_loss_pct/take_profit_pct + AI prompt 接线为下一步** |
 | 2026-06-14 | v2.2 | 盘中触发价 Stage B：v2 引擎构造级全局 `stop_loss_pct`/`take_profit_pct`（默认 None=关闭、负值截 0、0 视关闭），主循环强平之后逐腿检测（按 avg_entry×(1∓pct) 推触发价、leg_extremes 判触及、跳空复用强平几何、不加滑点扣正常 fee），命中腿单独平仓+finish_episode(exit_reason)+record_fill，平腿后重算本根 MTM；其余腿继续、下根可重入（v1/v2 重入时点略不对称、非硬不变量）。AI prompt（deepseek_code_generator v1）放宽「不加止损止盈」为「用户明确要求时输出 stop_loss_price/take_profit_price 列、逐根重报支持 trailing」。契约 §10.9/§9/§8 v2 改「已实现」。`tests/test_intrabar_trigger.py` 增 6 条 v2 金样例（共 18），296 tests green。webUI v2 pct 旋钮为可选 UI 后续 |
 | 2026-06-14 | v2.1 | 第九轮审查加固：exec 沙箱 AST 新增拒绝 pandas/numpy 文件/网络 I/O 方法（read_csv/read_pickle/to_csv/np.savetxt 等，封堵任意文件读写/反序列化 RCE/SSRF，§6 记录边界）；funding 回测窗口超本地覆盖时尾部退化为 0（不再无限前向外推末费率，与首段对称）；funding 单根 index 摊销因子兜底为一个结算周期（不再静默清零）；损坏 funding CSV 降级为不计 funding（不中断回测）；load_funding_series 对 tz-aware/重复时间戳 index 防御；funding_records_to_df schema 漂移退化空表；webUI 回测摘要展示 metrics.total_funding_cost（六语言）。studio 重构遗留的两处前端清理（死 header 文案、区块标题/侧栏未随语言切换）为纯 UI 维护项，留用户在其 studio 代码中处置；funding 自动补拉为产品决策，本轮以文档声明被动读取语义。267+ tests green |
+| 2026-06-24 | v3 | 策略可参数化（为稳健性参数扫描解锁）：`generate_signals` 可选第二形参 `params: dict\|None`（按 `inspect.signature` 元数捕获分发——`call_strategy` 单一调用点，1 参历史策略零行为变化、2 参策略收 params）+ 模块级 `PARAM_SPACE` 静态扫描空间声明（加载器 AST 解析、不执行策略、`{str标识符:[数字,...]}` 非空校验，违规解析期报错）；两引擎 `run(..., params=None)` 透传，`params=None` ⇒ bit-level 退化（webUI/历史路径逐位不变）；策略内部参数不可运行时注入（沙箱封死 `__globals__`/`__code__`/`eval`/`exec`），必须经形参显式传入；`behavior_check` 新增两次调用一致性探针（`deterministic` 事实，捕模块级状态/`np.random` 等非确定性，稳健性反复回测下会漂移）；§1.1 + §10.1 + 纯函数硬约束强化 + `tests/test_strategy_params.py` 7 条金样例。CONTRACT_VERSION 不变（v1=1 / v2=2，v3 是两版本共同的可选能力）。317 tests green。**配套基础设施（已提交）：backtest_runner 无 Gradio 编排内核（webUI 与稳健性共用单内核）+ module/analysis/robustness.py 样本内外/walk-forward/引擎参数扫描纯库层** |

@@ -268,6 +268,7 @@ def parse_strategy_metadata(code: str) -> dict:
 
     contract_version = 1
     symbols = None
+    param_space = None  # 契约 v3：策略可选声明的可调参数空间（供稳健性参数扫描）
 
     # 收集模块顶层对这两个名字的「任何」绑定形式。写错形式必须报错而不是
     # 静默回退 v1（否则 v2 代码会被路由进 v1 引擎，在深处炸出误导性错误），
@@ -299,7 +300,7 @@ def parse_strategy_metadata(code: str) -> dict:
     # 顶层之外的绑定（if/try/with 等语句块内）静态解析不到：与其静默
     # 回退 v1（LLM 偶尔会把常量包进防御性 try 块），不如直接指出声明
     # 必须放在模块顶层。函数/类体内部的同名局部变量不在此列。
-    meta_names = {"CONTRACT_VERSION", "SYMBOLS"}
+    meta_names = {"CONTRACT_VERSION", "SYMBOLS", "PARAM_SPACE"}
     bound_top = {name for name, _ in bindings if name in meta_names}
 
     for node in tree.body:
@@ -352,10 +353,72 @@ def parse_strategy_metadata(code: str) -> dict:
                     'SYMBOLS 必须是非空字符串列表，例如 SYMBOLS = ["BTCUSDT", "ETHUSDT"]'
                 )
 
+        elif name == "PARAM_SPACE":
+            param_space = _parse_param_space(value)
+
     return {
         "contract_version": contract_version,
         "symbols": symbols,
+        "param_space": param_space,
     }
+
+
+def _ast_number(node):
+    """从 AST 节点提取数值常量（int/float，含一元负号），否则返回 None。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return node.value
+    if (
+        isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, (int, float))
+        and not isinstance(node.operand.value, bool)
+    ):
+        return -node.operand.value
+    return None
+
+
+def _parse_param_space(value):
+    """解析模块级 PARAM_SPACE = {参数名: [候选值列表]}（契约 v3，AST 静态解析）。
+    键必须是合法标识符字符串、值必须是非空数值列表。形式错误必须报错（与
+    CONTRACT_VERSION/SYMBOLS 同样严格，避免「声明了但静态解析不到」的静默漂移）。"""
+    err = (
+        'PARAM_SPACE 必须是 {参数名(字符串): [候选值数值列表]} 的非空字典，'
+        '例如 PARAM_SPACE = {"ma_fast": [5, 10, 20], "ma_slow": [30, 60]}'
+    )
+    if not isinstance(value, ast.Dict) or not value.keys:
+        raise ValueError(err)
+
+    out = {}
+    for k_node, v_node in zip(value.keys, value.values):
+        if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str) and k_node.value.isidentifier()):
+            raise ValueError(err + "（键必须是合法标识符字符串）")
+        if not isinstance(v_node, (ast.List, ast.Tuple)) or not v_node.elts:
+            raise ValueError(err + f"（参数 {k_node.value} 的候选值必须是非空列表）")
+        vals = [_ast_number(e) for e in v_node.elts]
+        if any(v is None for v in vals):
+            raise ValueError(err + f"（参数 {k_node.value} 的候选值必须全为数值）")
+        out[k_node.value] = vals
+    return out
+
+
+def call_strategy(strategy_func, data, params=None):
+    """调用策略函数（契约 v3 兼容分支）：函数签名接收第二个位置参数时传入 params
+    （参数化策略 generate_signals(df, params=None)），否则只传 data（历史无参策略
+    generate_signals(df)）。params=None ⇒ 参数化策略走自身默认 ⇒ bit-level 退化。"""
+    import inspect
+
+    try:
+        positional = [
+            p for p in inspect.signature(strategy_func).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        accepts_params = len(positional) >= 2
+    except (ValueError, TypeError):
+        accepts_params = False
+
+    if accepts_params:
+        return strategy_func(data, params)
+    return strategy_func(data)
 
 
 SUPPORTED_CONTRACT_VERSIONS = (1, 2)

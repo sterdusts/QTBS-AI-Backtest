@@ -18,6 +18,7 @@ import pandas as pd
 from module.modules.code_backtest_core import CodeBacktestCore
 from module.modules.portfolio_backtest_core import PortfolioBacktestCore
 from module.Strategy.strategy_loader import (
+    call_strategy,
     load_strategy_func_from_code,
     parse_strategy_metadata,
     validate_strategy_metadata,
@@ -122,6 +123,21 @@ def _safe_error_type(error: str) -> str:
     return "未知异常"
 
 
+def _two_call_consistent(strategy_func, synthetic, version) -> bool:
+    """两次调用策略（同一合成数据的独立副本，params=None），判返回是否逐根一致。
+    含模块级可变状态或非确定性（如 np.random）的策略两次会不同——稳健性多次回测
+    下结论会漂移，故契约 v3 要求策略是无副作用纯函数（§1）。"""
+    if version == 2:
+        in1 = {s: df.copy(deep=False) for s, df in synthetic.items()}
+        in2 = {s: df.copy(deep=False) for s, df in synthetic.items()}
+        w1 = call_strategy(strategy_func, in1, None)
+        w2 = call_strategy(strategy_func, in2, None)
+        return bool(w1.equals(w2))
+    out1 = call_strategy(strategy_func, synthetic.copy(deep=False), None)
+    out2 = call_strategy(strategy_func, synthetic.copy(deep=False), None)
+    return bool(out1["target_position"].equals(out2["target_position"]))
+
+
 def run_behavior_check(code: str) -> dict:
     """
     在合成数据上真实运行策略代码，返回 JSON-able 的行为事实。
@@ -142,6 +158,7 @@ def run_behavior_check(code: str) -> dict:
         "has_nonzero_signal": False,
         "used_short": False,
         "max_gross_exposure": None,
+        "deterministic": None,   # 两次调用是否一致（含模块级状态/非确定性=False）
     }
 
     try:
@@ -181,6 +198,7 @@ def run_behavior_check(code: str) -> dict:
             result["has_nonzero_signal"] = bool((raw_w != 0).any().any())
             result["used_short"] = bool((raw_w < 0).any().any())
             result["max_gross_exposure"] = float(raw_w.abs().sum(axis=1).max())
+            result["deterministic"] = _two_call_consistent(strategy_func, data, 2)
 
         else:
             df = build_synthetic_kline()
@@ -196,6 +214,7 @@ def run_behavior_check(code: str) -> dict:
             result["opened_position"] = result["trade_count"] > 0
             result["has_nonzero_signal"] = bool((targets != 0).any())
             result["used_short"] = any(t.get("side") == "short" for t in trades)
+            result["deterministic"] = _two_call_consistent(strategy_func, df, 1)
 
         result["ok"] = True
 

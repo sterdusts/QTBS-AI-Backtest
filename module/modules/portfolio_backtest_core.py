@@ -42,6 +42,7 @@ from module.modules.backtest_metrics import (
     calculate_metrics,
     normalize_engine_params,
 )
+from module.Strategy.strategy_loader import call_strategy
 
 
 class PortfolioBacktestCore:
@@ -91,14 +92,16 @@ class PortfolioBacktestCore:
     # 主流程
     # =========================================================
 
-    def run(self, data: dict, funding_rates=None) -> dict:
+    def run(self, data: dict, funding_rates=None, params=None) -> dict:
         symbols, index = self._validate_data(data)
         funding_arr = self._prepare_funding_rates(funding_rates, symbols, index)
 
         # 浅拷贝即可防策略篡改：pandas 写时复制（CoW）下策略的任何写入
         # 只触发被改块的复制，原面板不受影响，深拷贝是纯浪费
         strategy_input = {s: df.copy(deep=False) for s, df in data.items()}
-        raw_weights = self.strategy_func(strategy_input)
+        # 契约 v3：参数化策略 generate_signals(data, params) 传入 params；历史无参
+        # 策略 generate_signals(data) 走兼容分支。params=None ⇒ 用默认 ⇒ bit-level 退化
+        raw_weights = call_strategy(self.strategy_func, strategy_input, params)
         weights = self._prepare_weights(raw_weights, symbols, index)
 
         opens = {s: data[s]["open"].to_numpy(dtype=float) for s in symbols}

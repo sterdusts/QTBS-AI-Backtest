@@ -271,17 +271,29 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 5. 最后必须处理 NaN，并确保 target_position 中只包含 -1、0、1。
 6. 如果用户明确点名了交易标的（例如"做多ETH"），额外声明 SYMBOLS = ["ETHUSDT"]；
    用户没点名标的就不要声明 SYMBOLS。
+7. **可参数化（可选，仅当用户想做参数寻优 / 稳健性扫描，或明确给出参数候选范围时才用）**：
+   - 把 generate_signals 的签名改成 `generate_signals(df, params=None)`，函数体开头
+     `p = params or {{}}`，所有可调参数用 `p.get("参数名", 默认值)` 读取；
+   - 在模块级声明扫描空间 `PARAM_SPACE = {{"参数名": [候选值, ...], ...}}`
+     （键是字符串、值是【非空】数字列表；系统据此做笛卡尔积逐点回测）；
+   - `params=None`（单次回测）时必须退化到默认值、与未参数化时**完全一致**；
+   - 不需要参数寻优就保持单参签名 `generate_signals(df)`、不要声明 PARAM_SPACE。
+   - 策略必须是**纯函数**：同一输入两次调用结果必须一致——不得用模块级可变状态、
+     `np.random`、时间或任何外部状态（稳健性会对同一策略反复回测，非确定性会让结论漂移）。
 
-契约 v1 推荐结构：
+契约 v1 推荐结构（含可选参数化示意，无需寻优时删掉 params/PARAM_SPACE 两行即可）：
 
 import pandas as pd
 import numpy as np
 
 CONTRACT_VERSION = 1
+# PARAM_SPACE = {{"fast": [5, 10, 20], "slow": [50, 100, 200]}}   # 仅参数寻优时声明
 
 
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
+def generate_signals(df: pd.DataFrame, params=None) -> pd.DataFrame:   # 不寻优时签名写 (df)
     df = df.copy()
+    p = params or {{}}                  # 不寻优时删掉这行
+    # fast = p.get("fast", 10)         # 用 p.get(名, 默认) 读可调参数
 
     # 计算指标
 

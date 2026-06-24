@@ -89,7 +89,7 @@ def load_for_backtest(
 def run_prepared(
     prepared, engine_params=None, *,
     sub_start=None, sub_end=None, min_klines=100,
-    funding_dir=DEFAULT_FUNDING_DIR,
+    funding_dir=DEFAULT_FUNDING_DIR, strategy_params=None,
 ):
     """在已加载数据上跑一次回测。可选 sub_start/sub_end 把窗口切到子区间
     （样本内外 / walk-forward）。engine_params 是引擎构造参数 dict（不含
@@ -124,11 +124,13 @@ def run_prepared(
     engine_kwargs = dict(engine_params, strategy_func=strategy_func)
 
     if route_version == 2:
-        result = PortfolioBacktestCore(**engine_kwargs).run(data, funding_rates=funding_map)
+        result = PortfolioBacktestCore(**engine_kwargs).run(
+            data, funding_rates=funding_map, params=strategy_params)
     else:
         symbol = route_symbols[0]
         v1_funding = funding_map.get(symbol) if funding_map else None
-        result = CodeBacktestCore(**engine_kwargs).run(df, funding_rates=v1_funding)
+        result = CodeBacktestCore(**engine_kwargs).run(
+            df, funding_rates=v1_funding, params=strategy_params)
 
     return {
         "result": result,

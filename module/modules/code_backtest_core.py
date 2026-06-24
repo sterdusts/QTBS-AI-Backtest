@@ -7,6 +7,7 @@ from module.modules.backtest_metrics import (
     calculate_metrics,
     normalize_engine_params,
 )
+from module.Strategy.strategy_loader import call_strategy
 
 
 class CodeBacktestCore:
@@ -61,7 +62,7 @@ class CodeBacktestCore:
         self.enable_liquidation = bool(enable_liquidation)
         self.stop_on_liquidation = bool(stop_on_liquidation)
 
-    def run(self, df: pd.DataFrame, funding_rates=None) -> dict:
+    def run(self, df: pd.DataFrame, funding_rates=None, params=None) -> dict:
         # 浅拷贝即可防策略篡改：pandas 写时复制下任何写入只复制被改的块
         df = df.copy(deep=False)
 
@@ -74,7 +75,9 @@ class CodeBacktestCore:
         input_ohlc = df
 
         try:
-            df = self.strategy_func(df)
+            # 契约 v3：参数化策略 generate_signals(df, params) 传入 params；
+            # 历史无参策略 generate_signals(df) 走兼容分支。params=None ⇒ 用默认 ⇒ 退化
+            df = call_strategy(self.strategy_func, df, params)
         except KeyError as e:
             # v2 策略（按标的名访问数据面板）被错误路由进 v1 时最典型的炸点。
             # 只有缺的键长得像交易对时才提示版本声明，避免把策略自身的
