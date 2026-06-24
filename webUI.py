@@ -33,6 +33,8 @@ from module.modules.data_panel import (
 )
 from module.modules.generic_chart import plot_generic_equity_curves
 from module.modules.portfolio_chart import plot_portfolio_result
+from module.modules.robustness_chart import plot_robustness
+from module.analysis.robustness import run_full_analysis
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -704,6 +706,118 @@ FETCH_TEXTS = {
         "tip_idle": "При запуске локальные инструменты сканируются и обновляются автоматически; при первом запуске загружаются инструменты по умолчанию. Нажмите «Обновить данные» для ручного обновления.",
     },
 }
+
+# 稳健性分析面板文案（六语言）。指标名复用 SUMMARY_TEXTS，这里只放结构性标签。
+ROBUSTNESS_TEXTS = {
+    "zh": {
+        "panel_title": "稳健性分析", "panel_desc": "样本内外切分 · Walk-Forward · 参数热力图",
+        "run_button": "运行稳健性分析", "split_label": "样本内占比 (IS)",
+        "title": "稳健性分析", "io_section": "样本内 / 样本外", "boundary": "切分点",
+        "col_in": "样本内", "col_out": "样本外", "col_ratio": "外/内",
+        "flags_title": "过拟合红线", "no_flags": "未触发过拟合红线",
+        "wfo_section": "Walk-Forward 前推",
+        "wfo_real": "传统 WFO（每窗样本内寻优 → 样本外评估）",
+        "wfo_stability": "固定策略分段样本外稳定性扫描（未声明 PARAM_SPACE）",
+        "wfo_windows": "窗口数", "wfo_valid": "有效窗口", "wfo_pos_ratio": "正收益窗口占比",
+        "wfo_mean_ret": "样本外平均收益%", "wfo_std_ret": "样本外收益波动",
+        "wfo_mean_sharpe": "样本外平均夏普", "wfo_worst_dd": "最差窗口回撤%",
+        "wfo_chosen": "各窗最优参数",
+        "scan_section": "参数热力图", "scan_best": "最优参数格",
+        "chart_note": "可视化见下方 HTML 图表文件",
+        "no_code": "请先生成或填入策略代码。", "fail": "稳健性分析失败",
+        "unavailable": "无法分析",
+    },
+    "en": {
+        "panel_title": "Robustness", "panel_desc": "IS/OOS split · Walk-Forward · Param heatmap",
+        "run_button": "Run Robustness Analysis", "split_label": "In-Sample ratio (IS)",
+        "title": "Robustness Analysis", "io_section": "In-Sample / Out-of-Sample", "boundary": "Split point",
+        "col_in": "IS", "col_out": "OOS", "col_ratio": "OOS/IS",
+        "flags_title": "Overfit red flags", "no_flags": "No overfit red flag triggered",
+        "wfo_section": "Walk-Forward",
+        "wfo_real": "True WFO (optimize on IS → evaluate on OOS each window)",
+        "wfo_stability": "Fixed-strategy segmented OOS stability scan (no PARAM_SPACE)",
+        "wfo_windows": "Windows", "wfo_valid": "Valid windows", "wfo_pos_ratio": "Positive-window ratio",
+        "wfo_mean_ret": "Mean OOS return%", "wfo_std_ret": "OOS return std",
+        "wfo_mean_sharpe": "Mean OOS Sharpe", "wfo_worst_dd": "Worst-window drawdown%",
+        "wfo_chosen": "Chosen params per window",
+        "scan_section": "Parameter heatmap", "scan_best": "Best cell",
+        "chart_note": "See the HTML chart file below for visualization",
+        "no_code": "Please generate or paste strategy code first.", "fail": "Robustness analysis failed",
+        "unavailable": "Cannot analyze",
+    },
+    "ko": {
+        "panel_title": "강건성 분석", "panel_desc": "표본 내/외 분할 · 워크포워드 · 파라미터 히트맵",
+        "run_button": "강건성 분석 실행", "split_label": "표본내 비율 (IS)",
+        "title": "강건성 분석", "io_section": "표본내 / 표본외", "boundary": "분할점",
+        "col_in": "표본내", "col_out": "표본외", "col_ratio": "외/내",
+        "flags_title": "과적합 경고선", "no_flags": "과적합 경고선 없음",
+        "wfo_section": "워크포워드",
+        "wfo_real": "정통 WFO (창마다 표본내 최적화 → 표본외 평가)",
+        "wfo_stability": "고정 전략 구간별 표본외 안정성 스캔 (PARAM_SPACE 없음)",
+        "wfo_windows": "창 수", "wfo_valid": "유효 창", "wfo_pos_ratio": "양(+) 수익 창 비율",
+        "wfo_mean_ret": "표본외 평균수익%", "wfo_std_ret": "표본외 수익 변동",
+        "wfo_mean_sharpe": "표본외 평균 샤프", "wfo_worst_dd": "최악 창 낙폭%",
+        "wfo_chosen": "창별 최적 파라미터",
+        "scan_section": "파라미터 히트맵", "scan_best": "최적 셀",
+        "chart_note": "시각화는 아래 HTML 차트 파일 참조",
+        "no_code": "먼저 전략 코드를 생성하거나 입력하세요.", "fail": "강건성 분석 실패",
+        "unavailable": "분석 불가",
+    },
+    "ja": {
+        "panel_title": "ロバストネス分析", "panel_desc": "イン/アウト分割 · ウォークフォワード · パラメータヒートマップ",
+        "run_button": "ロバストネス分析を実行", "split_label": "インサンプル比率 (IS)",
+        "title": "ロバストネス分析", "io_section": "イン / アウトサンプル", "boundary": "分割点",
+        "col_in": "イン", "col_out": "アウト", "col_ratio": "外/内",
+        "flags_title": "過剰最適化レッドライン", "no_flags": "過剰最適化レッドラインなし",
+        "wfo_section": "ウォークフォワード",
+        "wfo_real": "正統WFO（各窓でイン最適化 → アウト評価）",
+        "wfo_stability": "固定戦略の区間別アウト安定性スキャン（PARAM_SPACE未宣言）",
+        "wfo_windows": "ウィンドウ数", "wfo_valid": "有効ウィンドウ", "wfo_pos_ratio": "プラス収益ウィンドウ比率",
+        "wfo_mean_ret": "アウト平均収益%", "wfo_std_ret": "アウト収益変動",
+        "wfo_mean_sharpe": "アウト平均シャープ", "wfo_worst_dd": "最悪ウィンドウDD%",
+        "wfo_chosen": "各窓の最適パラメータ",
+        "scan_section": "パラメータヒートマップ", "scan_best": "最適セル",
+        "chart_note": "可視化は下のHTMLチャートファイルを参照",
+        "no_code": "先に戦略コードを生成または入力してください。", "fail": "ロバストネス分析に失敗",
+        "unavailable": "分析できません",
+    },
+    "ar": {
+        "panel_title": "تحليل المتانة", "panel_desc": "تقسيم داخل/خارج العينة · Walk-Forward · خريطة حرارية للمعاملات",
+        "run_button": "تشغيل تحليل المتانة", "split_label": "نسبة داخل العينة (IS)",
+        "title": "تحليل المتانة", "io_section": "داخل / خارج العينة", "boundary": "نقطة التقسيم",
+        "col_in": "داخل", "col_out": "خارج", "col_ratio": "خارج/داخل",
+        "flags_title": "خطوط حمراء للإفراط في التحسين", "no_flags": "لم تُفعَّل أي خطوط حمراء",
+        "wfo_section": "Walk-Forward",
+        "wfo_real": "WFO تقليدي (تحسين داخل العينة ← تقييم خارجها لكل نافذة)",
+        "wfo_stability": "مسح استقرار خارج العينة لاستراتيجية ثابتة (لا يوجد PARAM_SPACE)",
+        "wfo_windows": "عدد النوافذ", "wfo_valid": "نوافذ صالحة", "wfo_pos_ratio": "نسبة النوافذ الموجبة",
+        "wfo_mean_ret": "متوسط عائد خارج العينة%", "wfo_std_ret": "تقلب عائد خارج العينة",
+        "wfo_mean_sharpe": "متوسط شارب خارج العينة", "wfo_worst_dd": "أسوأ تراجع نافذة%",
+        "wfo_chosen": "أفضل معاملات لكل نافذة",
+        "scan_section": "خريطة حرارية للمعاملات", "scan_best": "أفضل خلية",
+        "chart_note": "انظر ملف الرسم HTML أدناه للتصور",
+        "no_code": "يرجى توليد أو لصق كود الاستراتيجية أولاً.", "fail": "فشل تحليل المتانة",
+        "unavailable": "تعذّر التحليل",
+    },
+    "ru": {
+        "panel_title": "Устойчивость", "panel_desc": "Разбиение IS/OOS · Walk-Forward · Тепловая карта",
+        "run_button": "Запустить анализ устойчивости", "split_label": "Доля в выборке (IS)",
+        "title": "Анализ устойчивости", "io_section": "В выборке / Вне выборки", "boundary": "Точка разбиения",
+        "col_in": "В выб.", "col_out": "Вне выб.", "col_ratio": "Вне/В",
+        "flags_title": "Красные флаги переобучения", "no_flags": "Красные флаги переобучения не сработали",
+        "wfo_section": "Walk-Forward",
+        "wfo_real": "Классический WFO (оптимизация на IS → оценка на OOS в каждом окне)",
+        "wfo_stability": "Скан стабильности OOS фиксированной стратегии (нет PARAM_SPACE)",
+        "wfo_windows": "Окон", "wfo_valid": "Валидных окон", "wfo_pos_ratio": "Доля прибыльных окон",
+        "wfo_mean_ret": "Средняя доходность OOS%", "wfo_std_ret": "Волатильность доходности OOS",
+        "wfo_mean_sharpe": "Средний Шарп OOS", "wfo_worst_dd": "Худшая просадка окна%",
+        "wfo_chosen": "Лучшие параметры по окнам",
+        "scan_section": "Тепловая карта параметров", "scan_best": "Лучшая ячейка",
+        "chart_note": "Визуализацию см. в HTML-файле графика ниже",
+        "no_code": "Сначала сгенерируйте или вставьте код стратегии.", "fail": "Анализ устойчивости не удался",
+        "unavailable": "Невозможно проанализировать",
+    },
+}
 # =========================================================
 # 基础工具函数
 # =========================================================
@@ -921,6 +1035,10 @@ def get_review_text(lang_code: str) -> dict:
 
 def get_fetch_text(lang_code: str) -> dict:
     return FETCH_TEXTS.get(lang_code, FETCH_TEXTS["zh"])
+
+
+def get_robustness_text(lang_code: str) -> dict:
+    return ROBUSTNESS_TEXTS.get(lang_code, ROBUSTNESS_TEXTS["zh"])
 
 
 def tooltip_html(inner_html: str) -> str:
@@ -1319,6 +1437,11 @@ def update_ui_language(
                 "button_running" if _snap["running"] else "button"
             ]
         ),
+        # 稳健性分析面板随语言切换（4 项，与 outputs 末尾 4 个组件一一对应）
+        gr.update(label=get_robustness_text(lang_code)["panel_title"]),
+        gr.update(label=get_robustness_text(lang_code)["split_label"]),
+        gr.update(value=get_robustness_text(lang_code)["run_button"]),
+        gr.update(label=get_robustness_text(lang_code)["panel_title"]),
     ]
 
 # =========================================================
@@ -1529,6 +1652,173 @@ def run_backtest_from_ui(
 
     except Exception as e:
         return f"{text['backtest_fail_error']}：{str(e)}", None
+
+
+# IS/OOS 对比表展示的指标 → SUMMARY_TEXTS 标签键（指标名复用回测摘要文案，不重复翻译）
+_ROBUSTNESS_METRIC_LABELS = (
+    ("total_return_pct", "total_return"),
+    ("annual_return_pct", "annual_return"),
+    ("max_drawdown_pct", "max_drawdown"),
+    ("sharpe_ratio", "sharpe_ratio"),
+    ("profit_factor", "profit_factor"),
+    ("net_win_rate", "net_win_rate"),
+)
+
+
+def build_robustness_summary(report: dict, lang_code: str, chart_path) -> str:
+    """把 run_full_analysis 报告渲染成纯文本（原始 IS/OOS 对比 + 红线 + WFO 聚合 +
+    最优参数格）。指标名复用 get_summary_text，结构标签用 get_robustness_text。"""
+    rt = get_robustness_text(lang_code)
+    st = get_summary_text(lang_code)
+    na = st["na"]
+
+    if not report.get("available"):
+        return f"{rt['unavailable']}：{report.get('reason', '')}"
+
+    meta = report["meta"]
+    lines = [
+        f"【{rt['title']}】{meta['display_symbol']} · {meta['timeframe']} · "
+        f"{meta['actual_start']} ~ {meta['actual_end']} ({meta['kline_count']})",
+    ]
+
+    # ---- 样本内 / 样本外原始对比 + 红线 ----
+    io = report["in_out"]
+    deg = io.get("degradation", {})
+    lines.append("")
+    lines.append(f"— {rt['io_section']} (IS {io['split_ratio']:.0%}) · {rt['boundary']} {io['boundary_time']} —")
+    if deg.get("available"):
+        header = f"{'':<14}{rt['col_in']:>12}{rt['col_out']:>12}{rt['col_ratio']:>10}"
+        lines.append(header)
+        per = deg["metrics"]
+        for key, label_key in _ROBUSTNESS_METRIC_LABELS:
+            cell = per.get(key, {})
+            label = st.get(label_key, key)
+            iv = format_number(cell.get("in"), 2, na)
+            ov = format_number(cell.get("out"), 2, na)
+            rv = format_number(cell.get("out_over_in"), 2, na)
+            lines.append(f"{label:<14}{iv:>12}{ov:>12}{rv:>10}")
+        flags = deg.get("overfit_flags") or []
+        lines.append("")
+        lines.append(f"{rt['flags_title']}：")
+        if flags:
+            lines.extend(f"  · {f}" for f in flags)
+        else:
+            lines.append(f"  · {rt['no_flags']}")
+    else:
+        lines.append(deg.get("reason", na))
+
+    # ---- Walk-Forward ----
+    wfo = report["walk_forward"]
+    agg = wfo.get("aggregate", {})
+    lines.append("")
+    mode_desc = rt["wfo_real"] if wfo.get("optimized") else rt["wfo_stability"]
+    lines.append(f"— {rt['wfo_section']} · {mode_desc} —")
+    pos_ratio = agg.get("positive_window_ratio")
+    pos_txt = f"{pos_ratio:.0%}" if isinstance(pos_ratio, (int, float)) else na
+    lines.append(f"{rt['wfo_windows']}：{agg.get('total_windows', 0)}   "
+                 f"{rt['wfo_valid']}：{agg.get('valid_windows', 0)}   "
+                 f"{rt['wfo_pos_ratio']}：{pos_txt}")
+    lines.append(f"{rt['wfo_mean_ret']}：{format_number(agg.get('mean_out_return'), 2, na)}   "
+                 f"{rt['wfo_std_ret']}：{format_number(agg.get('std_out_return'), 2, na)}")
+    lines.append(f"{rt['wfo_mean_sharpe']}：{format_number(agg.get('mean_out_sharpe'), 2, na)}   "
+                 f"{rt['wfo_worst_dd']}：{format_number(agg.get('worst_window_drawdown'), 2, na)}")
+    if wfo.get("optimized"):
+        chosen = [f"{w['index']}→{w['train'].get('chosen_params')}" for w in wfo.get("windows", [])]
+        if chosen:
+            lines.append(f"{rt['wfo_chosen']}：" + ", ".join(chosen))
+
+    # ---- 参数热力图最优格 ----
+    scan = report.get("param_scan")
+    if scan:
+        lines.append("")
+        lines.append(f"— {rt['scan_section']} ({scan['metric']}) —")
+        best = _best_scan_cell(scan)
+        if best:
+            lines.append(f"{rt['scan_best']}：{best['params']} → {format_number(best['value'], 4, na)}")
+        lines.append(rt["chart_note"])
+
+    lines.append("")
+    lines.append(f"{st['chart_file']}：")
+    lines.append(str(chart_path) if chart_path else na)
+    return "\n".join(lines)
+
+
+def _best_scan_cell(scan: dict):
+    """扫描矩阵里 metric 最大的格（None 不参选）。无有效格 ⇒ None。"""
+    best = None
+    for cell in scan.get("cells", []):
+        m = (cell.get("metrics") or {}).get(scan["metric"])
+        if not isinstance(m, (int, float)):
+            continue
+        if best is None or m > best["value"]:
+            best = {"params": cell.get("params"), "value": m}
+    return best
+
+
+def run_robustness_from_ui(
+    strategy_code: str,
+    output_language: str,
+    market: str,
+    symbol: str,
+    timeframe: str,
+    start_time,
+    end_time,
+    initial_cash,
+    leverage,
+    position_size_percent,
+    fee_rate_percent,
+    slippage_percent,
+    split_ratio_percent,
+):
+    """稳健性分析入口：与回测共用 parse_common_ui_params + 引擎参数，调 run_full_analysis
+    （加载一次、复跑切窗/换参），渲染六语言文字报告 + pyecharts 一页图。返回 (报告文本, HTML)。"""
+    rt = get_robustness_text(output_language)
+    try:
+        if strategy_code is None or strategy_code.strip() == "":
+            return rt["no_code"], None
+
+        try:
+            start_str, end_str, symbol, (
+                initial_cash_value,
+                leverage_value,
+                effective_leverage_value,
+                position_size_percent_value,
+                fee_rate_percent_value,
+                slippage_percent_value,
+            ) = parse_common_ui_params(
+                output_language, symbol, start_time, end_time,
+                initial_cash, leverage, position_size_percent,
+                fee_rate_percent, slippage_percent,
+            )
+        except Exception as e:
+            return str(e), None
+
+        split_ratio = parse_float_input(split_ratio_percent, 70.0, output_language) / 100
+        split_ratio = min(max(split_ratio, 0.05), 0.95)  # 钳进 (0,1)，防极端切分点报错
+
+        engine_params = dict(
+            initial_cash=initial_cash_value,
+            fee_rate=fee_rate_percent_value / 100,
+            slippage=slippage_percent_value / 100,
+            leverage=effective_leverage_value,
+            position_size=position_size_percent_value / 100,
+        )
+
+        report = run_full_analysis(
+            strategy_code, symbol, timeframe, start_str, end_str,
+            engine_params=engine_params, split_ratio=split_ratio,
+        )
+
+        html_path = plot_robustness(
+            report, output_dir="Past_data",
+            file_prefix=f"{symbol}_{timeframe}_webui_robustness",
+            language=output_language, auto_open=True,
+        )
+        summary = build_robustness_summary(report, output_language, html_path)
+        return summary, html_path
+
+    except Exception as e:
+        return f"{rt['fail']}：{str(e)}", None
 
 
 # =========================================================
@@ -2864,6 +3154,34 @@ with gr.Blocks(
                             elem_id="chart-file-output",
                         )
 
+                with gr.Accordion(
+                    get_robustness_text(default_lang)["panel_title"],
+                    open=False,
+                    elem_id="robustness-panel",
+                ) as robustness_accordion:
+                    gr.Markdown(get_robustness_text(default_lang)["panel_desc"])
+                    with gr.Row(elem_classes=["param-row"]):
+                        robustness_split_input = gr.Number(
+                            label=get_robustness_text(default_lang)["split_label"],
+                            value=70,
+                            minimum=5,
+                            maximum=95,
+                            elem_id="robustness-split",
+                        )
+                        robustness_button = gr.Button(
+                            value=get_robustness_text(default_lang)["run_button"],
+                            elem_id="robustness-button",
+                        )
+                    robustness_result_output = gr.Textbox(
+                        label="",
+                        lines=18,
+                        elem_id="robustness-result",
+                    )
+                    robustness_chart_output = gr.File(
+                        label=get_robustness_text(default_lang)["panel_title"],
+                        elem_id="robustness-chart-file",
+                    )
+
             with gr.Row(elem_id="data-status-bar", equal_height=True):
                 with gr.Column(scale=9, min_width=260, elem_id="fetch-progress-col"):
                     fetch_progress = gr.HTML(
@@ -2911,6 +3229,10 @@ with gr.Blocks(
                     chart_file_output,
                     fetch_progress,
                     fetch_button,
+                    robustness_accordion,
+                    robustness_split_input,
+                    robustness_button,
+                    robustness_chart_output,
                 ],
                 api_name="update_language",
             )
@@ -2976,6 +3298,30 @@ with gr.Blocks(
                     chart_file_output,
                 ],
                 api_name="run_backtest",
+            )
+
+            robustness_button.click(
+                fn=run_robustness_from_ui,
+                inputs=[
+                    strategy_code_output,
+                    language_select,
+                    market_select,
+                    symbol_input,
+                    timeframe_select,
+                    start_date,
+                    end_date,
+                    initial_cash_input,
+                    leverage_input,
+                    position_size_input,
+                    fee_rate_input,
+                    slippage_input,
+                    robustness_split_input,
+                ],
+                outputs=[
+                    robustness_result_output,
+                    robustness_chart_output,
+                ],
+                api_name="run_robustness",
             )
 
             # ---- 数据拉取进度区：Timer 轮询全局状态、手动更新、启动自动更新 ----

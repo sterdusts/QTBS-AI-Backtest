@@ -377,3 +377,77 @@ def _aggregate_walk_forward(windows):
         "mean_out_sharpe": _mean(sharpes),
         "worst_window_drawdown": min(dds) if dds else None,  # 最负=最差
     }
+
+
+def _scan_grid_from_space(param_space):
+    """从策略 PARAM_SPACE 取【前 ≤2 维】构成热力图扫描网格（>2 维只取前两维，
+    其余维不进扫描——webUI 热力图最多二维）。无声明 ⇒ None。"""
+    if not param_space:
+        return None
+    keys = list(param_space.keys())[:2]
+    return {k: param_space[k] for k in keys}
+
+
+def run_full_analysis(
+    strategy_code, ui_symbol, timeframe, start_str, end_str, engine_params=None, *,
+    split_ratio=0.7, train_frac=0.3, test_frac=0.1, anchored=False,
+    scan_metric="sharpe_ratio", optimize_metric="sharpe_ratio",
+    min_window_bars=20, prepared=None,
+    data_dir=DEFAULT_DATA_DIR, funding_dir=DEFAULT_FUNDING_DIR,
+):
+    """一站式稳健性分析编排（webUI 面板用）：加载【一次】数据，复跑样本内外切分 +
+    walk-forward（策略声明 PARAM_SPACE 则自动真 WFO）+ 策略参数热力图扫描（若有
+    PARAM_SPACE）。WFO 训练/测试窗按全窗根数比例派生（train_frac/test_frac）。
+    返回单一 JSON-able 报告 dict（各子分析仍各自 JSON-able）。数据不足以切窗时
+    available=False + reason。"""
+    if prepared is None:
+        prepared = load_for_backtest(strategy_code, ui_symbol, timeframe, start_str, end_str, data_dir=data_dir)
+
+    index = _prepared_index(prepared)
+    n = len(index)
+    # 切两段 IS/OOS 至少各 min_window_bars，WFO 至少容下一段 train+test
+    if n < max(2 * min_window_bars, 4):
+        return {
+            "type": "robustness_report", "contract": ROBUSTNESS_CONTRACT,
+            "available": False,
+            "reason": f"数据根数不足（{n} 根），无法做稳健性切窗分析（至少需 {max(2 * min_window_bars, 4)} 根）",
+            "meta": {"display_symbol": prepared["display_symbol"], "timeframe": timeframe, "kline_count": n},
+        }
+
+    in_out = split_in_out_sample(
+        strategy_code, ui_symbol, timeframe, start_str, end_str,
+        engine_params=engine_params, split_ratio=split_ratio,
+        min_klines=min_window_bars, prepared=prepared, funding_dir=funding_dir)
+
+    train_bars = max(min_window_bars, int(n * train_frac))
+    test_bars = max(min_window_bars, int(n * test_frac))
+    wfo = walk_forward(
+        strategy_code, ui_symbol, timeframe, start_str, end_str,
+        engine_params=engine_params, train_bars=train_bars, test_bars=test_bars,
+        step_bars=test_bars, anchored=anchored, optimize_metric=optimize_metric,
+        min_klines=min_window_bars, prepared=prepared, funding_dir=funding_dir)
+
+    param_space = _param_space_of(strategy_code)
+    scan = None
+    if param_space:
+        scan = scan_strategy_params(
+            strategy_code, ui_symbol, timeframe, start_str, end_str,
+            engine_params=engine_params, param_grid=_scan_grid_from_space(param_space),
+            metric=scan_metric, min_klines=min_window_bars, prepared=prepared, funding_dir=funding_dir)
+
+    return {
+        "type": "robustness_report",
+        "contract": ROBUSTNESS_CONTRACT,
+        "available": True,
+        "in_out": in_out,
+        "walk_forward": wfo,
+        "param_scan": scan,         # None ⇒ 策略未声明 PARAM_SPACE，无热力图
+        "meta": {
+            "display_symbol": prepared["display_symbol"],
+            "timeframe": timeframe,
+            "kline_count": n,
+            "actual_start": str(index[0]),
+            "actual_end": str(index[-1]),
+            "has_param_space": bool(param_space),
+        },
+    }
