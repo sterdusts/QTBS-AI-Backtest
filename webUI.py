@@ -7,6 +7,11 @@ import gradio as gr
 from module.AI.api_config import LANGUAGE_DISPLAY_NAMES, clamp_score
 from module.AI.deepseek_strategy_reviewer import review_strategy_code_with_deepseek
 from module.AI.deepseek_code_generator import generate_strategy_code_with_deepseek
+from module.Strategy.backtest_runner import (
+    InsufficientKlinesError,
+    resolve_strategy_route,
+    run_once,
+)
 from module.Strategy.behavior_check import format_behavior_summary, run_behavior_check
 from module.Strategy.strategy_loader import (
     load_strategy_func_from_code,
@@ -1087,30 +1092,9 @@ def parse_common_ui_params(
     return start_str, end_str, symbol, params
 
 
-def resolve_strategy_route(strategy_code: str, ui_symbol: str):
-    """
-    根据策略代码元数据决定回测路由。
-
-    返回 (contract_version, symbols)：
-    - v2：使用代码中声明的 SYMBOLS（必须存在）
-    - v1：代码点名了标的就用代码的，否则用 UI 选择的标的
-    """
-
-    metadata = parse_strategy_metadata(strategy_code)
-
-    # 版本与 SYMBOLS 组合规则单源在 strategy_loader.validate_strategy_metadata
-    # （与生成侧共用）：未知版本、v2 缺 SYMBOLS/格式不规范、v1 多标的都在此拒绝
-    validate_strategy_metadata(metadata)
-
-    if metadata["contract_version"] == 2:
-        # 共享校验已保证 SYMBOLS 非空、格式规范且无重复，原样使用
-        return 2, list(metadata["symbols"])
-
-    # v1：校验保证 SYMBOLS 至多一个，不存在静默截断
-    if metadata["symbols"]:
-        return 1, [normalize_symbol(metadata["symbols"][0])]
-
-    return 1, [normalize_symbol(ui_symbol)]
+# resolve_strategy_route 已抽到 module/Strategy/backtest_runner.py（无 Gradio，
+# 供 webUI 与稳健性分析层共用），此处经顶部 import 再导出，test_webui_helpers
+# 的 `from webUI import resolve_strategy_route` 不受影响。
 
 
 def build_review_html(review: dict | None, lang_code: str = "zh") -> str:
@@ -1472,64 +1456,36 @@ def run_backtest_from_ui(
         slippage_value = slippage_percent_value / 100
         position_size_value = position_size_percent_value / 100
 
-        # 1. 解析契约元数据决定路由（v1 单标的 / v2 组合），
-        #    校验并从内存加载策略函数（不经过共享文件，并发安全），
-        #    同时把实际参与回测的代码留档到 Past_data/strategy_code/ 便于追溯
-        route_version, route_symbols = resolve_strategy_route(strategy_code, symbol)
-        strategy_func = load_strategy_func_from_code(strategy_code)
+        # 单次回测编排（路由→加载策略→按版本加载数据→funding→选引擎 run）已抽到
+        # backtest_runner.run_once（无 Gradio，与稳健性分析层共用同一内核、杜绝执行
+        # 路径分叉）；出图仍在此（webUI 专属）。代码留档在此调一次（稳健性多次回测不审计）。
         save_strategy_code_audit(strategy_code)
-
-        # 两个引擎共享同一组参数：只在这里定义一次，
-        # 新增参数时不会出现 v1/v2 分支漏改一边的静默分叉
-        engine_kwargs = dict(
-            strategy_func=strategy_func,
-            initial_cash=initial_cash_value,
-            fee_rate=fee_rate_value,
-            slippage=slippage_value,
-            leverage=effective_leverage_value,
-            position_size=position_size_value,
-        )
-
-        # ---- 按版本只加载数据；数据充分性标准共用一份，v1/v2 不会各自漂移 ----
-
-        if route_version == 2:
-            # 日期过滤下沉到 load_aligned_panel 内部、对齐之前执行：
-            # 避免先对全历史做 union 对齐、再把窗口外的行全部丢弃
-            # required_end 缺省派生自 end_date，无需重复传
-            data = load_aligned_panel(
-                route_symbols, timeframe,
-                start_date=start_str, end_date=end_str,
+        try:
+            run = run_once(
+                strategy_code, symbol, timeframe, start_str, end_str,
+                engine_params=dict(
+                    initial_cash=initial_cash_value,
+                    fee_rate=fee_rate_value,
+                    slippage=slippage_value,
+                    leverage=effective_leverage_value,
+                    position_size=position_size_value,
+                ),
             )
-            data_index = next(iter(data.values())).index
-            display_symbol = " + ".join(route_symbols)
-        else:
-            symbol = route_symbols[0]
-            df = load_symbol_kline(symbol, timeframe, required_end=end_str)
-            df = filter_df_by_date(df, start_str, end_str)
-            data_index = df.index
-            display_symbol = symbol
+        except InsufficientKlinesError as e:
+            return text["too_few_klines_error"].format(count=e.kline_count), None
 
-        kline_count = len(data_index)
+        result = run["result"]
+        route_version = run["route_version"]
+        route_symbols = run["route_symbols"]
+        display_symbol = run["display_symbol"]
+        kline_count = run["kline_count"]
+        # 摘要展示实际参与回测的数据范围（本地数据未覆盖请求窗口时不贴长周期标签）
+        actual_start = run["actual_start"]
+        actual_end = run["actual_end"]
 
-        if kline_count < 100:
-            return text["too_few_klines_error"].format(count=kline_count), None
-
-        # 摘要展示实际参与回测的数据范围：本地数据没覆盖到请求窗口时，
-        # 按请求日期展示会给短窗口结果贴上长周期标签（年化/夏普失真）。
-        # 索引已排序，取首尾是 O(1)
-        actual_start = str(data_index[0])
-        actual_end = str(data_index[-1])
-
-        # 资金费率（契约 §10.8）：本地有 funding 历史的标的自动按 per-bar 摊销
-        # 费率参与回测；无本地费率数据时 build_funding_rates 返回 None ⇒ 引擎
-        # 不计 funding，逐根行为与无 funding 完全一致（不改变现有回测结果）。
-        funding_map = build_funding_rates(route_symbols, data_index)
-
-        # ---- 跑引擎、出图：分支体只保留真正不同的部分 ----
+        # ---- 出图：分支体只保留真正不同的部分 ----
 
         if route_version == 2:
-            result = PortfolioBacktestCore(**engine_kwargs).run(data, funding_rates=funding_map)
-
             base_names = "_".join(get_base_asset(s) for s in route_symbols[:4])
             html_path = plot_portfolio_result(
                 result=result,
@@ -1540,10 +1496,7 @@ def run_backtest_from_ui(
                 auto_open=True,
             )
         else:
-            # v1 单标的：从 funding_map 取该标的的 per-bar 费率序列（无则 None）
-            v1_funding = funding_map.get(symbol) if funding_map else None
-            result = CodeBacktestCore(**engine_kwargs).run(df, funding_rates=v1_funding)
-
+            symbol = route_symbols[0]
             html_path = plot_generic_equity_curves(
                 result=result,
                 output_dir="Past_data",
