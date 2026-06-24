@@ -133,18 +133,27 @@ def calculate_metrics(
         end_time = equity_df["time"].iloc[-1]
         duration_days = (end_time - start_time).total_seconds() / 86400
 
-        if duration_days > 0 and initial_cash > 0 and final_equity > 0:
-            try:
-                annual_return_pct = ((final_equity / initial_cash) ** (365.25 / duration_days) - 1) * 100
-            except OverflowError:
-                # 极短窗口 + 高收益时指数爆出 float 上限：这种窗口下
-                # 年化本就没有统计意义，诚实地给 inf 而不是让整个
-                # 回测结果在指标阶段崩溃报废
-                annual_return_pct = float("inf")
+        if duration_days > 0 and initial_cash > 0:
+            if final_equity > 0:
+                try:
+                    annual_return_pct = ((final_equity / initial_cash) ** (365.25 / duration_days) - 1) * 100
+                except OverflowError:
+                    # 极短窗口 + 高收益时指数爆出 float 上限：这种窗口下
+                    # 年化本就没有统计意义，诚实地给 inf 而不是让整个
+                    # 回测结果在指标阶段崩溃报废
+                    annual_return_pct = float("inf")
+            else:
+                # 爆仓归零（final_equity ≤ 0）：年化退化为 -100%（账户已清空，
+                # 任何期限年化仍是 -100%）。不能停在初始化的 0 而与
+                # total_return_pct = -100% 自相矛盾（审查发现 F6）
+                annual_return_pct = -100.0
 
-        if (equity_series <= 0).any():
-            # 权益穿零后 pct_change 以负基数计算，收益序列符号全错，
-            # 夏普会变成错误符号的垃圾值：直接跳过（保持 0）
+        if (equity_series < 0).any():
+            # 权益【穿负】后 pct_change 以负基数计算，收益序列符号全错，
+            # 夏普会变成错误符号的垃圾值：直接跳过（保持 0）。
+            # 注意：强平把权益夹到【恰好 0】是合法的 -100% 收益（有限值），
+            # 不应被跳过——否则爆仓策略夏普报 0 看似"中性"（审查发现 F5）。
+            # 0 作分母产生的 inf/nan 由下行 replace+dropna 清掉。
             returns = pd.Series(dtype=float)
         else:
             returns = equity_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()

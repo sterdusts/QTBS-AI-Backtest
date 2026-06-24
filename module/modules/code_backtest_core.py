@@ -372,8 +372,12 @@ class CodeBacktestCore:
                         "equity_close": float(cash),
                         "equity_at_high": float(mtm["equity_at_high"]),
                         "equity_at_low": float(mtm["equity_at_low"]),
-                        "equity_worst": float(cash),
-                        "equity_best": float(cash),
+                        # 触发成交前持仓在本根真实经历了盘中高低（审查 F2）：worst/best 取
+                        # 「持仓段盘中极值」与「平仓后 cash」的更极端者。否则止盈成交根把
+                        # 进场后的盘中回撤抹成 0，max_drawdown 被系统性低估、风险被掩盖。
+                        # （强平根不同：强平在最不利价成交，cash 即真实最坏，仍保持 cash。）
+                        "equity_worst": float(min(mtm["equity_worst"], cash)),
+                        "equity_best": float(max(mtm["equity_best"], cash)),
                         "price_high": float(high_price),
                         "price_low": float(low_price),
                         "price_close": float(close_price),
@@ -815,6 +819,15 @@ class CodeBacktestCore:
             return None
 
         if position_side == 1:  # 多头
+            # 开盘（首 tick）已越过止盈 ⇒ 止盈在开盘即成交，先于同根盘中【后到】的止损
+            # （审查 F9：跳空高开 open≥tp 时，限价止盈在开盘必成交、还吃到更优的 open；
+            # 不能因同根 low≤stop 而被「保守优先止损」误判成亏损出场）。
+            if has_take and open_price >= take_price:
+                return {
+                    "fill_price": max(take_price, open_price),
+                    "trigger_price": high_price, "trigger_field": "high",
+                    "exit_reason": "take_profit",
+                }
             if has_stop and low_price <= stop_price:
                 # 跌破止损（在下方）；跳空低开越过 → 按更不利的 open 成交
                 return {
@@ -830,6 +843,13 @@ class CodeBacktestCore:
                     "exit_reason": "take_profit",
                 }
         else:  # 空头 position_side == -1（镜像）
+            # 开盘已越过止盈（低开 open≤tp）⇒ 止盈开盘即成交，先于同根盘中后到的止损
+            if has_take and open_price <= take_price:
+                return {
+                    "fill_price": min(take_price, open_price),
+                    "trigger_price": low_price, "trigger_field": "low",
+                    "exit_reason": "take_profit",
+                }
             if has_stop and high_price >= stop_price:
                 return {
                     "fill_price": max(stop_price, open_price),

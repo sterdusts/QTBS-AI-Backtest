@@ -67,9 +67,11 @@ class PortfolioBacktestCore:
 
         # 盘中止损/止盈全局百分比（契约 §10.9，v2.2）：None=关闭（默认）⇒ 逐根行为
         # 与无触发完全一致（bit-level 退化）。每腿触发价由 avg_entry×(1∓pct) 推导。
-        # 逐标的差异化触发价留 v3。负值无意义，截断为 ≥0；0 视为关闭（不触发）。
-        self.stop_loss_pct = max(float(stop_loss_pct), 0.0) if stop_loss_pct else None
-        self.take_profit_pct = max(float(take_profit_pct), 0.0) if take_profit_pct else None
+        # 逐标的差异化触发价留 v3。**仅正值启用**：None / 0 / 负值一律视为关闭。
+        # （审查 F8：旧式 `max(float(x),0.0) if x else None` 对负值因 `if -0.05` 为真
+        # 而截成 0.0 并【启用】入场价处的退化触发——负值必须是 None 而非 0.0。）
+        self.stop_loss_pct = float(stop_loss_pct) if stop_loss_pct and float(stop_loss_pct) > 0 else None
+        self.take_profit_pct = float(take_profit_pct) if take_profit_pct and float(take_profit_pct) > 0 else None
 
         # 参数截断规则单源在 backtest_metrics，与单标的引擎完全一致
         params = normalize_engine_params(
@@ -143,8 +145,15 @@ class PortfolioBacktestCore:
             # 一致；gross_pnl 仍为 raw 价差、不含 funding。funding_cf 默认 0 ⇒
             # 无 funding 时与原公式逐字节一致。
             funding_cf = ep.get("funding_cf", 0.0)
-            pnl = ep["realized_pnl"] - ep["fees"] + funding_cf
+            raw_pnl = ep["realized_pnl"] - ep["fees"] + funding_cf
             entry_equity = ep["entry_equity"]
+
+            # 单笔净亏不超过入场时投入的权益（逐仓保证金 / 账户权益 0 下限语义，与 v1
+            # 一致）：强平跳空 / 清算费 / funding 把名义亏损推到 < -100% 时，单笔 net_pnl
+            # 夹到 -entry_equity。否则 avg_loss / 盈亏比 / profit_factor 被不可能的超额
+            # 亏损污染，且与 v1（:907 max(equity,0) 间接夹 net_pnl）不一致（审查 F3/4/7）。
+            # gross_pnl 不夹——它是 raw 价格口径的纯价差盈亏（含杠杆放大），与 v1 同。
+            pnl = max(raw_pnl, -entry_equity) if entry_equity else raw_pnl
 
             ep["pnl"] = float(pnl)
             ep["net_pnl"] = float(pnl)
@@ -498,24 +507,31 @@ class PortfolioBacktestCore:
                     hit = None  # (fill_price, exit_reason, trigger_price, trigger_field)
 
                     if q > 0:  # 多头：止损在下方(adverse=low)、止盈在上方(favorable=high)
-                        if self.stop_loss_pct is not None:
+                        tp = entry * (1.0 + self.take_profit_pct) if self.take_profit_pct is not None else None
+                        # 开盘高开越过止盈 ⇒ 止盈开盘即成交（首 tick），先于同根盘中后到的
+                        # 止损（审查 F9）。开盘越过按更优的 open 成交。
+                        if tp is not None and not math.isnan(open_v) and open_v >= tp:
+                            hit = (max(tp, open_v), "take_profit", favorable, "high")
+                        if hit is None and self.stop_loss_pct is not None:
                             sp = entry * (1.0 - self.stop_loss_pct)
                             if adverse <= sp:
                                 fill = sp if math.isnan(open_v) else min(sp, open_v)
                                 hit = (fill, "stop_loss", adverse, "low")
-                        if hit is None and self.take_profit_pct is not None:
-                            tp = entry * (1.0 + self.take_profit_pct)
+                        if hit is None and tp is not None:
                             if favorable >= tp:
                                 fill = tp if math.isnan(open_v) else max(tp, open_v)
                                 hit = (fill, "take_profit", favorable, "high")
                     else:  # 空头：止损在上方(adverse=high)、止盈在下方(favorable=low)
-                        if self.stop_loss_pct is not None:
+                        tp = entry * (1.0 - self.take_profit_pct) if self.take_profit_pct is not None else None
+                        # 开盘低开越过止盈 ⇒ 止盈开盘即成交，先于同根盘中后到的止损
+                        if tp is not None and not math.isnan(open_v) and open_v <= tp:
+                            hit = (min(tp, open_v), "take_profit", favorable, "low")
+                        if hit is None and self.stop_loss_pct is not None:
                             sp = entry * (1.0 + self.stop_loss_pct)
                             if adverse >= sp:
                                 fill = sp if math.isnan(open_v) else max(sp, open_v)
                                 hit = (fill, "stop_loss", adverse, "high")
-                        if hit is None and self.take_profit_pct is not None:
-                            tp = entry * (1.0 - self.take_profit_pct)
+                        if hit is None and tp is not None:
                             if favorable <= tp:
                                 fill = tp if math.isnan(open_v) else min(tp, open_v)
                                 hit = (fill, "take_profit", favorable, "low")
@@ -542,12 +558,16 @@ class PortfolioBacktestCore:
                     finish_episode(s, ts, fill_price, exit_reason)
                     stop_triggered = True
 
-                # 平掉部分腿后 cash/持仓已变：重算 mtm 使本根权益记录反映平仓后状态
+                # 平掉部分腿后 cash/持仓已变：重算 mtm 使本根权益记录反映平仓后状态。
+                # 但 worst/best 取「平仓前全腿在场盘中极值」与「平仓后极值」的更极端者
+                # （审查 F2）：被止盈平掉的腿在本根真实经历过盘中回撤，若只用平仓后极值
+                # 会把它抹掉、max_drawdown 低估。close 仍用平仓后值（反映真实持仓）。
                 if stop_triggered:
+                    pre_worst, pre_best = equity_worst, equity_best
                     mtm = compute_mtm(i)
                     equity_close = mtm["equity_close"]
-                    equity_worst = mtm["equity_worst"]
-                    equity_best = mtm["equity_best"]
+                    equity_worst = min(pre_worst, mtm["equity_worst"])
+                    equity_best = max(pre_best, mtm["equity_best"])
 
             # ---------- 正常权益记录 ----------
 

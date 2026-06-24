@@ -157,6 +157,15 @@ def generate_signals(df, params=None):
 - 权益曲线覆盖**每一根** K 线（含首根与末根）
 - 每根记录 close / high / low 三个标记价下的权益及盘中最大偏离权益（插针可见）
 - 最后一根 K 线只做权益结算与强平检测，不执行交易（无下一根开盘价）
+- **回撤口径**：峰值取盘中最有利权益累计、谷底取盘中最不利权益（对账户最严苛）。
+  止损/止盈成交根**保留持仓段真实盘中极值**（取 `min(盘中worst, 平仓后cash)` /
+  `max(盘中best, 平仓后cash)`），与普通持仓根同口径——否则止盈成交根把进场后的盘中
+  回撤抹成 0、`max_drawdown` 被系统性低估（审查 F2）。强平根不同：在最不利价成交，
+  结算后 cash 即真实最坏，仍落 cash（不报不可能回撤）
+- **爆仓归零的指标**（审查 F5/F6）：权益夹到**恰好 0** 是合法的 −100% 收益（有限值）。
+  夏普按含该 −100% 收益的真实序列计算 ⇒ 强负值（不再被「权益 ≤ 0 跳过」误清成 0 看似
+  中性）；年化收益归零退化为 **−100%**（不再停在 0 而与 `total_return = −100%` 自相
+  矛盾）。仅当权益**穿负**（< 0，正常路径不可达）才跳过夏普（负基数翻转符号）
 
 ### 5.5 末尾持仓虚拟结算
 
@@ -171,8 +180,8 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 - **方向语义**：多头止损 `low ≤ stop`、止盈 `high ≥ tp`；空头止损 `high ≥ stop`、止盈 `low ≤ tp`
 - **跳空越过按本根 open 成交**（不加滑点）：止损在不利方向触发，跳空把成交价推向更不利的 open（`min(stop,open)` 多 / `max(stop,open)` 空，与强平 §5.3 同规则）；止盈在有利方向触发，跳空把成交价推向更有利的 open（`max(tp,open)` 多 / `min(tp,open)` 空，与限价单实际成交一致）
 - **触发 = 全平**该仓，`exit_reason ∈ {stop_loss, take_profit}`；触发后本根不再对账，下一根目标仍非零则自然重入（复用 §5.3）
-- **定序**：funding → MTM → **强平**（优先）→ **止损/止盈**（仅强平未触发时）→ 正常权益；同根止损与止盈同时触及时**保守优先止损**
-- **默认关闭**：策略不给触发价 ⇒ 逐根行为与无触发完全一致（bit-level，§10.7 不变量 6）
+- **定序**：funding → MTM → **强平**（优先）→ **止损/止盈**（仅强平未触发时）→ 正常权益；同根止损与止盈同时触及时**保守优先止损**。**但开盘（首 tick）已越过止盈**（多 `open ≥ tp` / 空 `open ≤ tp`）⇒ **止盈在开盘即成交、优先于同根盘中后到的止损**（限价止盈在开盘必成交，不应被更低的盘中 low 误判成亏损出场；审查 F9）
+- **默认关闭**：策略不给触发价 ⇒ 逐根行为与无触发完全一致（bit-level，§10.7 不变量 6）。v2 全局 `stop_loss_pct`/`take_profit_pct` **仅正值启用**：None / 0 / **负值**一律视为关闭（审查 F8：负值不得截成 0.0 而启用入场价处的退化触发）
 
 ## 6. 安全边界（加载器强制执行）
 
@@ -362,10 +371,20 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
 
 ### 10.7 不变量（金样例锁定）
 
-1. 单资产、全仓、离散权重场景：v2 与 v1 引擎逐根权益曲线、交易盈亏完全一致
-   （含 `slippage > 0` 与持仓到结束 end_of_data 的场景）
-2. 强平场景：v2 的 α 插值与 v1 强平价公式给出相同数字（含 `maintenance_margin_rate > 0`）
-3. `gross_pnl` 两引擎同口径：实际持仓 × raw 价差（不含滑点与手续费）
+1. 单资产、全仓、离散权重【**做多**】场景：v2 与 v1 引擎逐根权益曲线、交易盈亏
+   完全一致（含 `slippage > 0` 与持仓到结束 end_of_data 的场景）。
+   **做空例外（审查 F1/F10 校正）**：杠杆 1 的多仓天然自平衡（`current_w` 恒等于
+   目标权重 ⇒ 不触发再平衡），而**做空仓位**（以及杠杆 > 1 的多仓）随价格漂移——
+   做空时权益与名义敞口反向变动，`current_w = qty×close/(权益×杠杆)` 偏离目标 ⇒ v2
+   按 §10.2「**持续维持目标敞口**」再平衡，与 v1 的**恒定数量**做空**有意不同**（与
+   不变量 4 同源的连续再平衡语义，非缺陷）。故 v1≡v2 等价**仅对多仓成立**；单资产
+   做空/离散策略路由本就走 v1（恒定数量、口径最透明）。组合对冲/配对的做空腿走 v2
+   的连续再平衡口径（可用更大 `rebalance_threshold` 抑制换手）
+2. 强平场景：v2 的 α 插值与 v1 强平价公式给出相同数字（含 `maintenance_margin_rate > 0`）；
+   两引擎均把**账户权益夹到 ≥ 0**、**单笔 `net_pnl` 夹到 ≥ −入场权益**（逐仓保证金语义，
+   审查 F3/F4/F7：v2 原先 `net_pnl` 未夹会报 < −100% 的亏损污染 avg_loss/盈亏比/PF）
+3. `gross_pnl` 两引擎同口径：实际持仓 × raw 价差（不含滑点与手续费）；**gross 不夹**
+   −100%（含杠杆放大的纯价差，可 < −入场权益），只有 `net_pnl` 夹
 4. `position_size < 1` 时两引擎语义**有意不同**（v1 一次性比例 / v2 持续再平衡），
    由说明性测试钉死，见 10.2 推论
 5. 资金费率 funding（§10.8）：`funding_rates=None`（或全零）时引擎逐根行为与无
@@ -440,3 +459,4 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
 | 2026-06-14 | v2.2 | 盘中触发价 Stage B：v2 引擎构造级全局 `stop_loss_pct`/`take_profit_pct`（默认 None=关闭、负值截 0、0 视关闭），主循环强平之后逐腿检测（按 avg_entry×(1∓pct) 推触发价、leg_extremes 判触及、跳空复用强平几何、不加滑点扣正常 fee），命中腿单独平仓+finish_episode(exit_reason)+record_fill，平腿后重算本根 MTM；其余腿继续、下根可重入（v1/v2 重入时点略不对称、非硬不变量）。AI prompt（deepseek_code_generator v1）放宽「不加止损止盈」为「用户明确要求时输出 stop_loss_price/take_profit_price 列、逐根重报支持 trailing」。契约 §10.9/§9/§8 v2 改「已实现」。`tests/test_intrabar_trigger.py` 增 6 条 v2 金样例（共 18），296 tests green。webUI v2 pct 旋钮为可选 UI 后续 |
 | 2026-06-14 | v2.1 | 第九轮审查加固：exec 沙箱 AST 新增拒绝 pandas/numpy 文件/网络 I/O 方法（read_csv/read_pickle/to_csv/np.savetxt 等，封堵任意文件读写/反序列化 RCE/SSRF，§6 记录边界）；funding 回测窗口超本地覆盖时尾部退化为 0（不再无限前向外推末费率，与首段对称）；funding 单根 index 摊销因子兜底为一个结算周期（不再静默清零）；损坏 funding CSV 降级为不计 funding（不中断回测）；load_funding_series 对 tz-aware/重复时间戳 index 防御；funding_records_to_df schema 漂移退化空表；webUI 回测摘要展示 metrics.total_funding_cost（六语言）。studio 重构遗留的两处前端清理（死 header 文案、区块标题/侧栏未随语言切换）为纯 UI 维护项，留用户在其 studio 代码中处置；funding 自动补拉为产品决策，本轮以文档声明被动读取语义。267+ tests green |
 | 2026-06-24 | v3 | 策略可参数化（为稳健性参数扫描解锁）：`generate_signals` 可选第二形参 `params: dict\|None`（按 `inspect.signature` 元数捕获分发——`call_strategy` 单一调用点，1 参历史策略零行为变化、2 参策略收 params）+ 模块级 `PARAM_SPACE` 静态扫描空间声明（加载器 AST 解析、不执行策略、`{str标识符:[数字,...]}` 非空校验，违规解析期报错）；两引擎 `run(..., params=None)` 透传，`params=None` ⇒ bit-level 退化（webUI/历史路径逐位不变）；策略内部参数不可运行时注入（沙箱封死 `__globals__`/`__code__`/`eval`/`exec`），必须经形参显式传入；`behavior_check` 新增两次调用一致性探针（`deterministic` 事实，捕模块级状态/`np.random` 等非确定性，稳健性反复回测下会漂移）；§1.1 + §10.1 + 纯函数硬约束强化 + `tests/test_strategy_params.py` 7 条金样例。CONTRACT_VERSION 不变（v1=1 / v2=2，v3 是两版本共同的可选能力）。317 tests green。**配套基础设施（已提交）：backtest_runner 无 Gradio 编排内核（webUI 与稳健性共用单内核）+ module/analysis/robustness.py 样本内外/walk-forward/引擎参数扫描纯库层** |
+| 2026-06-24 | v3 | 差分验证（独立 clean-room 引擎重写 + 真实 BTC 数据逐根比对）+ 全仓审查修复 9 条边缘缺陷：核心执行经独立重写到机器精度互验（数据层/fill-timing/v2 多资产零确认发现）。修复（均不影响常规「杠杆1/做多/无止损/未爆仓」回测，仅纠正边缘场景）——**F5/F6**：爆仓归零时夏普不再被「权益≤0 跳过」误清成 0（改为 `<0` 才跳过，恰好 0 是合法 −100% 收益 ⇒ 强负夏普）、年化退化为 −100%（不再与 total_return 自相矛盾），§5.4；**F3/F4/F7**：v2 单笔 `net_pnl` 夹到 ≥ −入场权益（逐仓保证金，与 v1 一致），修强平跳空/清算费/funding 把单笔亏损推到 < −100% 污染 avg_loss/盈亏比/profit_factor，gross 不夹，§10.7 不变量 2/3；**F2**：止损/止盈成交根保留持仓段真实盘中 worst/best（`min/max` 与平仓后 cash），修 max_drawdown 被抹成 0（两引擎），§5.4；**F9**：开盘跳空越过止盈时止盈优先于同根盘中后到的止损（两引擎），§5.6；**F8**：v2 `stop_loss_pct`/`take_profit_pct` 负值视为关闭（None）而非截成 0.0 启用退化触发，§5.6；**F1/F10**：v2 做空连续再平衡是 §10.2「持续维持敞口」的正确行为（非缺陷）——校正 §10.7 不变量 1 为「v1≡v2 仅对多仓成立、做空例外」，明确长短不对称。`tests/test_audit_fixes.py` 8 条金样例；335 tests green。验证脚手架 `validation/`（oracle + 差分 + 复现）不提交 |
