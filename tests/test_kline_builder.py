@@ -26,6 +26,24 @@ def make_1m_df(start, periods):
 # 重采样聚合正确性
 # =========================================================
 
+def test_1d_aggregation_does_not_raise_on_day_offset():
+    """回归：pandas 4 下 to_offset("1D") 是日历偏移 Day，旧代码 pd.Timedelta(Day)
+    抛 'Value must be ... not Day' ⇒ 日线回测在数据加载即崩溃（分钟/小时正常）。
+    完整 2 天 1m 必须聚合成 2 根完整日线，且各 1440 根的完整性校验通过。"""
+    builder = KlineBuilder(make_1m_df("2024-01-01 00:00", 2880))  # 2 整天
+    df_1d = builder.build("1D")
+    assert len(df_1d) == 2
+    assert df_1d["close_time"].iloc[0] == pd.Timestamp("2024-01-02 00:00")
+    assert df_1d["close_time"].iloc[1] == pd.Timestamp("2024-01-03 00:00")
+
+
+def test_1d_incomplete_day_dropped():
+    """日线完整性校验同样按 1440 根计：缺分钟的当天不应伪装成完整日线。"""
+    builder = KlineBuilder(make_1m_df("2024-01-01 00:00", 1440 + 720))  # 1 整天 + 半天
+    assert len(builder.build("1D", drop_incomplete=True)) == 1     # 半天那根被删
+    assert len(builder.build("1D", drop_incomplete=False)) == 2    # 显式保留尾 bar
+
+
 def test_4h_aggregation():
     # 00:00 - 07:59，整 8 小时 = 两根完整 4h K线
     builder = KlineBuilder(make_1m_df("2024-01-01 00:00", 480))

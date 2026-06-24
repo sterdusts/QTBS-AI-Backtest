@@ -149,7 +149,11 @@ class KlineBuilder:
         # 高周期 K 线必须由完整数量的 1m bar 构成。内部缺分钟却仍聚合为
         # “完整 4h/1d”会隐藏数据洞，并扭曲 high/low、指标与成交信号。
         offset = pd.tseries.frequencies.to_offset(interval)
-        interval_delta = pd.Timedelta(offset)
+        # 注意：pandas 4 下 to_offset("1D") 是【日历】偏移 Day（一天因 DST 可能非 24h），
+        # pd.Timedelta(Day偏移对象) 直接抛 "not Day"；而 min/h 是定长 Tick 可转。本项目
+        # 周期均为 UTC 定长（crypto 24/7、索引 tz-naive 无 DST），用字符串解析把 "1D"
+        # 当固定 24h（=1440 根 1m）。offset 仍保留给下方 close_time = index + offset。
+        interval_delta = pd.Timedelta(interval)
         expected_count = int(interval_delta / pd.Timedelta(minutes=1))
         counts = df["close"].resample(
             interval, label="left", closed="left"
