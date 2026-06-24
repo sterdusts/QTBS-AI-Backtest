@@ -40,6 +40,13 @@ class InsufficientKlinesError(ValueError):
         super().__init__(f"K 线根数不足：{kline_count} < {min_klines}")
 
 
+def infer_price_market(data_dir: str) -> str:
+    """Infer whether local prices are spot or perpetual-futures data."""
+
+    name = str(data_dir).replace("\\", "/").rstrip("/").split("/")[-1].lower()
+    return "perpetual" if ("futures" in name or "perpetual" in name) else "spot"
+
+
 def resolve_strategy_route(strategy_code: str, ui_symbol: str):
     """根据策略代码元数据决定回测路由，返回 (contract_version, symbols)：
     - v2：使用代码中声明的 SYMBOLS（共享校验已保证非空、格式规范、无重复）
@@ -58,11 +65,14 @@ def resolve_strategy_route(strategy_code: str, ui_symbol: str):
 
 def load_for_backtest(
     strategy_code, ui_symbol, timeframe, start_str, end_str,
-    data_dir=DEFAULT_DATA_DIR,
+    data_dir=DEFAULT_DATA_DIR, price_market=None,
 ):
     """加载一次：路由 + 按版本加载（并日期过滤到请求窗口）数据。返回 prepared
     dict 供 run_prepared 复用（数据只打数据层一次，切窗/换参不重复加载）。"""
     route_version, route_symbols = resolve_strategy_route(strategy_code, ui_symbol)
+    price_market = price_market or infer_price_market(data_dir)
+    if price_market not in ("spot", "perpetual"):
+        raise ValueError("price_market 只能是 'spot' 或 'perpetual'")
 
     if route_version == 2:
         data = load_aligned_panel(
@@ -74,6 +84,7 @@ def load_for_backtest(
             "strategy_code": strategy_code, "timeframe": timeframe,
             "data": data, "df": None,
             "display_symbol": " + ".join(route_symbols),
+            "price_market": price_market,
         }
 
     symbol = route_symbols[0]
@@ -83,6 +94,7 @@ def load_for_backtest(
         "route_version": 1, "route_symbols": route_symbols,
         "strategy_code": strategy_code, "timeframe": timeframe,
         "data": None, "df": df, "display_symbol": symbol,
+        "price_market": price_market,
     }
 
 
@@ -120,7 +132,14 @@ def run_prepared(
         raise InsufficientKlinesError(kline_count, min_klines)
 
     strategy_func = load_strategy_func_from_code(prepared["strategy_code"])
-    funding_map = build_funding_rates(route_symbols, data_index, funding_dir=funding_dir)
+    # 真实 funding 只属于永续合约。默认 UI 数据目录是现货 K 线；
+    # 把永续费率自动叠加到现货价格会构造一个不存在的混合市场。
+    price_market = prepared.get("price_market", "spot")
+    funding_map = (
+        build_funding_rates(route_symbols, data_index, funding_dir=funding_dir)
+        if price_market == "perpetual"
+        else None
+    )
     engine_kwargs = dict(engine_params, strategy_func=strategy_func)
 
     if route_version == 2:
@@ -132,6 +151,9 @@ def run_prepared(
         result = CodeBacktestCore(**engine_kwargs).run(
             df, funding_rates=v1_funding, params=strategy_params)
 
+    result["metrics"]["price_market"] = price_market
+    result["metrics"]["funding_enabled"] = funding_map is not None
+
     return {
         "result": result,
         "route_version": route_version,
@@ -141,16 +163,19 @@ def run_prepared(
         "kline_count": kline_count,
         "actual_start": str(data_index[0]),
         "actual_end": str(data_index[-1]),
+        "price_market": price_market,
     }
 
 
 def run_once(
     strategy_code, ui_symbol, timeframe, start_str, end_str, engine_params=None, *,
     min_klines=100, data_dir=DEFAULT_DATA_DIR, funding_dir=DEFAULT_FUNDING_DIR,
+    price_market=None,
 ):
     """单次回测便捷入口 = load_for_backtest + run_prepared（全窗）。webUI 用它替代
     内联编排，保证「单次回测」与「稳健性多次回测」走同一内核、永不分叉。"""
     prepared = load_for_backtest(
-        strategy_code, ui_symbol, timeframe, start_str, end_str, data_dir=data_dir,
+        strategy_code, ui_symbol, timeframe, start_str, end_str,
+        data_dir=data_dir, price_market=price_market,
     )
     return run_prepared(prepared, engine_params, min_klines=min_klines, funding_dir=funding_dir)

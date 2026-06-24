@@ -7,6 +7,7 @@ from module.modules.backtest_metrics import (
     calculate_metrics,
     normalize_engine_params,
 )
+from module.modules.market_data_validation import validate_backtest_frame
 from module.Strategy.strategy_loader import call_strategy
 
 
@@ -63,21 +64,25 @@ class CodeBacktestCore:
         self.stop_on_liquidation = bool(stop_on_liquidation)
 
     def run(self, df: pd.DataFrame, funding_rates=None, params=None) -> dict:
-        # 浅拷贝即可防策略篡改：pandas 写时复制下任何写入只复制被改的块
-        df = df.copy(deep=False)
+        validate_backtest_frame(df, label="回测 K 线")
+
+        # 行情账本与策略输入必须是两个不同的 DataFrame 对象。仅保存
+        # `input_ohlc = df` 后把同一个 df 交给策略，策略原地改写 OHLC 时
+        # input_ohlc 也会同步变化，导致策略可以篡改自己的成交价。
+        input_ohlc = df.copy(deep=False)
+        strategy_input = input_ohlc.copy(deep=False)
 
         # 回测窗口的唯一事实源是【输入】索引：策略对帧做 dropna / 缩短行
         # 后，引擎必须按输入索引重对齐，否则会在更短窗口静默跑完，
         # equity_curve 只覆盖剩余根数，且与 webUI 取自完整输入索引的
         # kline_count / 起止时间静默错配（详见下方 reindex 重对齐块）。
         # 行情列从输入帧取（真实市场数据），不依赖策略返回帧里的副本。
-        input_index = df.index
-        input_ohlc = df
+        input_index = input_ohlc.index
 
         try:
             # 契约 v3：参数化策略 generate_signals(df, params) 传入 params；
             # 历史无参策略 generate_signals(df) 走兼容分支。params=None ⇒ 用默认 ⇒ 退化
-            df = call_strategy(self.strategy_func, df, params)
+            df = call_strategy(self.strategy_func, strategy_input, params)
         except KeyError as e:
             # v2 策略（按标的名访问数据面板）被错误路由进 v1 时最典型的炸点。
             # 只有缺的键长得像交易对时才提示版本声明，避免把策略自身的
@@ -93,6 +98,13 @@ class CodeBacktestCore:
                 f"策略代码访问了不存在的键/列（KeyError: {e}），"
                 "请检查策略引用的列名或字典键是否存在。"
             ) from e
+
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("策略函数必须返回 pandas DataFrame")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("策略返回帧的 index 必须是 DatetimeIndex")
+        if not df.index.is_unique:
+            raise ValueError("策略返回帧的时间索引存在重复")
 
         if "target_position" not in df.columns:
             raise ValueError("策略函数必须生成 target_position 字段")
@@ -110,37 +122,20 @@ class CodeBacktestCore:
         _strat_stop = df["stop_loss_price"] if "stop_loss_price" in df.columns else None
         _strat_take = df["take_profit_price"] if "take_profit_price" in df.columns else None
 
-        # 策略返回帧重对齐回【输入】索引（与 v2 §10.2 / portfolio 引擎
-        # 的 weights.reindex(index).ffill().fillna(0) 对齐）。
-        # 策略 dropna 等副作用返回更短帧时，若直接遍历策略自身索引会让
-        # 回测窗口被静默截断；这里强制把窗口钉回完整输入区间。
-        #
-        # 关键：策略返回与输入【等长且同序】帧时（金样例的全部情形），
-        # df.index.equals(input_index) 为真，整块跳过 —— happy path 逐根
-        # 行为完全不变（单资产 v1≡v2、强平 α 退化、end_of_data、
-        # slippage>0 等金样例不受任何影响）。
-        if not df.index.equals(input_index):
-            # 索引与输入完全不重叠（reset_index / 时间整体偏移等）会让下面的
-            # ffill 无源、target 全部回退 0，静默产出一份「0 笔交易」的正常
-            # 报告——这类错误必须报出来而不是吞掉（与 v2 _prepare_weights 一致）
-            if df.index.intersection(input_index).empty:
-                raise ValueError(
-                    "策略返回帧的索引与输入 K 线索引完全不重叠，无法重对齐。"
-                    "策略应保留输入的时间索引（v1 推荐返回 df 本身并新增 "
-                    "target_position 列），不要 reset_index 或整体平移时间轴。"
-                )
+        strategy_index = df.index
+        if strategy_index.intersection(input_index).empty:
+            raise ValueError(
+                "策略返回帧的索引与输入 K 线索引完全不重叠，无法重对齐。"
+                "策略应保留输入的时间索引（v1 推荐返回 df 本身并新增 "
+                "target_position 列），不要 reset_index 或整体平移时间轴。"
+            )
 
-            # target_position 缺行视为「延续上一行」（ffill），与契约 §3 推荐
-            # 口径及 v2 §10.2 一致；首段无前值时兜底为 0（空仓）。
-            # 先按【输入】索引 reindex（缺行置 NaN），再在输入时间序上 ffill，
-            # 与 v2 的 weights.reindex(index).ffill().fillna(0) 完全同序。
-            target = df["target_position"].reindex(input_index).ffill().fillna(0)
-
-            # 行情列从【输入帧】恢复（真实市场数据），不 ffill 造假、也不信任
-            # 策略返回帧里可能被改写/缺失的副本。这样策略 dropna 缩短行情行
-            # 时回测窗口仍是完整输入区间，且行情值就是引擎自己的输入。
-            df = input_ohlc.copy(deep=False)
-            df["target_position"] = target
+        # 无论策略是否保留原索引，成交与图表使用的 OHLC 都只取可信输入。
+        # 策略返回帧仅提供目标仓位与可选触发价，不能覆盖市场事实。
+        target = df["target_position"].reindex(input_index).ffill().fillna(0)
+        trusted_df = input_ohlc.copy(deep=False)
+        trusted_df["target_position"] = target
+        df = trusted_df
 
         # 合法值校验必须在整数转换之前：astype(int) 会把 0.5 向零截断成
         # 合法的 0、把 inf 炸成晦涩的 pandas 转换错误，校验就形同虚设
@@ -171,6 +166,15 @@ class CodeBacktestCore:
             pd.to_numeric(_strat_take.reindex(input_index), errors="coerce").to_numpy(dtype=float)
             if _strat_take is not None else None
         )
+        for name, arr in (
+            ("stop_loss_price", stop_arr),
+            ("take_profit_price", take_arr),
+        ):
+            if arr is None:
+                continue
+            invalid = (~np.isnan(arr)) & ((~np.isfinite(arr)) | (arr <= 0))
+            if invalid.any():
+                raise ValueError(f"{name} 只能是正的有限价格或 NaN")
 
         cash = self.initial_cash
 
@@ -400,6 +404,28 @@ class CodeBacktestCore:
                     entry_notional = None
                     entry_open_fee = None
                     position_funding_cf = 0.0
+
+                    # 本根收盘时策略目标已经可知；触发平仓后若目标仍非零，
+                    # 应在下一根开盘重入。旧逻辑直接 continue，直到下一根
+                    # 收盘才再次对账，实际拖到“下下根”开盘，且与 v2 不一致。
+                    if i + 1 < len(df) and current_target != 0:
+                        open_result = self._open_position(
+                            cash=cash,
+                            side=current_target,
+                            raw_price=float(df["open"].iloc[i + 1]),
+                            execute_time=df.index[i + 1],
+                        )
+                        if open_result is not None:
+                            cash = open_result["cash_after"]
+                            position = open_result["position"]
+                            position_side = current_target
+                            entry_price = open_result["entry_price"]
+                            entry_raw_price = open_result["entry_raw_price"]
+                            entry_time = open_result["entry_time"]
+                            entry_equity = open_result["entry_equity"]
+                            entry_margin = open_result["entry_margin"]
+                            entry_notional = open_result["entry_notional"]
+                            entry_open_fee = open_result["entry_open_fee"]
 
                     continue
 

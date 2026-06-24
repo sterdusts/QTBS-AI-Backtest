@@ -9,6 +9,8 @@ trades 对组合引擎而言是「持仓片段」（episode：从建仓到完全
 对单资产引擎而言就是逐笔交易，两者结构兼容。
 """
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -28,19 +30,45 @@ def normalize_engine_params(
     属性、看起来"参数一致"，分叉极难被发现。
     """
 
-    lev = int(leverage)
+    def finite_float(name, value):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} 必须是有限数值") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{name} 必须是有限数值")
+        return parsed
+
+    initial = finite_float("initial_cash", initial_cash)
+    fee = finite_float("fee_rate", fee_rate)
+    slip = finite_float("slippage", slippage)
+    pos = finite_float("position_size", position_size)
+    maintenance = finite_float("maintenance_margin_rate", maintenance_margin_rate)
+    liquidation_fee = finite_float("liquidation_fee_rate", liquidation_fee_rate)
+    lev_raw = finite_float("leverage", leverage)
+    if not lev_raw.is_integer():
+        raise ValueError("leverage 必须是整数")
+
+    if initial <= 0:
+        raise ValueError("initial_cash 必须大于 0")
+    if fee < 0 or fee >= 1:
+        raise ValueError("fee_rate 必须在 [0, 1) 之间")
+    if slip < 0 or slip >= 1:
+        raise ValueError("slippage 必须在 [0, 1) 之间")
+
+    lev = int(lev_raw)
     if lev <= 0:
         lev = 1
 
     return {
-        "initial_cash": float(initial_cash),
-        "fee_rate": float(fee_rate),
-        "slippage": float(slippage),
+        "initial_cash": initial,
+        "fee_rate": fee,
+        "slippage": slip,
         "leverage": lev,
-        "position_size": min(max(float(position_size), 0.0), 1.0),
+        "position_size": min(max(pos, 0.0), 1.0),
         # rate ≥ 1 没有意义（开仓即触维持线）且会让强平价公式除零
-        "maintenance_margin_rate": min(max(float(maintenance_margin_rate), 0.0), 0.99),
-        "liquidation_fee_rate": max(float(liquidation_fee_rate), 0.0),
+        "maintenance_margin_rate": min(max(maintenance, 0.0), 0.99),
+        "liquidation_fee_rate": max(liquidation_fee, 0.0),
     }
 
 

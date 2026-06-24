@@ -143,6 +143,26 @@ def test_exact_boundary_bar_kept():
     assert df_4h["close"].iloc[0] == pytest.approx(339.0)
 
 
+def test_internal_partial_bar_dropped():
+    raw = make_1m_df("2024-01-01 00:00", 480)
+    # 第一根 4h 中间缺一分钟；第二根完整。
+    raw = raw[raw["open_time"] != pd.Timestamp("2024-01-01 02:00")]
+    builder = KlineBuilder(raw)
+
+    df_4h = builder.build("4h", drop_incomplete=False)
+
+    assert list(df_4h.index) == [pd.Timestamp("2024-01-01 04:00")]
+
+
+def test_impossible_ohlc_row_dropped():
+    raw = make_1m_df("2024-01-01 00:00", 3)
+    raw.loc[1, "high"] = raw.loc[1, "open"] - 1
+
+    builder = KlineBuilder(raw)
+
+    assert len(builder.df_1m) == 2
+
+
 # =========================================================
 # 高周期 → 低周期映射防未来函数
 # =========================================================

@@ -84,7 +84,16 @@ class KlineBuilder:
             (df["open"] > 0) &
             (df["high"] > 0) &
             (df["low"] > 0) &
-            (df["close"] > 0)
+            (df["close"] > 0) &
+            (df["volume"] >= 0)
+        ]
+
+        # 删除不可能的 OHLC：坏行若进入回测，会直接伪造止损/止盈、
+        # 强平与盘中回撤。不能只检查“价格为正”。
+        df = df[
+            (df["high"] >= df[["open", "close"]].max(axis=1)) &
+            (df["low"] <= df[["open", "close"]].min(axis=1)) &
+            (df["high"] >= df["low"])
         ]
 
         # 时间戳合理性底线：损坏数据产出的 1677/1970 年幽灵索引会让
@@ -137,8 +146,22 @@ class KlineBuilder:
 
         kline = kline.dropna()
 
-        # 添加 close_time
+        # 高周期 K 线必须由完整数量的 1m bar 构成。内部缺分钟却仍聚合为
+        # “完整 4h/1d”会隐藏数据洞，并扭曲 high/low、指标与成交信号。
         offset = pd.tseries.frequencies.to_offset(interval)
+        interval_delta = pd.Timedelta(offset)
+        expected_count = int(interval_delta / pd.Timedelta(minutes=1))
+        counts = df["close"].resample(
+            interval, label="left", closed="left"
+        ).count()
+        complete = counts.reindex(kline.index).eq(expected_count)
+        if not drop_incomplete and len(kline) > 0:
+            # 显式请求保留当前尚未收完的尾 bar 时，只豁免最后一根；
+            # 历史中段的数据洞仍不能伪装成完整高周期 K 线。
+            complete.iloc[-1] = True
+        kline = kline[complete]
+
+        # 添加 close_time
         kline["close_time"] = kline.index + offset
 
         # 删除最后一根未完成K线

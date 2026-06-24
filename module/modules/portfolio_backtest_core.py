@@ -42,6 +42,7 @@ from module.modules.backtest_metrics import (
     calculate_metrics,
     normalize_engine_params,
 )
+from module.modules.market_data_validation import validate_backtest_frame
 from module.Strategy.strategy_loader import call_strategy
 
 
@@ -65,13 +66,21 @@ class PortfolioBacktestCore:
     ):
         self.strategy_func = strategy_func
 
+        def optional_positive_finite(name, value):
+            if value is None:
+                return None
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                raise ValueError(f"{name} 必须是有限数值")
+            return parsed if parsed > 0 else None
+
         # 盘中止损/止盈全局百分比（契约 §10.9，v2.2）：None=关闭（默认）⇒ 逐根行为
         # 与无触发完全一致（bit-level 退化）。每腿触发价由 avg_entry×(1∓pct) 推导。
         # 逐标的差异化触发价留 v3。**仅正值启用**：None / 0 / 负值一律视为关闭。
         # （审查 F8：旧式 `max(float(x),0.0) if x else None` 对负值因 `if -0.05` 为真
         # 而截成 0.0 并【启用】入场价处的退化触发——负值必须是 None 而非 0.0。）
-        self.stop_loss_pct = float(stop_loss_pct) if stop_loss_pct and float(stop_loss_pct) > 0 else None
-        self.take_profit_pct = float(take_profit_pct) if take_profit_pct and float(take_profit_pct) > 0 else None
+        self.stop_loss_pct = optional_positive_finite("stop_loss_pct", stop_loss_pct)
+        self.take_profit_pct = optional_positive_finite("take_profit_pct", take_profit_pct)
 
         # 参数截断规则单源在 backtest_metrics，与单标的引擎完全一致
         params = normalize_engine_params(
@@ -86,7 +95,10 @@ class PortfolioBacktestCore:
         self.maintenance_margin_rate = params["maintenance_margin_rate"]
         self.liquidation_fee_rate = params["liquidation_fee_rate"]
 
-        self.rebalance_threshold = max(float(rebalance_threshold), 0.0)
+        threshold = float(rebalance_threshold)
+        if not math.isfinite(threshold):
+            raise ValueError("rebalance_threshold 必须是有限数值")
+        self.rebalance_threshold = max(threshold, 0.0)
         self.enable_liquidation = bool(enable_liquidation)
         self.stop_on_liquidation = bool(stop_on_liquidation)
 
@@ -134,6 +146,13 @@ class PortfolioBacktestCore:
 
         # ---------- 内部辅助 ----------
 
+        def set_episode_pnl(ep, pnl):
+            entry_equity = ep["entry_equity"]
+            ep["pnl"] = float(pnl)
+            ep["net_pnl"] = float(pnl)
+            ep["pnl_pct"] = float(pnl / entry_equity * 100) if entry_equity else 0.0
+            ep["net_pnl_pct"] = ep["pnl_pct"]
+
         def finish_episode(s, exit_time, exit_price, exit_reason):
             ep = open_episodes[s]
             ep["exit_time"] = str(exit_time)
@@ -148,18 +167,12 @@ class PortfolioBacktestCore:
             raw_pnl = ep["realized_pnl"] - ep["fees"] + funding_cf
             entry_equity = ep["entry_equity"]
 
-            # 单笔净亏不超过入场时投入的权益（逐仓保证金 / 账户权益 0 下限语义，与 v1
-            # 一致）：强平跳空 / 清算费 / funding 把名义亏损推到 < -100% 时，单笔 net_pnl
-            # 夹到 -entry_equity。否则 avg_loss / 盈亏比 / profit_factor 被不可能的超额
-            # 亏损污染，且与 v1（:907 max(equity,0) 间接夹 net_pnl）不一致（审查 F3/4/7）。
-            # gross_pnl 不夹——它是 raw 价格口径的纯价差盈亏（含杠杆放大），与 v1 同。
-            pnl = max(raw_pnl, -entry_equity) if entry_equity else raw_pnl
-
-            ep["pnl"] = float(pnl)
-            ep["net_pnl"] = float(pnl)
+            # 组合引擎是共享 cash 的全仓账本，不是每腿独立逐仓。单腿原始
+            # 归因可以超过账户权益；账户跌穿 0 时的保险基金信用必须在同次
+            # 强平的全部亏损腿之间按比例分配，不能让每条腿各自夹到
+            # -entry_equity（两腿会凭空合计亏掉两个账户）。分配在强平循环后做。
+            set_episode_pnl(ep, raw_pnl)
             ep["funding_pnl"] = float(funding_cf)
-            ep["pnl_pct"] = float(pnl / entry_equity * 100) if entry_equity else 0.0
-            ep["net_pnl_pct"] = ep["pnl_pct"]
             # gross = raw 价格口径的纯价格盈亏（不含滑点与手续费），与 v1 同口径
             ep["gross_pnl"] = float(ep["realized_pnl_raw"])
             ep["gross_pnl_pct"] = (
@@ -397,6 +410,7 @@ class PortfolioBacktestCore:
 
                     event_legs = []
                     liq_fee_total = 0.0
+                    liquidation_episode_start = len(episodes)
 
                     for s in symbols:
                         q = qty[s]
@@ -447,6 +461,23 @@ class PortfolioBacktestCore:
                         avg_entry_raw[s] = None
                         finish_episode(s, ts, liq_price, "liquidation")
 
+                    # 跳空/清算费可把共享账户 cash 打穿 0。交易所保险基金吸收
+                    # 的缺口是一次【账户级】信用：按各亏损腿原始净亏比例分配，
+                    # 使单资产自然退化为 -100%，多资产则不会每腿各亏一个账户。
+                    insurance_credit = max(-cash, 0.0)
+                    if insurance_credit > 0:
+                        liq_episodes = episodes[liquidation_episode_start:]
+                        negative_total = sum(
+                            -ep["pnl"] for ep in liq_episodes if ep["pnl"] < 0
+                        )
+                        if negative_total > 0:
+                            for ep in liq_episodes:
+                                if ep["pnl"] >= 0:
+                                    continue
+                                allocation = insurance_credit * (-ep["pnl"]) / negative_total
+                                set_episode_pnl(ep, ep["pnl"] + allocation)
+                                ep["insurance_credit"] = float(allocation)
+
                     cash = max(cash, 0.0)
 
                     liquidation_events.append({
@@ -455,6 +486,7 @@ class PortfolioBacktestCore:
                         "equity_after": float(cash),
                         "maintenance": float(maintenance),
                         "liquidation_fee": float(liq_fee_total),
+                        "insurance_credit": float(insurance_credit),
                         "legs": event_legs,
                         "leverage": int(self.leverage),
                         "maintenance_margin_rate": float(self.maintenance_margin_rate),
@@ -718,25 +750,12 @@ class PortfolioBacktestCore:
         if not isinstance(data, dict) or len(data) == 0:
             raise ValueError("data 必须是非空 dict: {symbol: DataFrame}")
 
-        required_columns = ["open", "high", "low", "close"]
         index = None
 
         for symbol, df in data.items():
-            missing = [c for c in required_columns if c not in df.columns]
-            if missing:
-                raise ValueError(f"{symbol} 的 K 线缺少必要字段: {missing}")
-
-            # 引擎依赖「同一行 OHLC 要么全有效、要么全 NaN（未上市/缺数据）」
-            # 的不变式：行内混合缺失会让持仓估值取到 None 而深处崩溃，
-            # 必须在入口报清楚
-            valid = df[required_columns].notna()
-            mixed = valid.any(axis=1) & ~valid.all(axis=1)
-            if bool(mixed.any()):
-                raise ValueError(
-                    f"{symbol} 的 K 线存在 OHLC 部分缺失的行（如 open 有值但 "
-                    "close 为 NaN）：同一行要么全部有效、要么全部为 NaN，"
-                    "请使用 data_panel.load_aligned_panel 加载数据"
-                )
+            validate_backtest_frame(
+                df, label=f"{symbol} 的 K 线", allow_all_nan_rows=True
+            )
 
             if index is None:
                 index = df.index
@@ -832,6 +851,10 @@ class PortfolioBacktestCore:
 
         weights = raw_weights.reindex(columns=symbols)
         weights = weights.apply(pd.to_numeric, errors="coerce")
+
+        values = weights.to_numpy(dtype=float)
+        if np.isinf(values).any():
+            raise ValueError("目标权重不能包含正负无穷")
 
         # 策略明确返回的行：NaN 权重视为 0（契约语义）
         weights = weights.fillna(0.0)

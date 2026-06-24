@@ -294,6 +294,34 @@ def test_missing_target_column_rejected():
         core.run(df)
 
 
+def test_impossible_ohlc_rejected():
+    df = make_df([100, 100, 100])
+    df.loc[df.index[1], "high"] = 99.0
+    with pytest.raises(ValueError, match="不可能"):
+        run_core(df, [0, 0, 0])
+
+
+def test_duplicate_time_index_rejected():
+    df = make_df([100, 100, 100])
+    df.index = pd.DatetimeIndex([df.index[0], df.index[0], df.index[2]])
+    with pytest.raises(ValueError, match="重复"):
+        run_core(df, [0, 0, 0])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"initial_cash": float("nan")},
+        {"fee_rate": float("inf")},
+        {"slippage": 1.0},
+        {"position_size": float("nan")},
+    ],
+)
+def test_non_finite_or_impossible_engine_params_rejected(kwargs):
+    with pytest.raises(ValueError):
+        CodeBacktestCore(lambda d: d, **kwargs)
+
+
 # =========================================================
 # 盘中浮动权益（mtm）数学
 # =========================================================

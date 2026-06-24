@@ -9,6 +9,7 @@ tmp 目录 ⇒ build_funding_rates 返回 None）。
 
 import pytest
 
+from module.Strategy import backtest_runner
 from module.Strategy.backtest_runner import (
     InsufficientKlinesError,
     resolve_strategy_route,
@@ -102,3 +103,32 @@ def test_insufficient_klines_raises(tmp_path):
 def test_resolve_strategy_route():
     assert resolve_strategy_route(V1_CODE, "ETH") == (1, ["ETHUSDT"])
     assert resolve_strategy_route(V2_CODE, "ETH") == (2, ["BTCUSDT"])
+
+
+def test_spot_prices_do_not_auto_apply_perpetual_funding(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_build(symbols, index, funding_dir):
+        calls.append((symbols, len(index)))
+        return {"BTCUSDT": [0.01] * len(index)}
+
+    monkeypatch.setattr(backtest_runner, "build_funding_rates", fake_build)
+    df = make_df([100, 100, 100, 100])
+
+    spot = _prep_v1(df)
+    spot["price_market"] = "spot"
+    spot_run = run_prepared(
+        spot, dict(initial_cash=1000.0), min_klines=1,
+        funding_dir=str(tmp_path),
+    )
+    assert calls == []
+    assert spot_run["result"]["metrics"]["funding_enabled"] is False
+
+    perpetual = _prep_v1(df)
+    perpetual["price_market"] = "perpetual"
+    perp_run = run_prepared(
+        perpetual, dict(initial_cash=1000.0), min_klines=1,
+        funding_dir=str(tmp_path),
+    )
+    assert calls == [(["BTCUSDT"], len(df))]
+    assert perp_run["result"]["metrics"]["funding_enabled"] is True

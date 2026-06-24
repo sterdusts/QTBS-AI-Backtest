@@ -179,7 +179,8 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 策略可为持仓指定止损/止盈触发价，引擎用**当根 K 线的 high/low 判断盘中是否触及、按触发价当根成交**（消除「信号表达止损 + 一根延迟」的旧局限）。详见 §10.9。要点：
 - **方向语义**：多头止损 `low ≤ stop`、止盈 `high ≥ tp`；空头止损 `high ≥ stop`、止盈 `low ≤ tp`
 - **跳空越过按本根 open 成交**（不加滑点）：止损在不利方向触发，跳空把成交价推向更不利的 open（`min(stop,open)` 多 / `max(stop,open)` 空，与强平 §5.3 同规则）；止盈在有利方向触发，跳空把成交价推向更有利的 open（`max(tp,open)` 多 / `min(tp,open)` 空，与限价单实际成交一致）
-- **触发 = 全平**该仓，`exit_reason ∈ {stop_loss, take_profit}`；触发后本根不再对账，下一根目标仍非零则自然重入（复用 §5.3）
+- **触发 = 全平**该仓，`exit_reason ∈ {stop_loss, take_profit}`；触发后不在当根盘中再次开仓，
+  但收盘目标仍非零时在**下一根开盘**自然重入（复用 §5.3，v1/v2 时点一致）
 - **定序**：funding → MTM → **强平**（优先）→ **止损/止盈**（仅强平未触发时）→ 正常权益；同根止损与止盈同时触及时**保守优先止损**。**但开盘（首 tick）已越过止盈**（多 `open ≥ tp` / 空 `open ≤ tp`）⇒ **止盈在开盘即成交、优先于同根盘中后到的止损**（限价止盈在开盘必成交，不应被更低的盘中 low 误判成亏损出场；审查 F9）
 - **默认关闭**：策略不给触发价 ⇒ 逐根行为与无触发完全一致（bit-level，§10.7 不变量 6）。v2 全局 `stop_loss_pct`/`take_profit_pct` **仅正值启用**：None / 0 / **负值**一律视为关闭（审查 F8：负值不得截成 0.0 而启用入场价处的退化触发）
 
@@ -381,8 +382,10 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
    做空/离散策略路由本就走 v1（恒定数量、口径最透明）。组合对冲/配对的做空腿走 v2
    的连续再平衡口径（可用更大 `rebalance_threshold` 抑制换手）
 2. 强平场景：v2 的 α 插值与 v1 强平价公式给出相同数字（含 `maintenance_margin_rate > 0`）；
-   两引擎均把**账户权益夹到 ≥ 0**、**单笔 `net_pnl` 夹到 ≥ −入场权益**（逐仓保证金语义，
-   审查 F3/F4/F7：v2 原先 `net_pnl` 未夹会报 < −100% 的亏损污染 avg_loss/盈亏比/PF）
+   两引擎均把**账户权益夹到 ≥ 0**。v1 单资产时单笔 `net_pnl` 自然不低于 −入场权益；
+   v2 是共享 cash 的全仓组合账本，跳空造成的账户负值由保险基金信用补到 0，并按同次强平
+   各亏损腿的原始净亏比例分配，保证**强平腿净收益之和与账户实际权益变化对账**。不能把每条
+   腿各自独立夹到 −入场权益，否则两条腿会凭空合计亏掉两个账户
 3. `gross_pnl` 两引擎同口径：实际持仓 × raw 价差（不含滑点与手续费）；**gross 不夹**
    −100%（含杠杆放大的纯价差，可 < −入场权益），只有 `net_pnl` 夹
 4. `position_size < 1` 时两引擎语义**有意不同**（v1 一次性比例 / v2 持续再平衡），
@@ -410,6 +413,9 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
 - **每根费率的来源**：数据层把真实 8h 离散费率序列**连续摊销**到每根 K 线并防
   未来函数（每根取最近一次【已结算】费率，按 `rate × bar秒 / 结算周期秒` 摊销）；
   引擎只消费「每根费率」，对数据来源无感（固定年化近似亦可作同形态输入）
+- **市场一致性**：自动编排只在 `price_market="perpetual"`（或期货数据目录自动识别）
+  时加载真实 funding；默认 UI 的 `kline_data` 是现货行情，必须保持 funding 关闭。
+  禁止把永续资金费率自动叠加到现货价格上构造不存在的混合市场
 - **单笔 pnl 口径**：funding 作为持有期现金流**计入单笔 `net_pnl`**——v1 经
   `net_pnl = equity_after − entry_equity` 天然含已扣 cash 的 funding；v2 在
   `finish_episode` 显式 `pnl = realized_pnl − fees + funding_cf`，两引擎同口径。
@@ -429,7 +435,7 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
 策略为持仓指定止损/止盈触发价，引擎用当根 high/low 判触及、按触发价当根成交（消除「信号表达止损 + 一根延迟」旧局限）。**默认全关闭**时逐根行为与无触发完全一致（§10.7 不变量 6）。执行几何见 §5.6。
 
 - **v1 接口（已实现）**：策略在返回 df 上可选挂 `stop_loss_price` / `take_profit_price` 两列（**绝对价格**，`NaN`=该根无触发单）。**逐根读当根值、不 ffill**（与 `target_position` 有意不同）——故策略可每根重报、天然支持**移动止损 trailing**。两列都不给 ⇒ 整功能关闭。触发价随策略缩短帧时一并 `reindex(input_index)`（缺行为 NaN，不 ffill）
-- **v2 接口（已实现）**：构造级全局 `stop_loss_pct` / `take_profit_pct`（默认 `None`=关闭），引擎对每个持仓腿按 `avg_entry × (1∓pct)`（多）/`(1±pct)`（空）推导触发价，命中腿**单独平仓**（其余腿继续，平腿后重算本根 MTM）。**逐标的、逐时刻差异化触发价留给 v3 订单级引擎**（v2 的「单一权重 DataFrame 返回」是简洁契约，不塞 per-symbol 触发价）。注：v1 触发后整仓 `continue` 重入下下根、v2 逐腿平后下根即可重入，**触发后重入时点 v1/v2 略有不对称**（非硬不变量）
+- **v2 接口（已实现）**：构造级全局 `stop_loss_pct` / `take_profit_pct`（默认 `None`=关闭），引擎对每个持仓腿按 `avg_entry × (1∓pct)`（多）/`(1±pct)`（空）推导触发价，命中腿**单独平仓**（其余腿继续，平腿后重算本根 MTM）。**逐标的、逐时刻差异化触发价留给 v3 订单级引擎**（v2 的「单一权重 DataFrame 返回」是简洁契约，不塞 per-symbol 触发价）。v1/v2 均在触发根收盘目标仍非零时于**下一根开盘**重入
 - **成交几何**：方向语义与跳空越过按本根 open 成交（**不加滑点**），见 §5.6。触发成交扣正常 `fee_rate` 平仓费；`gross_pnl` 仍为 raw 价差不含触发损益修饰
 - **定序与交互**：funding（已扣 cash）→ MTM → 强平（**优先**）→ 止损/止盈（仅强平未触发时）→ 正常权益；同根止损+止盈同时触及**保守优先止损**；触发平仓那根仍计 funding（`funding_pnl` 含）；末根盘中触及仍按触发价成交（不退化 `end_of_data`）；触发后下根目标非零则重入（复用 §5.3）
 - **输出**：`trade`/`episode` 的 `exit_reason ∈ {stop_loss, take_profit}`（原有 `signal`/`liquidation`/`end_of_data` 之外），附 `trigger_price`（触及的 high/low 值）、`trigger_field`（'high'/'low'）；`liquidated` 仍为 False；全 JSON-able
@@ -441,6 +447,7 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
 
 | 日期 | 版本 | 变更 |
 |------|------|------|
+| 2026-06-24 | v3 | 可信度审计第二轮：新增完全隔离的 clean-room 单资产/组合参考引擎与 BTC/ETH 真实数据 20 组逐根差分（最大绝对差 `3.64e-12`）；修 v1 策略可原地篡改 OHLC 成交价；两引擎入口拒绝重复/乱序时间轴、非有限与不可能 OHLC，参数拒绝 NaN/Inf 与 ≥100% 费率/滑点；高周期重采样丢弃内部缺分钟的伪完整 K 线；v1 止损/止盈后重入从下下根纠正为下一根（与 v2 一致）；v2 多腿爆仓的账户地板信用改按亏损腿比例归因，使腿 PnL 合计与账户权益对账；自动 funding 仅允许永续价格，默认现货 UI 不再混入永续费率 |
 | 2026-06-11 | v1 | 首次成文：固化既有引擎语义；信号比较语义明确为「与实际持仓对账」；权益曲线覆盖首尾 K 线；策略加载改为内存加载 + 审计留档 |
 | 2026-06-11 | v2 | 新增契约 v2：多标的连续目标权重 + 组合引擎 PortfolioBacktestCore + 对齐数据层 data_panel；指标计算抽取为共享模块 backtest_metrics |
 | 2026-06-11 | v2 | v2 全链路接入：AI 生成双契约 prompt（CONTRACT_VERSION/SYMBOLS 自描述元数据）、webUI 双引擎路由、组合图表 portfolio_chart；v1 数据加载切换到 data_panel 缓存层 |
@@ -459,4 +466,5 @@ def generate_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
 | 2026-06-14 | v2.2 | 盘中触发价 Stage B：v2 引擎构造级全局 `stop_loss_pct`/`take_profit_pct`（默认 None=关闭、负值截 0、0 视关闭），主循环强平之后逐腿检测（按 avg_entry×(1∓pct) 推触发价、leg_extremes 判触及、跳空复用强平几何、不加滑点扣正常 fee），命中腿单独平仓+finish_episode(exit_reason)+record_fill，平腿后重算本根 MTM；其余腿继续、下根可重入（v1/v2 重入时点略不对称、非硬不变量）。AI prompt（deepseek_code_generator v1）放宽「不加止损止盈」为「用户明确要求时输出 stop_loss_price/take_profit_price 列、逐根重报支持 trailing」。契约 §10.9/§9/§8 v2 改「已实现」。`tests/test_intrabar_trigger.py` 增 6 条 v2 金样例（共 18），296 tests green。webUI v2 pct 旋钮为可选 UI 后续 |
 | 2026-06-14 | v2.1 | 第九轮审查加固：exec 沙箱 AST 新增拒绝 pandas/numpy 文件/网络 I/O 方法（read_csv/read_pickle/to_csv/np.savetxt 等，封堵任意文件读写/反序列化 RCE/SSRF，§6 记录边界）；funding 回测窗口超本地覆盖时尾部退化为 0（不再无限前向外推末费率，与首段对称）；funding 单根 index 摊销因子兜底为一个结算周期（不再静默清零）；损坏 funding CSV 降级为不计 funding（不中断回测）；load_funding_series 对 tz-aware/重复时间戳 index 防御；funding_records_to_df schema 漂移退化空表；webUI 回测摘要展示 metrics.total_funding_cost（六语言）。studio 重构遗留的两处前端清理（死 header 文案、区块标题/侧栏未随语言切换）为纯 UI 维护项，留用户在其 studio 代码中处置；funding 自动补拉为产品决策，本轮以文档声明被动读取语义。267+ tests green |
 | 2026-06-24 | v3 | 策略可参数化（为稳健性参数扫描解锁）：`generate_signals` 可选第二形参 `params: dict\|None`（按 `inspect.signature` 元数捕获分发——`call_strategy` 单一调用点，1 参历史策略零行为变化、2 参策略收 params）+ 模块级 `PARAM_SPACE` 静态扫描空间声明（加载器 AST 解析、不执行策略、`{str标识符:[数字,...]}` 非空校验，违规解析期报错）；两引擎 `run(..., params=None)` 透传，`params=None` ⇒ bit-level 退化（webUI/历史路径逐位不变）；策略内部参数不可运行时注入（沙箱封死 `__globals__`/`__code__`/`eval`/`exec`），必须经形参显式传入；`behavior_check` 新增两次调用一致性探针（`deterministic` 事实，捕模块级状态/`np.random` 等非确定性，稳健性反复回测下会漂移）；§1.1 + §10.1 + 纯函数硬约束强化 + `tests/test_strategy_params.py` 7 条金样例。CONTRACT_VERSION 不变（v1=1 / v2=2，v3 是两版本共同的可选能力）。317 tests green。**配套基础设施（已提交）：backtest_runner 无 Gradio 编排内核（webUI 与稳健性共用单内核）+ module/analysis/robustness.py 样本内外/walk-forward/引擎参数扫描纯库层** |
-| 2026-06-24 | v3 | 差分验证（独立 clean-room 引擎重写 + 真实 BTC 数据逐根比对）+ 全仓审查修复 9 条边缘缺陷：核心执行经独立重写到机器精度互验（数据层/fill-timing/v2 多资产零确认发现）。修复（均不影响常规「杠杆1/做多/无止损/未爆仓」回测，仅纠正边缘场景）——**F5/F6**：爆仓归零时夏普不再被「权益≤0 跳过」误清成 0（改为 `<0` 才跳过，恰好 0 是合法 −100% 收益 ⇒ 强负夏普）、年化退化为 −100%（不再与 total_return 自相矛盾），§5.4；**F3/F4/F7**：v2 单笔 `net_pnl` 夹到 ≥ −入场权益（逐仓保证金，与 v1 一致），修强平跳空/清算费/funding 把单笔亏损推到 < −100% 污染 avg_loss/盈亏比/profit_factor，gross 不夹，§10.7 不变量 2/3；**F2**：止损/止盈成交根保留持仓段真实盘中 worst/best（`min/max` 与平仓后 cash），修 max_drawdown 被抹成 0（两引擎），§5.4；**F9**：开盘跳空越过止盈时止盈优先于同根盘中后到的止损（两引擎），§5.6；**F8**：v2 `stop_loss_pct`/`take_profit_pct` 负值视为关闭（None）而非截成 0.0 启用退化触发，§5.6；**F1/F10**：v2 做空连续再平衡是 §10.2「持续维持敞口」的正确行为（非缺陷）——校正 §10.7 不变量 1 为「v1≡v2 仅对多仓成立、做空例外」，明确长短不对称。`tests/test_audit_fixes.py` 8 条金样例；335 tests green。验证脚手架 `validation/`（oracle + 差分 + 复现）不提交 |
+| 2026-06-24 | v3 | 差分验证（独立 clean-room 引擎重写 + 真实 BTC 数据逐根比对）+ 全仓审查修复 9 条边缘缺陷：核心执行经独立重写到机器精度互验（数据层/fill-timing/v2 多资产零确认发现）。修复（均不影响常规「杠杆1/做多/无止损/未爆仓」回测，仅纠正边缘场景）——**F5/F6**：爆仓归零时夏普不再被「权益≤0 跳过」误清成 0（改为 `<0` 才跳过，恰好 0 是合法 −100% 收益 ⇒ 强负夏普）、年化退化为 −100%（不再与 total_return 自相矛盾），§5.4；**F3/F4/F7**：v2 单笔 `net_pnl` 不再报 < −100% 的不可能亏损（修强平跳空/清算费/funding 污染 avg_loss/盈亏比/profit_factor），gross 不夹，§10.7 不变量 2/3（**机制在下行第二轮审核中校正为「保险基金信用按亏损腿比例分配」——单资产退化为 −100%、多资产保证腿净亏之和与账户权益变化对账**）；**F2**：止损/止盈成交根保留持仓段真实盘中 worst/best（`min/max` 与平仓后 cash），修 max_drawdown 被抹成 0（两引擎），§5.4；**F9**：开盘跳空越过止盈时止盈优先于同根盘中后到的止损（两引擎），§5.6；**F8**：v2 `stop_loss_pct`/`take_profit_pct` 负值视为关闭（None）而非截成 0.0 启用退化触发，§5.6；**F1/F10**：v2 做空连续再平衡是 §10.2「持续维持敞口」的正确行为（非缺陷）——校正 §10.7 不变量 1 为「v1≡v2 仅对多仓成立、做空例外」，明确长短不对称。`tests/test_audit_fixes.py` 8 条金样例；335 tests green。验证脚手架 `validation/`（oracle + 差分 + 复现）不提交 |
+| 2026-06-24 | v3 | 第二轮独立审核（Codex clean-room + 真实数据，与首轮 oracle 互为佐证：20 组逐根差分最大绝对差 3.6e-12）加固 7 项执行/输入边界 + 校正首轮 F3/F4/F7：①新增 `module/modules/market_data_validation.py`（两引擎 `run` 入口 `validate_backtest_frame` 拒重复/乱序索引、NaN/Inf、非正价、不可能 OHLC[high<low / high<max(o,c) / low>min(o,c)]）；`normalize_engine_params` 拒 NaN/Inf 参数与 slippage/fee≥1（防 NaN/负成交价）；②v1 行情账本与策略输入拆成两个 DataFrame（`input_ohlc` 独立副本），策略原地改写 OHLC 不再能篡改自身成交价（金样例钉死）；③高周期重采样要求完整 1m 根数，历史中段缺分钟的 4h/日线不再当完整 K 线（`kline_builder` + `data_quality`）；④v1 止损/止盈后重入与 v2 对齐（同次下一根开盘，金样例 `test_v1_stop_reentry_occurs_at_next_open`）；⑤**v2 多腿爆仓改保险基金信用按各亏损腿原始净亏比例分配**（替换首轮每腿独立夹 −entry_equity 的错法——多腿会凭空合计亏掉多个账户；现单资产退化 −100%、多资产 Σ腿净亏=账户权益变化，已验证 2 腿各 −500/Σ=−1000）；⑥自动编排避免把永续 funding 叠加到默认现货价（口径分离）；⑦契约 §10.7 不变量 2/3 同步。`tests/test_clean_room_validation.py` + 扩充 `test_audit_fixes.py`/`test_backtest_core.py`/`test_kline_builder.py`/`test_backtest_runner.py`；361 tests green。两套独立 clean-room（`validation/oracle_v1.py` + `validation/clean_room_engine.py`）均与生产引擎核心逐根一致 |

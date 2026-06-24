@@ -35,9 +35,9 @@ def _v2_weights(rows, sym="BTCUSDT"):
 
 def _wipeout_run():
     o = [100, 102, 104, 106, 50]
-    highs = [x * 1.01 for x in o]
-    lows = [x * 0.99 for x in o[:-1]] + [40]
     closes = [102, 104, 106, 108, 45]
+    highs = [max(x, c) * 1.01 for x, c in zip(o, closes)]
+    lows = [x * 0.99 for x in o[:-1]] + [40]
     df = make_df(o, closes, highs, lows)
     return CodeBacktestCore(_v1_strat([1, 1, 1, 1, 1]), initial_cash=1000.0, leverage=3,
                             position_size=1.0, maintenance_margin_rate=0.0).run(df)
@@ -156,3 +156,72 @@ def test_f8_negative_pct_disables_trigger():
     r = core.run({"BTCUSDT": df})
     # 无触发：不应出现 stop_loss/take_profit 出场（只有 signal/end_of_data）
     assert not any(e.get("exit_reason") in ("stop_loss", "take_profit") for e in r["trades"])
+
+
+def test_v1_strategy_cannot_mutate_trusted_ohlc():
+    df = make_df([100, 100, 100, 110])
+
+    def mutating_strategy(d):
+        d["open"] = 1.0
+        d["high"] = 1.0
+        d["low"] = 1.0
+        d["close"] = 1.0
+        d["target_position"] = [1, 1, 1, 1]
+        return d
+
+    result = CodeBacktestCore(
+        mutating_strategy, initial_cash=1000.0, enable_liquidation=False
+    ).run(df)
+
+    assert result["trades"][0]["entry_price"] == pytest.approx(100.0)
+    assert result["metrics"]["final_equity"] == pytest.approx(1100.0)
+    assert result["df"]["open"].tolist() == [100.0, 100.0, 100.0, 110.0]
+
+
+def test_v1_stop_reentry_occurs_at_next_open():
+    df = make_df(
+        [100, 100, 100, 90, 90],
+        [100, 100, 90, 90, 90],
+        [100, 100, 100, 90, 90],
+        [100, 100, 89, 90, 90],
+    )
+    result = CodeBacktestCore(
+        _v1_strat(
+            [1, 1, 1, 1, 1],
+            stop=[np.nan, np.nan, 95, np.nan, np.nan],
+        ),
+        initial_cash=1000.0,
+        enable_liquidation=False,
+    ).run(df)
+
+    assert result["trades"][0]["exit_reason"] == "stop_loss"
+    assert result["trades"][1]["entry_time"] == str(df.index[3])
+
+
+def test_v2_multileg_liquidation_attribution_reconciles_to_account():
+    df = make_df(
+        [100, 100, 50, 50],
+        [100, 100, 50, 50],
+        [100, 100, 55, 50],
+        [100, 100, 40, 50],
+    )
+
+    def weights(data):
+        import pandas as pd
+        return pd.DataFrame(
+            {"BTCUSDT": [0.5] * 4, "ETHUSDT": [0.5] * 4},
+            index=df.index,
+        )
+
+    result = PortfolioBacktestCore(
+        weights,
+        initial_cash=1000.0,
+        leverage=10,
+        rebalance_threshold=10.0,
+        maintenance_margin_rate=0.0,
+    ).run({"BTCUSDT": df, "ETHUSDT": df.copy()})
+
+    liquidated = [t for t in result["trades"] if t["exit_reason"] == "liquidation"]
+    assert result["metrics"]["final_equity"] == pytest.approx(0.0)
+    assert sum(t["net_pnl"] for t in liquidated) == pytest.approx(-1000.0)
+    assert [t["net_pnl"] for t in liquidated] == pytest.approx([-500.0, -500.0])
