@@ -32,6 +32,33 @@ def _wait_idle(timeout=5.0):
     return False
 
 
+def test_integrity_check_runs_with_force_when_requested(tmp_path, monkeypatch):
+    """手动「检查并修复」：enqueue(force_integrity=True) ⇒ worker 在更新前以
+    force=True 调 check_and_repair（忽略白名单全量查）。"""
+    calls = []
+    monkeypatch.setattr(fetch_queue, "Obtain_K",
+                        lambda symbol, save_dir: _touch(tmp_path, symbol))
+    monkeypatch.setattr(fetch_queue.data_integrity, "check_and_repair",
+                        lambda symbol, data_dir, force=False, **kw: calls.append((symbol, force)))
+
+    fetch_queue.enqueue(["BTC"], str(tmp_path), force_integrity=True)
+    assert _wait_idle()
+    assert calls == [("BTCUSDT", True)]
+
+
+def test_integrity_check_force_false_by_default(tmp_path, monkeypatch):
+    """常规后台更新：check_and_repair 以 force=False（走白名单，省开销）先于更新执行。"""
+    calls = []
+    monkeypatch.setattr(fetch_queue, "Obtain_K",
+                        lambda symbol, save_dir: _touch(tmp_path, symbol))
+    monkeypatch.setattr(fetch_queue.data_integrity, "check_and_repair",
+                        lambda symbol, data_dir, force=False, **kw: calls.append((symbol, force)))
+
+    fetch_queue.enqueue(["ETH"], str(tmp_path))
+    assert _wait_idle()
+    assert calls == [("ETHUSDT", False)]
+
+
 def test_enqueue_runs_worker_and_completes(tmp_path, monkeypatch):
     fetched = []
 

@@ -66,6 +66,7 @@ _DONE = 0                  # 已完成数（成功+失败）
 _FINISHED_AT = None        # 本批完成时间戳
 _GEN = 0                   # 批次代号：reset/开新批自增，作废 in-flight 计数
 _WORKER = None             # 持久后台 worker 线程
+_FORCE_INTEGRITY: set = set()   # 本轮需【强制全量】完整性检查的币种（手动检查按钮）
 
 
 def _reset_locked():
@@ -77,6 +78,7 @@ def _reset_locked():
     _DIR_OF.clear()
     _ALL.clear()
     _ERRORS.clear()
+    _FORCE_INTEGRITY.clear()
     _TOTAL = 0
     _DONE = 0
     _FINISHED_AT = None
@@ -93,14 +95,18 @@ def _classify_mode(symbol: str, data_dir: str) -> str:
     return "update" if has_kline_data(symbol, data_dir=data_dir) else "initial"
 
 
-def _register_locked(symbol: str, data_dir: str, front: bool = False) -> None:
+def _register_locked(symbol: str, data_dir: str, front: bool = False,
+                     force_integrity: bool = False) -> None:
     """在锁内把币种登记进队列（去重）。front=True 插队首（回测优先拉）。
+    force_integrity=True 标记本币种需强制全量完整性检查（手动检查按钮）。
     _DIR_OF 总取最新请求目录（同名不同目录时以最后请求方为准）。"""
     global _TOTAL, _FINISHED_AT
 
     # 总用最新请求目录：回测 fetch_blocking 要在它自己的目录拿数据，
     # 不能沿用批量首次登记的目录
     _DIR_OF[symbol] = data_dir
+    if force_integrity:
+        _FORCE_INTEGRITY.add(symbol)   # 只升级、不降级（同币种被多路登记时取最强）
 
     if symbol == _CURRENT:
         return
@@ -131,8 +137,9 @@ def _ensure_worker_locked():
     _WORKER.start()
 
 
-def enqueue(symbols, data_dir) -> list:
-    """批量登记币种并确保 worker 运行。返回真正新入队的币种。"""
+def enqueue(symbols, data_dir, force_integrity: bool = False) -> list:
+    """批量登记币种并确保 worker 运行。返回真正新入队的币种。
+    force_integrity=True：本批强制全量完整性检查（手动「检查并修复」按钮用）。"""
     with _COND:
         _maybe_start_new_batch_locked()
         added = []
@@ -140,7 +147,7 @@ def enqueue(symbols, data_dir) -> list:
             symbol = normalize_symbol(raw)
             if symbol not in _QUEUED and symbol != _CURRENT:
                 added.append(symbol)
-            _register_locked(symbol, data_dir)
+            _register_locked(symbol, data_dir, force_integrity=force_integrity)
         _ensure_worker_locked()
         _COND.notify_all()
         return added
@@ -183,14 +190,17 @@ def _run():
             _CURRENT = cand
             gen = _GEN
             data_dir = _DIR_OF.get(cand)
+            force_integrity = cand in _FORCE_INTEGRITY
+            _FORCE_INTEGRITY.discard(cand)
 
         ok = False
         try:
             # 先检查/修复缺口（白名单控开销），再增量更新。完整性这步最佳努力——
-            # 失败只吞掉、绝不阻断正常更新（数据可用性优先）。
+            # 失败只吞掉、绝不阻断正常更新（数据可用性优先）。force_integrity=True
+            # （手动按钮）忽略白名单全量重查。
             if _INTEGRITY_ENABLED and data_dir:
                 try:
-                    data_integrity.check_and_repair(cand, data_dir)
+                    data_integrity.check_and_repair(cand, data_dir, force=force_integrity)
                 except Exception:
                     pass
             Obtain_K(cand, save_dir=data_dir)

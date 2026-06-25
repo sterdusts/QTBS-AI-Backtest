@@ -627,6 +627,7 @@ FETCH_TEXTS = {
         "failed": "失败",
         "button": "更新数据",
         "button_running": "更新中…",
+        "button_integrity": "检查并修复",
         "tip_initial": "本次将首次拉取以下交易对（2017 至今的 1 分钟数据）：",
         "tip_update": "本次将更新以下交易对的数据：",
         "tip_idle": "启动时自动扫描本地交易对并更新；首次使用则初次拉取默认币种。点「更新数据」可手动更新。",
@@ -642,6 +643,7 @@ FETCH_TEXTS = {
         "failed": "failed",
         "button": "Update Data",
         "button_running": "Updating…",
+        "button_integrity": "Check & Repair",
         "tip_initial": "Initial download of these symbols (1m data since 2017):",
         "tip_update": "Updating data for these symbols:",
         "tip_idle": "On startup, local symbols are scanned and updated automatically; first use downloads the default symbols. Click 'Update Data' to update manually.",
@@ -657,6 +659,7 @@ FETCH_TEXTS = {
         "failed": "실패",
         "button": "데이터 업데이트",
         "button_running": "업데이트 중…",
+        "button_integrity": "검사 및 복구",
         "tip_initial": "다음 종목을 최초 다운로드합니다(2017년부터의 1분 데이터):",
         "tip_update": "다음 종목의 데이터를 업데이트합니다:",
         "tip_idle": "시작 시 로컬 종목을 스캔하여 자동 업데이트하며, 최초 사용 시 기본 종목을 다운로드합니다. '데이터 업데이트'로 수동 업데이트할 수 있습니다.",
@@ -672,6 +675,7 @@ FETCH_TEXTS = {
         "failed": "失敗",
         "button": "データ更新",
         "button_running": "更新中…",
+        "button_integrity": "チェックと修復",
         "tip_initial": "以下の銘柄を初回取得します（2017年以降の1分データ）：",
         "tip_update": "以下の銘柄のデータを更新します：",
         "tip_idle": "起動時にローカル銘柄をスキャンして自動更新し、初回利用時はデフォルト銘柄を取得します。「データ更新」で手動更新できます。",
@@ -687,6 +691,7 @@ FETCH_TEXTS = {
         "failed": "فشل",
         "button": "تحديث البيانات",
         "button_running": "جارٍ التحديث…",
+        "button_integrity": "فحص وإصلاح",
         "tip_initial": "سيتم التنزيل الأول للرموز التالية (بيانات الدقيقة منذ 2017):",
         "tip_update": "سيتم تحديث بيانات الرموز التالية:",
         "tip_idle": "عند بدء التشغيل تُفحص الرموز المحلية وتُحدّث تلقائيًا؛ الاستخدام الأول ينزّل الرموز الافتراضية. اضغط «تحديث البيانات» للتحديث يدويًا.",
@@ -702,6 +707,7 @@ FETCH_TEXTS = {
         "failed": "ошибка",
         "button": "Обновить данные",
         "button_running": "Обновление…",
+        "button_integrity": "Проверить и исправить",
         "tip_initial": "Первая загрузка этих инструментов (1-мин данные с 2017):",
         "tip_update": "Обновление данных по этим инструментам:",
         "tip_idle": "При запуске локальные инструменты сканируются и обновляются автоматически; при первом запуске загружаются инструменты по умолчанию. Нажмите «Обновить данные» для ручного обновления.",
@@ -1169,6 +1175,16 @@ def on_manual_update(lang_code: str):
     return refresh_fetch_progress(lang_code)
 
 
+def on_integrity_check(lang_code: str):
+    """手动「检查并修复数据」按钮：对本地全部交易对【强制全量】缺口检查 + 回补
+    （忽略白名单），随后增量更新；正在拉取时点击无效。复用同一拉取队列与进度区。"""
+    if not fetch_queue.is_running():
+        local = list_local_symbols(DEFAULT_DATA_DIR)
+        targets = local if local else fetch_queue.DEFAULT_INITIAL_SYMBOLS
+        fetch_queue.enqueue(targets, DEFAULT_DATA_DIR, force_integrity=True)
+    return refresh_fetch_progress(lang_code)
+
+
 def parse_common_ui_params(
     output_language: str,
     symbol,
@@ -1443,6 +1459,8 @@ def update_ui_language(
         gr.update(label=get_robustness_text(lang_code)["split_label"]),
         gr.update(value=get_robustness_text(lang_code)["run_button"]),
         gr.update(label=get_robustness_text(lang_code)["panel_title"]),
+        # 数据「检查并修复」按钮随语言切换
+        gr.update(value=get_fetch_text(lang_code)["button_integrity"]),
     ]
 
 # =========================================================
@@ -3229,6 +3247,11 @@ with gr.Blocks(
                         elem_id="fetch-update-button",
                         size="sm",
                     )
+                    integrity_button = gr.Button(
+                        value=get_fetch_text(default_lang)["button_integrity"],
+                        elem_id="fetch-integrity-button",
+                        size="sm",
+                    )
 
                 fetch_timer = gr.Timer(1.0)
 
@@ -3268,6 +3291,7 @@ with gr.Blocks(
                     robustness_split_input,
                     robustness_button,
                     robustness_chart_output,
+                    integrity_button,
                 ],
                 api_name="update_language",
             )
@@ -3373,6 +3397,13 @@ with gr.Blocks(
                 inputs=[language_select],
                 outputs=[fetch_progress, fetch_button],
                 api_name="update_market_data",
+            )
+
+            integrity_button.click(
+                fn=on_integrity_check,
+                inputs=[language_select],
+                outputs=[fetch_progress, fetch_button],
+                api_name="check_repair_data",
             )
 
             demo.load(
