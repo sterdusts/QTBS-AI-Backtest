@@ -1445,9 +1445,6 @@ def update_ui_language(
         # 回测结果现为 gr.HTML 可视化仪表盘：切语言时不重渲染（保留当前结果、不清空），
         # 下次运行回测会以新语言重画。gr.update() 无参 = 不改动该组件
         gr.update(),
-        gr.update(
-            label=text["chart_file_label"],
-        ),
         # 进度区按新语言重渲染（读一次快照，不重置进度，也不再额外 is_running）
         gr.update(value=build_fetch_progress_html(_snap, lang_code)),
         gr.update(
@@ -1586,7 +1583,7 @@ def run_backtest_from_ui(
 
     try:
         if strategy_code is None or strategy_code.strip() == "":
-            return _result_error_html(text["no_code_error"]), None
+            return _result_error_html(text["no_code_error"])
 
         try:
             start_str, end_str, symbol, (
@@ -1602,7 +1599,7 @@ def run_backtest_from_ui(
                 fee_rate_percent, slippage_percent,
             )
         except Exception as e:
-            return _result_error_html(str(e)), None
+            return _result_error_html(str(e))
 
         fee_rate_value = fee_rate_percent_value / 100
         slippage_value = slippage_percent_value / 100
@@ -1624,7 +1621,7 @@ def run_backtest_from_ui(
                 ),
             )
         except InsufficientKlinesError as e:
-            return _result_error_html(text["too_few_klines_error"].format(count=e.kline_count)), None
+            return _result_error_html(text["too_few_klines_error"].format(count=e.kline_count))
 
         result = run["result"]
         route_version = run["route_version"]
@@ -1725,10 +1722,10 @@ def run_backtest_from_ui(
             summary_text,
             output_language,
         )
-        return dashboard, html_path
+        return dashboard
 
     except Exception as e:
-        return _result_error_html(f"{text['backtest_fail_error']}：{str(e)}"), None
+        return _result_error_html(f"{text['backtest_fail_error']}：{str(e)}")
 
 
 # IS/OOS 对比表展示的指标 → SUMMARY_TEXTS 标签键（指标名复用回测摘要文案，不重复翻译）
@@ -3220,15 +3217,12 @@ with gr.Blocks(
                             elem_id="output-code",
                         )
 
-                    # 回测结果可视化仪表盘（大字总盈亏 + 权益曲线 + 指标卡），全宽主角
+                    # 回测结果可视化仪表盘（大字总盈亏 + 权益曲线 + 指标卡），全宽主角。
+                    # 图表 HTML 仍自动落盘 Past_data/ 并自动在浏览器打开、且随历史 JSON 留档，
+                    # 故不再单设"回测图表文件"下载组件。
                     backtest_result_output = gr.HTML(
                         build_dashboard_placeholder(default_lang),
                         elem_id="result-box",
-                    )
-
-                    chart_file_output = gr.File(
-                        label=default_text["chart_file_label"],
-                        elem_id="chart-file-output",
                     )
 
                 with gr.Accordion(
@@ -3308,7 +3302,6 @@ with gr.Blocks(
                     code_accordion,
                     review_output,
                     backtest_result_output,
-                    chart_file_output,
                     fetch_progress,
                     fetch_button,
                     robustness_accordion,
@@ -3379,7 +3372,6 @@ with gr.Blocks(
                 ],
                 outputs=[
                     backtest_result_output,
-                    chart_file_output,
                 ],
                 api_name="run_backtest",
             )
