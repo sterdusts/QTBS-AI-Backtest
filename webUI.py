@@ -34,6 +34,7 @@ from module.modules.data_panel import (
 from module.modules.generic_chart import plot_generic_equity_curves
 from module.modules.portfolio_chart import plot_portfolio_result
 from module.modules.robustness_chart import plot_robustness
+from module.modules.run_history import build_run_record, save_run_record
 from module.analysis.robustness import run_full_analysis
 from dotenv import load_dotenv
 
@@ -1551,6 +1552,7 @@ def run_backtest_from_ui(
     position_size_percent,
     fee_rate_percent,
     slippage_percent,
+    prompt="",
 ):
     text = get_ui_text(output_language)
     summary_text = get_summary_text(output_language)
@@ -1647,6 +1649,38 @@ def run_backtest_from_ui(
             slippage_percent_value=slippage_percent_value,
             chart_path=chart_path,
         )
+
+        # 历史留档：把提示词 + 代码 + 参数 + 关键指标 + 图表路径落成一份自包含 JSON
+        # （Past_data/runs/），供事后追溯/复现与将来的历史查看功能。最佳努力——
+        # 留档失败绝不影响回测结果展示。
+        try:
+            save_run_record(build_run_record(
+                prompt=prompt,
+                strategy_code=strategy_code,
+                market=market,
+                params={
+                    "symbol": display_symbol,
+                    "route_symbols": route_symbols,
+                    "contract_version": route_version,
+                    "timeframe": timeframe,
+                    "requested_start": start_str,
+                    "requested_end": end_str,
+                    "actual_start": actual_start,
+                    "actual_end": actual_end,
+                    "kline_count": kline_count,
+                    "initial_cash": initial_cash_value,
+                    "leverage": leverage_value,
+                    "effective_leverage": effective_leverage_value,
+                    "position_size_percent": position_size_percent_value,
+                    "fee_rate_percent": fee_rate_percent_value,
+                    "slippage_percent": slippage_percent_value,
+                },
+                metrics=metrics,
+                chart_file=html_path,
+                timestamp_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            ))
+        except Exception as record_err:
+            print(f"[run_history] 历史留档失败（不影响回测）：{record_err}")
 
         return summary, html_path
 
@@ -3292,6 +3326,7 @@ with gr.Blocks(
                     position_size_input,
                     fee_rate_input,
                     slippage_input,
+                    strategy_input,   # 自然语言提示词：随回测一起落历史留档（run_history）
                 ],
                 outputs=[
                     backtest_result_output,
