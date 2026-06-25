@@ -196,11 +196,22 @@ v1 / v2 两引擎行为一致（金样例交叉验证）。
 - **AST 拒绝模块属性回取**（`os`/`sys`/`subprocess`/`socket`/`compat`/`io`/`f2py` 等作属性名）：pandas/numpy import 时把 stdlib 模块挂为子模块属性，`pd.compat.os` 就是真实 os 模块，否则 `pd.compat.os.system(...)` 完整 RCE
 - **AST 拒绝 `df.query` / `df.eval`**：pandas 字符串表达式引擎会执行字符串内的任意属性链调用（`df.query("...__subclasses__()...os.system(...)")`）→ RCE；表达式是字符串字面量，dunder 静态防线对其内部失明。纯量化策略用向量化布尔索引代替
 - 字符串黑名单（仅 AST 白名单覆盖不到的危险调用）：`open(`、`eval(`、`exec(`、`__import__`、`compile(`、`globals(`、`locals(`
+- **AST 拒绝 numpy/pandas 文件读取构造器**（`DataSource`/`ExcelFile`/`get_handle` 等，连同 `npyio` 子模块属性）：`np.lib.npyio.DataSource().open(path)` 是 I/O 方法名黑名单的漏网读取器（可读本地文件 / URL SSRF / 临时写）
 - 必须存在顶层 `generate_signals` 函数
 - 策略代码从**内存**编译加载，不经过共享文件路径（并发安全）；
   实际参与回测的代码会以时间戳文件留档到 `Past_data/strategy_code/`（仅审计，不加载）
 
-> **边界说明**：以上是**单用户本地驾驶舱**（`demo.launch` 绑 127.0.0.1、策略来自用户自己 prompt 的 DeepSeek 生成）下的务实加固，足以挡住 AI 生成代码意外/被提示注入诱导的越权。**生产级隔离**（策略跑在独立进程 + 无网络 namespace + 只读文件系统）是平台化阶段（多用户）的目标，静态黑名单不是绝对沙箱。
+**运行期沙箱守卫（`sys.addaudithook`，对 AST 黑名单的根因补强）**：AST 黑名单是
+**加载期、按 API 名**的防御，已被绕过四轮（open/import → dunder 链 → pandas/numpy I/O
+方法 → 模块属性回取 → DataSource/ExcelFile…），因为按名枚举永远不全。故再加一层
+**执行期、按 OS 操作**的拦截：在策略 `exec`/调用窗口内（线程局部深度计数、仅此期间生效），
+于真正触发 **文件打开 / socket / DNS / 子进程 / `os.system` / 原生代码** 的审计事件处拒绝——
+**无论 Python 层用 DataSource、`read_csv`、裸 `open`、还是 dunder 链回取 `os.system` 到达，
+都殊途同归到这几个审计事件被拦**。审计事件集小而稳定（不随 pandas 版本增长），纯函数
+策略零触发 ⇒ 近零误伤（391 tests 不受影响）。文件**写**一律拒；文件**读**仅放行 Python/库
+目录（懒加载 import），用户数据/密钥文件一律拒。守卫外（主程序、数据层 I/O）不受影响。
+
+> **边界说明**：以上是**单用户本地驾驶舱**（`demo.launch` 绑 127.0.0.1、策略来自用户自己 prompt 的 DeepSeek 生成）下的务实加固。AST 黑名单（加载期）+ 运行期审计守卫（执行期、OS 操作层）两层纵深后，**文件读写 / 联网 / 子进程整类逃逸在执行期被根因拦截**，不再依赖逐个枚举 pandas/numpy API 名。**生产级隔离**（策略跑在独立进程 + 无网络 namespace + 只读文件系统 + 资源/超时限制）仍是平台化阶段（多用户）的更强目标——审计钩子是同进程软隔离、非绝对沙箱（例如 CPU/内存 DoS、纯内存计算炸弹不在其拦截范围）。
 
 ## 7. AI 生成约束（prompt 同步清单)
 

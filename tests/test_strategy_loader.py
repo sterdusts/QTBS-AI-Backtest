@@ -7,8 +7,10 @@ import pandas as pd
 import pytest
 
 from module.Strategy.strategy_loader import (
+    call_strategy,
     load_strategy_func_from_code,
     parse_strategy_metadata,
+    sandbox_guard,
     save_strategy_code_audit,
     validate_strategy_code,
     validate_strategy_metadata,
@@ -204,6 +206,46 @@ def test_escape_via_pandas_numpy_io_blocked():
         )
         with pytest.raises(ValueError, match="文件/网络 I/O"):
             load_strategy_func_from_code(code)
+
+
+def test_runtime_sandbox_guard_blocks_io_network_process():
+    # 运行期审计守卫（sys.addaudithook）：在策略执行窗口于【OS 操作层】拦截，
+    # 无论 Python 层用何花招到达——这是对 AST 黑名单（加载期、按 API 名、易绕）的
+    # 根因补强。逐项验证守卫内被拒、守卫外正常、库文件懒加载读取放行。
+    import os
+    import socket
+    import tempfile
+
+    def must_block(fn):
+        with pytest.raises(PermissionError):
+            with sandbox_guard():
+                fn()
+
+    must_block(lambda: open("STRATEGY_CONTRACT.md").close())          # 读用户文件
+    must_block(lambda: open(os.path.join(tempfile.gettempdir(), "pwn.txt"), "w"))  # 写文件
+    must_block(lambda: socket.socket())                               # 联网
+    must_block(lambda: socket.getaddrinfo("example.com", 80))         # SSRF DNS
+    must_block(lambda: os.system("echo x"))                           # 子进程/RCE
+
+    # 库文件读取须放行（否则误伤策略里的 import 懒加载）
+    with sandbox_guard():
+        open(os.__file__).close()
+
+    # 守卫外一切正常（主程序/数据层 I/O 不受影响）
+    open("STRATEGY_CONTRACT.md").close()
+    socket.socket().close()
+
+
+def test_call_strategy_runtime_guard_blocks_file_read():
+    # 端到端：即便某策略绕过了 AST 黑名单，运行期它真去读文件时仍被 call_strategy
+    # 的守卫在 open 事件处拦下（模拟"未知绕过"——直接用未经校验的函数）。
+    def evil(df):
+        with open("STRATEGY_CONTRACT.md") as f:
+            f.read()
+        return df
+
+    with pytest.raises(PermissionError):
+        call_strategy(evil, pd.DataFrame({"close": [1.0, 2.0, 3.0]}))
 
 
 def test_escape_via_datasource_and_excelfile_blocked():

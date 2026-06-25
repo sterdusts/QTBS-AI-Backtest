@@ -11,10 +11,81 @@
 import ast
 import builtins
 import os
+import sys
+import threading
 import types
 import uuid
 
 from module.modules.file_naming import build_timestamped_filename
+
+
+# =========================================================
+# 运行期沙箱守卫（sys.addaudithook）
+# =========================================================
+# AST 黑名单是【加载期、按 API 名】的防御，被绕过四轮（open/import → dunder 链 →
+# pandas/numpy I/O 方法 → 模块属性回取 → DataSource/ExcelFile…），属务实但漏。
+# 这里加一层【执行期、按 OS 操作】的根因补强：在策略 exec/调用期间，于真正触发
+# 文件打开 / socket / 子进程 / 原生代码时拦截——无论 Python 层用何种花招到达
+# （DataSource、read_csv、裸 open、dunder 链回取 os.system 都殊途同归到这些审计事件）。
+# 审计事件集小而稳定（不随 pandas 版本增长），纯函数策略零触发 ⇒ 近零误伤。
+# 钩子全局且不可卸载，故用线程局部深度计数，仅在策略加载/执行窗口内生效。
+_sbx_local = threading.local()
+
+# 懒加载允许：import 子模块会读 .py/.pyc/.so/.pyd 及包内数据文件，均在这些目录内。
+# 用户数据/密钥文件（如 C:\Users\...\secret.txt）不在其中 ⇒ 读取被拒。
+_PYLIB_DIRS = tuple(sorted({
+    os.path.normcase(os.path.abspath(p))
+    for p in (sys.prefix, sys.base_prefix, *sys.path) if p
+}, key=len, reverse=True))
+
+_BLOCKED_AUDIT_PREFIXES = (
+    "socket.", "subprocess.", "ctypes.", "winreg.", "urllib.", "ftplib.",
+    "smtplib.", "http.client", "os.exec", "os.spawn", "os.fork",
+)
+_BLOCKED_AUDIT_EVENTS = frozenset({
+    "os.system", "os.startfile", "os.posix_spawn", "os.kill", "os.putenv",
+    "os.unsetenv", "os.removexattr", "os.setxattr", "shutil.copyfile",
+})
+
+
+def _sbx_active():
+    return getattr(_sbx_local, "depth", 0) > 0
+
+
+def _sandbox_audit_hook(event, args):
+    if not _sbx_active():
+        return
+    if event == "open":
+        path = args[0] if args else None
+        mode = args[1] if len(args) > 1 else None
+        m = "" if mode is None else str(mode)
+        if any(c in m for c in ("w", "a", "x", "+")):
+            raise PermissionError(f"策略沙箱：执行期禁止写文件 open({path!r}, {mode!r})")
+        # 读：仅放行 Python/库目录内文件（懒加载 import）；其余（用户数据/密钥）一律拒。
+        # 用 normcase（纯字符串、不触发审计事件）避免钩子内 abspath 再入。
+        if isinstance(path, str):
+            low = os.path.normcase(path)
+            if any(low.startswith(d) for d in _PYLIB_DIRS):
+                return
+        raise PermissionError(
+            f"策略沙箱：执行期禁止读取文件 open({path!r})（纯函数不得读数据/密钥文件）")
+    if event in _BLOCKED_AUDIT_EVENTS or event.startswith(_BLOCKED_AUDIT_PREFIXES):
+        raise PermissionError(f"策略沙箱：执行期禁止操作 {event}")
+
+
+sys.addaudithook(_sandbox_audit_hook)
+
+
+class sandbox_guard:
+    """上下文管理器：在策略 exec/调用窗口内开启运行期审计守卫（线程局部、可重入）。"""
+
+    def __enter__(self):
+        _sbx_local.depth = getattr(_sbx_local, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        _sbx_local.depth = max(0, getattr(_sbx_local, "depth", 1) - 1)
+        return False
 
 
 # 策略代码审计留档目录（仅留档，不参与执行）
@@ -418,9 +489,11 @@ def call_strategy(strategy_func, data, params=None):
     except (ValueError, TypeError):
         accepts_params = False
 
-    if accepts_params:
-        return strategy_func(data, params)
-    return strategy_func(data)
+    # 运行期沙箱守卫：策略函数体执行期间于 OS 操作层拦文件/网络/子进程（见模块顶部）
+    with sandbox_guard():
+        if accepts_params:
+            return strategy_func(data, params)
+        return strategy_func(data)
 
 
 SUPPORTED_CONTRACT_VERSIONS = (1, 2)
@@ -510,7 +583,9 @@ def load_strategy_func_from_code(code: str):
     module.__dict__["__builtins__"] = _build_sandbox_builtins()
 
     compiled = compile(code, filename=f"<{module_name}>", mode="exec")
-    exec(compiled, module.__dict__)
+    # 模块级代码也可能内含越权（如顶层 np.DataSource().open(...)）：exec 期也开守卫
+    with sandbox_guard():
+        exec(compiled, module.__dict__)
 
     if not hasattr(module, "generate_signals"):
         raise ValueError("策略代码中没有 generate_signals 函数")
