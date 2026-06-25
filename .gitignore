@@ -72,3 +72,6 @@ gradio_cached_examples/
 # 原子写暂存目录（临时文件，永不提交）
 .staging/
 *.tmp
+
+# 数据完整性状态 sidecar（运行期产物，随数据本地留存）
+.integrity/

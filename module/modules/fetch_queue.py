@@ -25,6 +25,7 @@ K 线数据拉取队列：统一所有拉取路径的串行化、进度状态与
 import threading
 import time
 
+from module.modules import data_integrity
 from module.modules.Load_real_kline import (
     Obtain_K,
     has_kline_data,
@@ -34,6 +35,15 @@ from module.modules.Load_real_kline import (
 
 # 首次使用（本地无任何数据）时默认初次拉取的币种
 DEFAULT_INITIAL_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+
+# 后台「先检查/修复缺口、再增量更新」总开关（默认开）。检查走白名单（只查未白名单月
+# + 最新月），开销随检查轮次收敛；修复仅在确有缺口时拉对应区间。
+_INTEGRITY_ENABLED = True
+
+
+def set_integrity_enabled(enabled: bool) -> None:
+    global _INTEGRITY_ENABLED
+    _INTEGRITY_ENABLED = bool(enabled)
 
 # 一批任务完成后，进度区保留"全部完成"显示的秒数
 _FINISHED_HOLD_SECONDS = 6.0
@@ -176,6 +186,13 @@ def _run():
 
         ok = False
         try:
+            # 先检查/修复缺口（白名单控开销），再增量更新。完整性这步最佳努力——
+            # 失败只吞掉、绝不阻断正常更新（数据可用性优先）。
+            if _INTEGRITY_ENABLED and data_dir:
+                try:
+                    data_integrity.check_and_repair(cand, data_dir)
+                except Exception:
+                    pass
             Obtain_K(cand, save_dir=data_dir)
             ok = bool(has_kline_data(cand, data_dir=data_dir))
         except Exception:

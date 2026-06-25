@@ -230,6 +230,52 @@ def data_acquisition(
     return df
 
 
+def _historical_klines(client, symbol, market_type, start, end):
+    """按市场类型取历史 K 线。start/end 接受毫秒整数或可读时间串。"""
+    interval = Client.KLINE_INTERVAL_1MINUTE
+    if market_type == "spot":
+        return client.get_historical_klines(symbol, interval=interval, start_str=start, end_str=end)
+    if market_type == "usdt_futures":
+        return client.futures_historical_klines(symbol=symbol, interval=interval, start_str=start, end_str=end)
+    if market_type == "coin_futures":
+        return client.futures_coin_historical_klines(symbol=symbol, interval=interval, start_str=start, end_str=end)
+    raise ValueError("market_type 只能是 'spot' / 'usdt_futures' / 'coin_futures'")
+
+
+def fetch_and_merge_range(
+    symbol, start_ms, end_ms, save_dir="kline_data", market_type="spot",
+):
+    """缺口修复：拉取 [start_ms, end_ms]（闭区间，毫秒）并【合并】进已有文件——保留
+    全部旧数据，只补这一段（不像 update_mode=False 那样覆盖、也不像 update_mode=True
+    那样只从末尾续拉）。去重(open_time)+排序后原子落盘。返回本次净新增行数。
+
+    回补历史中段，**不丢末根**（end_ms 是历史时点、非"now"）。币安对该段确无数据时
+    返回空 ⇒ 净新增 0，调用方据此把该段记为已知空洞、不再重试。
+    """
+    client = Client("", "")
+    sym = normalize_symbol(symbol)
+    os.makedirs(save_dir, exist_ok=True)
+    filename = os.path.join(save_dir, kline_file_name(sym))
+
+    old_df = load_existing_df(filename)
+    try:
+        klines = _historical_klines(client, sym, market_type, int(start_ms), int(end_ms))
+    except Exception as e:
+        print(f"❌ {sym} 缺口回补拉取失败 [{start_ms},{end_ms}]: {e}")
+        return 0
+
+    new_df = klines_to_df(klines)
+    if new_df.empty:
+        return 0
+
+    before = len(old_df)
+    df = pd.concat([old_df, new_df], ignore_index=True)
+    df = df.drop_duplicates(subset=["open_time"], keep="last").sort_values("open_time").reset_index(drop=True)
+    df = add_datetime_columns(df)
+    atomic_write_csv(df, filename, index=False, encoding="utf-8-sig")
+    return len(df) - before
+
+
 if False:
     # ===== 批量更新示例 =====
     stock_list = ['ETH', 'BTC', 'SOL', 'DOGE', 'XRP',
