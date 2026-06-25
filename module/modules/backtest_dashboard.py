@@ -8,6 +8,7 @@
 """
 
 import html as _html
+import math
 
 # 仪表盘特有标签（SUMMARY_TEXTS 没有的），六语言
 _DASH = {
@@ -80,7 +81,16 @@ def _color(v):
 
 def _spark_svg(values, w=520, h=88):
     """权益曲线内联 SVG（降采样到 ~160 点）。空/无效 → 空字符串。"""
-    pts = [float(v) for v in (values or []) if v is not None and v == v]
+    # 只保留【有限】值：剔除 None/NaN/±inf。仅用 v==v 会漏掉 inf（inf==inf 为真），
+    # 一个 inf 会让 min/max/span 变 inf、(v-lo)/span 算出 nan 坐标、整条折线损坏（审查 F1）。
+    pts = []
+    for v in (values or []):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            pts.append(f)
     if len(pts) < 2:
         return ""
     if len(pts) > 160:
@@ -153,10 +163,11 @@ def build_dashboard_html(metrics, trades, meta, summary_text, lang_code="zh"):
     pf_frac = (gross_profit / pf_total) if pf_total else 0.0
     win_frac = ((wins / (wins + losses)) if (wins + losses) else 0.0)
 
+    _start, _end = meta.get("start"), meta.get("end")
+    date_part = f"{_start} ~ {_end}" if (_start or _end) else ""   # 都缺时不要裸 " ~ "
     head = " · ".join(str(x) for x in [
         meta.get("symbol", ""), meta.get("timeframe", ""),
-        f'{meta.get("start","")} ~ {meta.get("end","")}',
-        f'{meta.get("kline_count","")}',
+        date_part, meta.get("kline_count", ""),
     ] if x not in ("", None))
 
     pnl_color = _color(total_ret if total_ret is not None else 0)

@@ -68,6 +68,21 @@ def test_dashboard_handles_none_metric_values():
     assert "qtbs-dash" in h and "—" in h
 
 
+def test_dashboard_sparkline_filters_non_finite():
+    # 审查 F1：权益里含 ±inf/NaN 不得产出 nan 坐标污染整条折线
+    meta = dict(_META, equity=[1000, float("inf"), 1100, float("nan"), 1300, float("-inf")])
+    h = build_dashboard_html(_METRICS, _TRADES, meta, _LABELS, "zh")
+    assert "<svg" in h and "polyline" in h
+    assert "nan" not in h.lower()          # 无非法坐标
+    assert ",inf" not in h and "inf," not in h
+
+
+def test_dashboard_empty_dates_no_bare_separator():
+    meta = {"symbol": "BTCUSDT", "timeframe": "1d", "equity": [100, 110]}
+    h = build_dashboard_html(_METRICS, _TRADES, meta, _LABELS, "zh")
+    assert " ~ " not in h   # start/end 都缺时不出现裸的 " ~ "
+
+
 def test_dashboard_negative_return_red():
     m = dict(_METRICS, total_return_pct=-30.0, final_equity=700.0)
     h = build_dashboard_html(m, _TRADES, _META, _LABELS, "zh")
