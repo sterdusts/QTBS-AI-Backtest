@@ -13,7 +13,7 @@ import os
 import webbrowser
 
 from pyecharts import options as opts
-from pyecharts.charts import Bar, HeatMap, Page
+from pyecharts.charts import Bar, Grid, HeatMap, Page
 
 from module.modules.file_naming import build_timestamped_filename
 
@@ -82,6 +82,29 @@ def _round(v):
     return round(v, 4) if isinstance(v, (int, float)) else None
 
 
+def _title_legend(title, with_legend=True):
+    """统一：标题居中置顶、图例在标题【下方】（不再与标题重叠）。"""
+    opts_d = {
+        "title_opts": opts.TitleOpts(title=title, pos_left="center", pos_top="3%"),
+        "tooltip_opts": opts.TooltipOpts(trigger="axis"),
+    }
+    if with_legend:
+        opts_d["legend_opts"] = opts.LegendOpts(pos_left="center", pos_top="12%")
+    else:
+        opts_d["legend_opts"] = opts.LegendOpts(is_show=False)
+    return opts_d
+
+
+def _wrap(chart, height="380px", pos_top="27%", pos_bottom="14%"):
+    """把单图包进 Grid：标题/图例在画布顶部 27% 内，绘图区从 27% 起——彻底避开重叠。
+    宽度 100% ⇒ 每图独占一行、自适应容器宽（修 SimplePageLayout flex-wrap 的 2 列错排）。"""
+    grid = Grid(init_opts=opts.InitOpts(width="100%", height=height))
+    grid.add(chart, grid_opts=opts.GridOpts(
+        pos_top=pos_top, pos_bottom=pos_bottom, pos_left="8%", pos_right="6%",
+        is_contain_label=True))
+    return grid
+
+
 def _is_oos_bar(report, metrics, title, lang):
     """IS/OOS 双系列柱（指标子集）。degradation 不可用 ⇒ None（不出该图）。"""
     deg = (report.get("in_out") or {}).get("degradation") or {}
@@ -96,12 +119,8 @@ def _is_oos_bar(report, metrics, title, lang):
     bar.add_xaxis(labels)
     bar.add_yaxis(_t(lang, "in"), is_vals, label_opts=opts.LabelOpts(is_show=False))
     bar.add_yaxis(_t(lang, "out"), oos_vals, label_opts=opts.LabelOpts(is_show=False))
-    bar.set_global_opts(
-        title_opts=opts.TitleOpts(title=title),
-        tooltip_opts=opts.TooltipOpts(trigger="axis"),
-        legend_opts=opts.LegendOpts(pos_top="6%"),
-    )
-    return bar
+    bar.set_global_opts(**_title_legend(title))
+    return _wrap(bar, height="380px", pos_top="27%", pos_bottom="12%")
 
 
 def _wfo_bar(report, lang):
@@ -134,13 +153,10 @@ def _wfo_bar(report, lang):
         markline = opts.MarkLineOpts(data=[opts.MarkLineItem(y=round(mean_ret, 4), name=_t(lang, "mean"))])
         bar.set_series_opts(markline_opts=markline)
 
-    bar.set_global_opts(
-        title_opts=opts.TitleOpts(title=_t(lang, "wfo_title")),
-        tooltip_opts=opts.TooltipOpts(trigger="axis"),
-        xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
-        legend_opts=opts.LegendOpts(pos_top="6%"),
-    )
-    return bar
+    go = _title_legend(_t(lang, "wfo_title"))
+    go["xaxis_opts"] = opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30))
+    bar.set_global_opts(**go)
+    return _wrap(bar, height="420px", pos_top="26%", pos_bottom="20%")
 
 
 def _heatmap(report, lang):
@@ -184,13 +200,15 @@ def _heatmap(report, lang):
     hm.add_yaxis(_t(lang, "metric_value"), y_labels, data,
                  label_opts=opts.LabelOpts(is_show=True, position="inside"))
     hm.set_global_opts(
-        title_opts=opts.TitleOpts(title=title),
+        title_opts=opts.TitleOpts(title=title, pos_left="center", pos_top="3%"),
+        legend_opts=opts.LegendOpts(is_show=False),
         visualmap_opts=opts.VisualMapOpts(min_=lo, max_=hi, is_calculable=True,
-                                          orient="horizontal", pos_left="center", pos_bottom="2%"),
+                                          orient="horizontal", pos_left="center", pos_bottom="3%"),
         xaxis_opts=opts.AxisOpts(name=x_name, type_="category"),
         yaxis_opts=opts.AxisOpts(name=(y_param or ""), type_="category"),
     )
-    return hm
+    # 顶部 18% 留标题、底部 24% 留水平 visualmap + x 轴标签
+    return _wrap(hm, height="440px", pos_top="18%", pos_bottom="24%")
 
 
 def plot_robustness(report, output_dir="Past_data", file_prefix="robustness",
