@@ -190,23 +190,25 @@ def build_dashboard_html(metrics, trades, meta, summary_text, lang_code="zh"):
     )
 
     # ---- 指标卡 ----
+    # 盈亏比 = 平均盈利/平均亏损（payoff_ratio）；与 Profit Factor(总盈/总亏)不同口径。
+    # 条形按 平均盈利/(平均盈利+|平均亏损|) 直观对比单笔盈亏体量。
+    avg_p = metrics.get("avg_profit") or 0.0
+    avg_l = metrics.get("avg_loss") or 0.0
+    payoff_frac = (avg_p / (avg_p + abs(avg_l))) if (avg_p + abs(avg_l)) else 0.0
     cards = [
         (st.get("net_win_rate", "win_rate"), (_num(win_rate, na=na) + "%"),
          f'{wins} {t["win"]} / {losses} {t["loss"]}', win_frac),
         (t["long_short"], (_num(long_frac * 100, na=na) + "%"),
          f'{longs}{t["long"]} / {shorts}{t["short"]}', long_frac),
-        (st.get("trade_count", "trades"), str(metrics.get("trade_count", len(trades))),
-         f'{_num(metrics.get("avg_holding_hours"), 1, na)}h · {t["total_fee"]} {_num(total_fee)}', None),
+        # 盈亏比 与 交易次数 互换：盈亏比占普通卡片位
+        (st.get("payoff_ratio", "payoff_ratio"), _num(metrics.get("payoff_ratio"), na=na),
+         f'+{_num(avg_p)} / {_num(avg_l)}', payoff_frac),
         (st.get("profit_factor", "PF"), _num(metrics.get("profit_factor"), na=na),
          f'+{_num(gross_profit)} / {_num(gross_loss)}', pf_frac),
     ]
-    # 盈亏比 = 平均盈利/平均亏损（payoff_ratio）；与 Profit Factor(总盈/总亏)不同口径。
-    # 作为整行卡片附在末尾（条形按 平均盈利/(平均盈利+|平均亏损|) 直观对比单笔盈亏体量）。
-    avg_p = metrics.get("avg_profit") or 0.0
-    avg_l = metrics.get("avg_loss") or 0.0
-    payoff_frac = (avg_p / (avg_p + abs(avg_l))) if (avg_p + abs(avg_l)) else 0.0
-    cards.append((st.get("payoff_ratio", "payoff_ratio"), _num(metrics.get("payoff_ratio"), na=na),
-                  f'+{_num(avg_p)} / {_num(avg_l)}', payoff_frac, True))
+    # 交易次数 改为整行卡片置于末尾（与盈亏比互换）
+    cards.append((st.get("trade_count", "trades"), str(metrics.get("trade_count", len(trades))),
+                  f'{_num(metrics.get("avg_holding_hours"), 1, na)}h · {t["total_fee"]} {_num(total_fee)}', None, True))
 
     cards_html = ""
     for card in cards:
