@@ -10,13 +10,15 @@ from module.modules.backtest_dashboard import (
 _LABELS = {
     "initial_cash": "初始资金", "final_equity": "最终权益", "total_return": "总收益率",
     "annual_return": "年化收益", "sharpe_ratio": "夏普比率", "max_drawdown": "最大回撤",
-    "net_win_rate": "净胜率", "profit_factor": "盈亏比", "trade_count": "交易次数",
+    "net_win_rate": "净胜率", "profit_factor": "Profit Factor", "payoff_ratio": "盈亏比",
+    "trade_count": "交易次数",
 }
 
 _METRICS = {
     "initial_cash": 1000.0, "final_equity": 1448.63, "total_return_pct": 44.863,
     "annual_return_pct": 34.35, "sharpe_ratio": 5.06, "max_drawdown_pct": -22.87,
-    "net_win_rate": 67.19, "profit_factor": 2.46, "trade_count": 4, "avg_holding_hours": 17.2,
+    "net_win_rate": 67.19, "profit_factor": 2.46, "payoff_ratio": 1.83,
+    "trade_count": 4, "avg_holding_hours": 17.2,
 }
 _TRADES = [
     {"side": "long", "net_pnl": 300.0, "open_fee": 1.0, "close_fee": 1.0},
@@ -38,7 +40,8 @@ def test_dashboard_contains_key_numbers_and_chart():
     assert "<svg" in h and "polyline" in h   # 权益迷你曲线
     assert "5.06" in h             # 夏普
     assert "-22.87" in h           # 最大回撤
-    assert "2.46" in h             # 盈亏比
+    assert "2.46" in h             # Profit Factor 卡
+    assert "盈亏比" in h and "1.83" in h   # 新增的盈亏比(payoff_ratio)行
     # 胜率卡：3 盈 / 1 亏
     assert "3 盈利 / 1 亏损" in h
     # 多空比卡：2多 / 2空
