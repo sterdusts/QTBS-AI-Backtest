@@ -249,8 +249,13 @@ def fetch_and_merge_range(
     全部旧数据，只补这一段（不像 update_mode=False 那样覆盖、也不像 update_mode=True
     那样只从末尾续拉）。去重(open_time)+排序后原子落盘。返回本次净新增行数。
 
-    回补历史中段，**不丢末根**（end_ms 是历史时点、非"now"）。币安对该段确无数据时
-    返回空 ⇒ 净新增 0，调用方据此把该段记为已知空洞、不再重试。
+    回补历史中段，**不丢末根**（end_ms 是历史时点、非"now"）。
+
+    返回值区分三态（调用方据此决定是否封"已知空洞"）：
+    - 整数 >0：净新增行数（成功补到数据）
+    - 0：拉取**成功但币安确无**该段数据 ⇒ 调用方可据此记为已知空洞、不再重试
+    - **None：拉取异常**（瞬时网络错误/超时等）⇒ 调用方【不得】封洞，须留待下次重试
+      （否则一次瞬时失败会把可补的缺口永久埋死——审查发现的高危）。
     """
     client = Client("", "")
     sym = normalize_symbol(symbol)
@@ -262,18 +267,18 @@ def fetch_and_merge_range(
         klines = _historical_klines(client, sym, market_type, int(start_ms), int(end_ms))
     except Exception as e:
         print(f"❌ {sym} 缺口回补拉取失败 [{start_ms},{end_ms}]: {e}")
-        return 0
+        return None   # 异常 ≠ 确无：返回 None，调用方不封洞、下次重试
 
     new_df = klines_to_df(klines)
     if new_df.empty:
-        return 0
+        return 0      # 成功但币安确无该段 ⇒ 可封为已知空洞
 
     before = len(old_df)
     df = pd.concat([old_df, new_df], ignore_index=True)
     df = df.drop_duplicates(subset=["open_time"], keep="last").sort_values("open_time").reset_index(drop=True)
     df = add_datetime_columns(df)
     atomic_write_csv(df, filename, index=False, encoding="utf-8-sig")
-    return len(df) - before
+    return max(0, len(df) - before)
 
 
 if False:

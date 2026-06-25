@@ -61,6 +61,13 @@ def test_scan_gaps_contiguous_none():
     assert di.scan_gaps(np.array(mins, dtype=np.int64)) == []
 
 
+def test_scan_gaps_ignores_subminute_spacing():
+    # 相邻 90 秒（>1min 但不足 2 分钟、非分钟对齐）：无整分钟缺失，不得算出倒挂缺口
+    base = di._month_start_ms("2024-01")
+    mins = [base, base + 90_000, base + 150_000]
+    assert di.scan_gaps(np.array(mins, dtype=np.int64)) == []
+
+
 # =========================================================
 # 修复：缺口被回补
 # =========================================================
@@ -97,6 +104,31 @@ def test_unfillable_gap_becomes_known_hole(tmp_path):
     rep2 = di.check_and_repair("BTCUSDT", str(tmp_path), fetcher=_filler(path, present))
     assert rep2["gaps_to_repair"] == 0
     assert rep2["remaining_gaps"] == 0
+
+
+def test_transient_fetch_error_not_sealed(tmp_path):
+    """高危回归：拉取【异常】（fetcher 返回 None）不得封为已知空洞——否则一次瞬时
+    网络错误会把可补缺口永久埋死。缺口须保留、下次网络恢复仍能补上。"""
+    path = _csv_path(tmp_path)
+    base = di._month_start_ms("2024-01")
+    present = [base + k * MIN for k in (0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12)]
+    missing = [base + 6 * MIN, base + 7 * MIN]
+    _write(path, present)
+
+    def erroring_fetcher(symbol, s, e, d, m):
+        return None   # 模拟拉取异常（超时/网络错误）
+
+    rep = di.check_and_repair("BTCUSDT", str(tmp_path), fetcher=erroring_fetcher)
+    assert rep["gaps_to_repair"] == 1
+    assert rep["confirmed_holes_new"] == 0       # 异常绝不封洞
+    assert rep["known_holes_total"] == 0
+    assert rep["remaining_gaps"] == 1            # 缺口仍在，待重试
+    assert "2024-01" not in rep["whitelisted_months"]
+
+    # 网络恢复、币安确有该段 ⇒ 仍能补上（没被永久埋死）
+    rep2 = di.check_and_repair("BTCUSDT", str(tmp_path), fetcher=_filler(path, present + missing))
+    assert rep2["rows_repaired"] == 2
+    assert di.scan_gaps(di._read_open_times(path)) == []
 
 
 # =========================================================

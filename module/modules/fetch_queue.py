@@ -105,11 +105,13 @@ def _register_locked(symbol: str, data_dir: str, front: bool = False,
     # 总用最新请求目录：回测 fetch_blocking 要在它自己的目录拿数据，
     # 不能沿用批量首次登记的目录
     _DIR_OF[symbol] = data_dir
-    if force_integrity:
-        _FORCE_INTEGRITY.add(symbol)   # 只升级、不降级（同币种被多路登记时取最强）
 
     if symbol == _CURRENT:
+        # 已在处理中（force 读取点已过）：本轮强制无意义，也不残留标记到下一轮
         return
+
+    if force_integrity:
+        _FORCE_INTEGRITY.add(symbol)   # 只升级、不降级（含已在队列中的币种：升级为强制）
 
     if symbol in _QUEUED:
         if front and symbol in _QUEUE:

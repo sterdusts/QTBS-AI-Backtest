@@ -44,7 +44,15 @@ def scan_gaps(open_times_ms):
         return []
     diffs = np.diff(arr)
     idx = np.where(diffs > ONE_MINUTE_MS)[0]
-    return [(int(arr[i] + ONE_MINUTE_MS), int(arr[i + 1] - ONE_MINUTE_MS)) for i in idx]
+    out = []
+    for i in idx:
+        s = int(arr[i] + ONE_MINUTE_MS)
+        e = int(arr[i + 1] - ONE_MINUTE_MS)
+        # 仅在【确有整分钟缺失】时才算缺口（s<=e）：非分钟对齐的脏时间戳（如相邻 90s）
+        # 会算出 s>e 的倒挂区间，污染覆盖/重叠判断，必须丢弃
+        if e >= s:
+            out.append((s, e))
+    return out
 
 
 def _month_of(ms):
@@ -217,14 +225,21 @@ def check_and_repair(
     new_holes_count = 0
     if repair and to_repair:
         fn = fetcher or _default_fetcher
+        attempted_ok = []   # 拉取【成功】（返回数字、含 0=确无）的缺口；None=异常不计
         for (gs, ge) in to_repair:
-            rows_repaired += int(fn(sym, gs, ge, data_dir, market_type) or 0)
-        # 回补后重读重扫：本轮尝试修复但仍残留的缺口 = 币安确无 ⇒ 记为已知空洞
+            res = fn(sym, gs, ge, data_dir, market_type)
+            if res is None:
+                continue    # 拉取异常（瞬时/未知）：不封洞、不计，留待下次重试
+            rows_repaired += int(res)
+            attempted_ok.append((gs, ge))
+        # 回补后重读重扫：仅【拉取成功但仍残留】的缺口 = 币安确无 ⇒ 记为已知空洞。
+        # 拉取异常的缺口不在 attempted_ok 里，绝不会被封——避免瞬时网络错误把可补
+        # 缺口永久埋死（审查发现的高危）。
         open_times = _read_open_times(file_path)
         months_present = _months_present(open_times)
         eval_months &= months_present
         gaps = scan_gaps(open_times)
-        residual = [g for g in gaps if not _covered_by_holes(g, holes) and _overlaps_any(g, to_repair)]
+        residual = [g for g in gaps if not _covered_by_holes(g, holes) and _overlaps_any(g, attempted_ok)]
         if residual:
             holes = _merge_holes(holes + residual)
             new_holes_count = len(residual)

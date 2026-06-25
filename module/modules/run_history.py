@@ -61,7 +61,9 @@ def save_run_record(record: dict, output_dir: str = RUN_HISTORY_DIR) -> str:
     os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, build_timestamped_filename("run", ".json"))
     with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(_json_safe(record), f, ensure_ascii=False, indent=2, default=str)
+        # _json_safe 已把 inf/NaN 归一为 null，故 allow_nan=False 永不抛、且保证产出
+        # 严格合法 JSON（默认 allow_nan=True 会写出非法的 Infinity/NaN 字面量）
+        json.dump(_json_safe(record), f, ensure_ascii=False, indent=2, default=str, allow_nan=False)
     return file_path
 
 
