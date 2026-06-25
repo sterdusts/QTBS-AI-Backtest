@@ -181,9 +181,6 @@ def build_dashboard_html(metrics, trades, meta, summary_text, lang_code="zh"):
         (st.get("annual_return", "annual_return"), _num(metrics.get("annual_return_pct"), na=na) + "%",
          _color(metrics.get("annual_return_pct") or 0)),
         (st.get("sharpe_ratio", "sharpe_ratio"), _num(metrics.get("sharpe_ratio"), na=na), None),
-        # 盈亏比 = 平均盈利/平均亏损（payoff_ratio），与卡片里的 Profit Factor（总盈/总亏）
-        # 是两个不同口径的指标，单独列出
-        (st.get("payoff_ratio", "payoff_ratio"), _num(metrics.get("payoff_ratio"), na=na), None),
         (st.get("max_drawdown", "max_drawdown"), _num(metrics.get("max_drawdown_pct"), na=na) + "%", _RED),
     ]
     rows_html = "".join(
@@ -203,11 +200,22 @@ def build_dashboard_html(metrics, trades, meta, summary_text, lang_code="zh"):
         (st.get("profit_factor", "PF"), _num(metrics.get("profit_factor"), na=na),
          f'+{_num(gross_profit)} / {_num(gross_loss)}', pf_frac),
     ]
+    # 盈亏比 = 平均盈利/平均亏损（payoff_ratio）；与 Profit Factor(总盈/总亏)不同口径。
+    # 作为整行卡片附在末尾（条形按 平均盈利/(平均盈利+|平均亏损|) 直观对比单笔盈亏体量）。
+    avg_p = metrics.get("avg_profit") or 0.0
+    avg_l = metrics.get("avg_loss") or 0.0
+    payoff_frac = (avg_p / (avg_p + abs(avg_l))) if (avg_p + abs(avg_l)) else 0.0
+    cards.append((st.get("payoff_ratio", "payoff_ratio"), _num(metrics.get("payoff_ratio"), na=na),
+                  f'+{_num(avg_p)} / {_num(avg_l)}', payoff_frac, True))
+
     cards_html = ""
-    for (title, val, sub, frac) in cards:
+    for card in cards:
+        title, val, sub, frac = card[0], card[1], card[2], card[3]
+        wide = len(card) > 4 and card[4]
         bar = _bar(frac) if frac is not None else ""
+        style = ' style="grid-column:1/-1"' if wide else ""
         cards_html += (
-            f'<div class="qd-card"><div class="qc-t">{esc(str(title))}</div>'
+            f'<div class="qd-card"{style}><div class="qc-t">{esc(str(title))}</div>'
             f'<div class="qc-v">{esc(str(val))}</div>'
             f'<div class="qc-sub">{esc(str(sub))}</div>{bar}</div>'
         )

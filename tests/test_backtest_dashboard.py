@@ -18,7 +18,7 @@ _METRICS = {
     "initial_cash": 1000.0, "final_equity": 1448.63, "total_return_pct": 44.863,
     "annual_return_pct": 34.35, "sharpe_ratio": 5.06, "max_drawdown_pct": -22.87,
     "net_win_rate": 67.19, "profit_factor": 2.46, "payoff_ratio": 1.83,
-    "trade_count": 4, "avg_holding_hours": 17.2,
+    "avg_profit": 200.0, "avg_loss": -109.3, "trade_count": 4, "avg_holding_hours": 17.2,
 }
 _TRADES = [
     {"side": "long", "net_pnl": 300.0, "open_fee": 1.0, "close_fee": 1.0},
