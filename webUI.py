@@ -34,6 +34,7 @@ from module.modules.data_panel import (
 from module.modules.generic_chart import plot_generic_equity_curves
 from module.modules.portfolio_chart import plot_portfolio_result
 from module.modules.robustness_chart import plot_robustness
+from module.modules.backtest_dashboard import build_dashboard_html, build_dashboard_placeholder
 from module.modules.run_history import build_run_record, save_run_record
 from module.analysis.robustness import run_full_analysis
 from dotenv import load_dotenv
@@ -1441,9 +1442,9 @@ def update_ui_language(
         gr.update(
             value=build_review_html(None, lang_code),
         ),
-        gr.update(
-            label=text["result_output_label"],
-        ),
+        # 回测结果现为 gr.HTML 可视化仪表盘：切语言时不重渲染（保留当前结果、不清空），
+        # 下次运行回测会以新语言重画。gr.update() 无参 = 不改动该组件
+        gr.update(),
         gr.update(
             label=text["chart_file_label"],
         ),
@@ -1557,6 +1558,14 @@ def generate_code_from_ui(
 # 运行回测
 # =========================================================
 
+def _result_error_html(msg: str) -> str:
+    """回测出错时在结果仪表盘位以醒目红字展示（gr.HTML）。"""
+    return (
+        '<div style="padding:14px;border-radius:12px;background:#fdeced;'
+        f'color:#ea3943;font-size:14px;line-height:1.5">{html.escape(str(msg))}</div>'
+    )
+
+
 def run_backtest_from_ui(
     strategy_code: str,
     output_language: str,
@@ -1577,7 +1586,7 @@ def run_backtest_from_ui(
 
     try:
         if strategy_code is None or strategy_code.strip() == "":
-            return text["no_code_error"], None
+            return _result_error_html(text["no_code_error"]), None
 
         try:
             start_str, end_str, symbol, (
@@ -1593,7 +1602,7 @@ def run_backtest_from_ui(
                 fee_rate_percent, slippage_percent,
             )
         except Exception as e:
-            return str(e), None
+            return _result_error_html(str(e)), None
 
         fee_rate_value = fee_rate_percent_value / 100
         slippage_value = slippage_percent_value / 100
@@ -1615,7 +1624,7 @@ def run_backtest_from_ui(
                 ),
             )
         except InsufficientKlinesError as e:
-            return text["too_few_klines_error"].format(count=e.kline_count), None
+            return _result_error_html(text["too_few_klines_error"].format(count=e.kline_count)), None
 
         result = run["result"]
         route_version = run["route_version"]
@@ -1701,10 +1710,25 @@ def run_backtest_from_ui(
         except Exception as record_err:
             print(f"[run_history] 历史留档失败（不影响回测）：{record_err}")
 
-        return summary, html_path
+        # 输出台以可视化仪表盘展示结果（大字总盈亏 + 权益曲线 + 指标卡）；
+        # 人类可读文字摘要仍随历史留档（上方 summary）。
+        equity = [p.get("equity_close") for p in result.get("equity_curve", [])]
+        dashboard = build_dashboard_html(
+            metrics,
+            result.get("trades", []),
+            {
+                "symbol": display_symbol, "timeframe": timeframe,
+                "start": actual_start, "end": actual_end,
+                "kline_count": kline_count, "initial_cash": initial_cash_value,
+                "equity": equity,
+            },
+            summary_text,
+            output_language,
+        )
+        return dashboard, html_path
 
     except Exception as e:
-        return f"{text['backtest_fail_error']}：{str(e)}", None
+        return _result_error_html(f"{text['backtest_fail_error']}：{str(e)}"), None
 
 
 # IS/OOS 对比表展示的指标 → SUMMARY_TEXTS 标签键（指标名复用回测摘要文案，不重复翻译）
@@ -3182,30 +3206,30 @@ with gr.Blocks(
                     )
                 )
 
-                with gr.Row(elem_id="output-grid", equal_height=True):
-                    with gr.Column(scale=6, min_width=360):
-                        with gr.Accordion(
-                            default_text["code_output_label"],
-                            open=False,
-                        ) as code_accordion:
-                            strategy_code_output = gr.Code(
-                                label="",
-                                language="python",
-                                lines=26,
-                                elem_id="output-code",
-                            )
-
-                    with gr.Column(scale=5, min_width=340):
-                        backtest_result_output = gr.Textbox(
-                            label=default_text["result_output_label"],
+                # 纵向堆叠：代码折叠面板【全宽】置顶（折叠后仅占标题条），把整片宽度
+                # 留给回测结果可视化（用户反馈：代码即便折叠也占了输出台太多空间）
+                with gr.Column(elem_id="output-grid"):
+                    with gr.Accordion(
+                        default_text["code_output_label"],
+                        open=False,
+                    ) as code_accordion:
+                        strategy_code_output = gr.Code(
+                            label="",
+                            language="python",
                             lines=20,
-                            elem_id="result-box",
+                            elem_id="output-code",
                         )
 
-                        chart_file_output = gr.File(
-                            label=default_text["chart_file_label"],
-                            elem_id="chart-file-output",
-                        )
+                    # 回测结果可视化仪表盘（大字总盈亏 + 权益曲线 + 指标卡），全宽主角
+                    backtest_result_output = gr.HTML(
+                        build_dashboard_placeholder(default_lang),
+                        elem_id="result-box",
+                    )
+
+                    chart_file_output = gr.File(
+                        label=default_text["chart_file_label"],
+                        elem_id="chart-file-output",
+                    )
 
                 with gr.Accordion(
                     get_robustness_text(default_lang)["panel_title"],
