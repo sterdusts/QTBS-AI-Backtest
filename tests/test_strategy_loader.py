@@ -206,6 +206,25 @@ def test_escape_via_pandas_numpy_io_blocked():
             load_strategy_func_from_code(code)
 
 
+def test_escape_via_datasource_and_excelfile_blocked():
+    # 全仓审查发现：np.lib.npyio.DataSource / np.DataSource / pd.ExcelFile 是
+    # I/O 黑名单遗漏的文件读取(/URL SSRF)构造器。逐个验证现已按属性名静态拒绝。
+    snippets = [
+        "np.lib.npyio.DataSource()",   # npyio 子模块 + DataSource 双重拦
+        "np.DataSource()",             # 顶层 DataSource
+        "ds = pd.ExcelFile",           # pandas Excel 文件读取器
+    ]
+    for snippet in snippets:
+        code = (
+            "import pandas as pd\nimport numpy as np\n\n"
+            "def generate_signals(df):\n"
+            f"    {snippet}\n"
+            "    return df\n"
+        )
+        with pytest.raises(ValueError, match="文件/网络 I/O|模块属性"):
+            load_strategy_func_from_code(code)
+
+
 def test_legit_pandas_numpy_compute_not_blocked_by_io_guard():
     # 正例：常用纯计算方法（to_numpy/to_dict/to_frame/rolling/ewm/shift 等）
     # 不被 I/O 守卫误杀，典型策略仍可加载执行。

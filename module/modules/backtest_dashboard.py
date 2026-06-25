@@ -161,7 +161,10 @@ def build_dashboard_html(metrics, trades, meta, summary_text, lang_code="zh"):
     long_frac = (longs / ls_total) if ls_total else 0.0
     pf_total = gross_profit + abs(gross_loss)
     pf_frac = (gross_profit / pf_total) if pf_total else 0.0
-    win_frac = ((wins / (wins + losses)) if (wins + losses) else 0.0)
+    # 进度条与显示的胜率%同源（用 win_rate/100），避免含保本单(net_pnl==0)时
+    # "卡片数字按 net_win_rate(分母含全部交易) 而条形按 wins/(wins+losses)" 不一致
+    win_frac = (win_rate / 100.0) if win_rate is not None else (
+        (wins / (wins + losses)) if (wins + losses) else 0.0)
 
     _start, _end = meta.get("start"), meta.get("end")
     date_part = f"{_start} ~ {_end}" if (_start or _end) else ""   # 都缺时不要裸 " ~ "

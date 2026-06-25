@@ -46,11 +46,14 @@ class KlineBuilder:
         # 浅拷贝即可：写时复制下对 open_time 的赋值只复制该列，不动原始帧
         df = df.copy(deep=False)
 
-        # 兼容 Binance 毫秒时间戳 / 字符串时间
+        # 兼容 Binance 毫秒时间戳 / 字符串时间。errors="coerce" 与 load_existing_df /
+        # data_integrity._read_open_times 同口径：损坏行 → NaT 后丢弃（下方 dropna），
+        # 而非整批加载崩溃（如 object 列里混入非法 token 致 OutOfBoundsDatetime）。
         if pd.api.types.is_numeric_dtype(df["open_time"]):
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
         else:
-            df["open_time"] = pd.to_datetime(df["open_time"])
+            df["open_time"] = pd.to_datetime(df["open_time"], errors="coerce")
+        df = df[df["open_time"].notna()]
 
         # 遗留 tz-aware CSV（ISO "...+00:00"）会得到带时区的 datetime：统一剥成
         # tz-naive UTC（与 data_panel._local_data_end 同口径），否则下游用

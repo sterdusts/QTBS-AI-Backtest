@@ -26,6 +26,16 @@ def make_1m_df(start, periods):
 # 重采样聚合正确性
 # =========================================================
 
+def test_object_dtype_open_time_does_not_crash():
+    """审查发现：object 列里的数值毫秒字符串经无 errors='coerce' 的 to_datetime 会
+    OutOfBoundsDatetime 崩溃。现与 load_existing_df 同口径：坏行 coerce→NaT→丢弃，
+    不再让回测在数据加载即崩。"""
+    raw = make_1m_df("2024-01-01 00:00", 5)
+    # 强制 open_time 为 object 且为数值毫秒字符串（损坏 CSV 的典型形态）
+    raw["open_time"] = raw["open_time"].astype("int64").astype(str).astype(object)
+    KlineBuilder(raw).build("4h")   # 不抛异常即通过（坏行被丢弃，可能为空）
+
+
 def test_1d_aggregation_does_not_raise_on_day_offset():
     """回归：pandas 4 下 to_offset("1D") 是日历偏移 Day，旧代码 pd.Timedelta(Day)
     抛 'Value must be ... not Day' ⇒ 日线回测在数据加载即崩溃（分钟/小时正常）。

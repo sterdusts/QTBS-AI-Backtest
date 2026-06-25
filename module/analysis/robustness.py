@@ -350,6 +350,11 @@ def _aggregate_walk_forward(windows):
         t = w["test"]
         if t.get("insufficient") or t.get("empty"):
             continue
+        # WFO 模式下若该窗 IS 段无有效信号（is_optimized=False，参数退化为首候选而非
+        # 真正寻优），其 OOS 不代表"按最优参数前推"的结果，不计入聚合统计防污染。
+        # 稳定性扫描模式（无 param_grid）的窗口没有 is_optimized 键 ⇒ 不受影响。
+        if w["train"].get("is_optimized") is False:
+            continue
         m = t["metrics"]
         valid += 1
         if m.get("total_return_pct") is not None:

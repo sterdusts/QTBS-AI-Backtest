@@ -245,6 +245,24 @@ def test_walk_forward_true_wfo_optimizes_is(tmp_path):
     assert _json_ok(res)
 
 
+def test_wfo_aggregate_excludes_unoptimized_windows():
+    # 审查发现：WFO 模式下 IS 无信号(is_optimized=False，参数退化为首候选)的窗口
+    # 不应计入聚合统计；稳定性扫描模式（无 is_optimized 键）的窗口不受影响。
+    windows = [
+        {"index": 0, "train": {"is_optimized": True},
+         "test": {"metrics": {"total_return_pct": 10.0, "sharpe_ratio": 1.0, "max_drawdown_pct": -5.0}}},
+        {"index": 1, "train": {"is_optimized": False},   # 应被剔除
+         "test": {"metrics": {"total_return_pct": 999.0, "sharpe_ratio": 9.0, "max_drawdown_pct": -1.0}}},
+    ]
+    agg = robustness._aggregate_walk_forward(windows)
+    assert agg["valid_windows"] == 1
+    assert agg["mean_out_return"] == 10.0          # 不含被剔除窗口的 999
+    # 稳定性扫描窗口（无 is_optimized 键）不被剔除
+    stab = robustness._aggregate_walk_forward(
+        [{"index": 0, "train": {"bars": 4}, "test": {"metrics": {"total_return_pct": 7.0}}}])
+    assert stab["valid_windows"] == 1
+
+
 def test_walk_forward_no_param_space_is_stability_scan(tmp_path):
     df = make_df(list(range(100, 112)))
     res = robustness.walk_forward(

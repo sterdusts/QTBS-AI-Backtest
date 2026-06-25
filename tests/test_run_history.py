@@ -75,3 +75,18 @@ def test_empty_prompt_allowed(tmp_path):
 
 def test_list_empty_dir_returns_empty(tmp_path):
     assert list_run_records(str(tmp_path / "nonexistent")) == []
+
+
+def test_numpy_scalars_serialize_as_numbers(tmp_path):
+    # 审查发现：np.int64 不是 Python int 子类，旧版会经 default=str 存成字符串 "153"
+    import numpy as np
+    rec = build_run_record(
+        prompt="", strategy_code="x", market="crypto",
+        params={"kline_count": np.int64(153), "ratio": np.float64(1.5)},
+        metrics={"sharpe": np.float64(float("inf"))}, chart_file=None, timestamp_utc="t")
+    path = save_run_record(rec, output_dir=str(tmp_path))
+    back = load_run_record(path)
+    assert back["params"]["kline_count"] == 153 and isinstance(back["params"]["kline_count"], int)
+    assert back["params"]["ratio"] == 1.5
+    assert back["metrics"]["sharpe"] is None          # np inf 仍归一为 null
+    assert '"153"' not in open(path, encoding="utf-8").read()   # 是数字、非字符串

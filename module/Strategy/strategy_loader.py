@@ -141,10 +141,11 @@ FORBIDDEN_IO_ATTRS = frozenset({
     "to_csv", "to_pickle", "to_parquet", "to_feather", "to_orc", "to_hdf",
     "to_excel", "to_json", "to_html", "to_xml", "to_sql", "to_stata",
     "to_gbq", "to_clipboard",
-    "ExcelWriter", "HDFStore",
-    # numpy 文件 I/O
+    "ExcelWriter", "ExcelFile", "HDFStore", "get_handle",
+    # numpy 文件 I/O（DataSource 是文件/URL 读取器，np.DataSource 与
+    # np.lib.npyio.DataSource 两条路径都拦——审查发现的越权向量）
     "save", "savez", "savez_compressed", "savetxt", "load", "loadtxt",
-    "fromfile", "tofile", "genfromtxt", "fromregex", "memmap",
+    "fromfile", "tofile", "genfromtxt", "fromregex", "memmap", "DataSource",
 })
 
 
@@ -156,6 +157,7 @@ FORBIDDEN_IO_ATTRS = frozenset({
 FORBIDDEN_MODULE_ATTRS = frozenset({
     "os", "sys", "subprocess", "socket", "shutil", "pathlib", "importlib",
     "ctypes", "pickle", "marshal", "builtins", "compat", "io", "f2py",
+    "npyio",   # np.lib.npyio 子模块（含 DataSource 等 I/O），斩断该路径中段
 })
 
 
