@@ -106,21 +106,43 @@ def _wrap(chart, height="380px", pos_top="27%", pos_bottom="14%"):
 
 
 def _is_oos_bar(report, metrics, title, lang):
-    """IS/OOS 双系列柱（指标子集）。degradation 不可用 ⇒ None（不出该图）。"""
+    """IS/OOS 对比：每个指标【独立坐标系】（自有 y 轴），并排成一行子图——避免量纲悬殊
+    的指标（如总收益 600% vs 年化 80%）共用一根 y 轴时小柱被压扁不可读。
+    degradation 不可用 ⇒ None。"""
     deg = (report.get("in_out") or {}).get("degradation") or {}
     if not deg.get("available"):
         return None
     per = deg.get("metrics", {})
-    labels = [_t(lang, f"m_{m}") for m in metrics]
-    is_vals = [_round((per.get(m) or {}).get("in")) for m in metrics]
-    oos_vals = [_round((per.get(m) or {}).get("out")) for m in metrics]
 
-    bar = Bar(init_opts=opts.InitOpts(width="960px", height="360px"))
-    bar.add_xaxis(labels)
-    bar.add_yaxis(_t(lang, "in"), is_vals, label_opts=opts.LabelOpts(is_show=False))
-    bar.add_yaxis(_t(lang, "out"), oos_vals, label_opts=opts.LabelOpts(is_show=False))
-    bar.set_global_opts(**_title_legend(title))
-    return _wrap(bar, height="380px", pos_top="27%", pos_bottom="12%")
+    n = len(metrics)
+    grid = Grid(init_opts=opts.InitOpts(width="100%", height="430px"))
+    left_m, right_m, gap = 5.0, 4.0, 6.0
+    col_w = (100 - left_m - right_m - gap * (n - 1)) / n
+
+    for i, m in enumerate(metrics):
+        label = _t(lang, f"m_{m}")
+        is_v = _round((per.get(m) or {}).get("in"))
+        oos_v = _round((per.get(m) or {}).get("out"))
+        bar = Bar()
+        bar.add_xaxis([label])
+        bar.add_yaxis(_t(lang, "in"), [is_v], itemstyle_opts=opts.ItemStyleOpts(color="#5b8ff9"),
+                      label_opts=opts.LabelOpts(is_show=True, position="top"))
+        bar.add_yaxis(_t(lang, "out"), [oos_v], itemstyle_opts=opts.ItemStyleOpts(color="#9fe080"),
+                      label_opts=opts.LabelOpts(is_show=True, position="top"))
+        go = {"tooltip_opts": opts.TooltipOpts(trigger="axis")}
+        if i == 0:
+            # 组标题 + 共享图例只在首个子图设一次（系列同名 ⇒ 图例自动去重，统管全行）
+            go["title_opts"] = opts.TitleOpts(title=title, pos_left="center", pos_top="3%")
+            go["legend_opts"] = opts.LegendOpts(pos_left="center", pos_top="12%")
+        else:
+            go["legend_opts"] = opts.LegendOpts(is_show=False)
+        bar.set_global_opts(**go)
+
+        left = left_m + i * (col_w + gap)
+        grid.add(bar, grid_opts=opts.GridOpts(
+            pos_left=f"{left:.1f}%", pos_right=f"{100 - (left + col_w):.1f}%",
+            pos_top="30%", pos_bottom="10%", is_contain_label=True))
+    return grid
 
 
 def _wfo_bar(report, lang):
