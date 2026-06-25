@@ -13,22 +13,22 @@ import math
 # 仪表盘特有标签（SUMMARY_TEXTS 没有的），六语言
 _DASH = {
     "zh": {"total_pnl": "总盈亏", "long_short": "多空比", "total_fee": "总费用",
-           "win": "盈利", "loss": "亏损", "long": "多", "short": "空", "trades_unit": "笔交易",
+           "win": "盈利", "loss": "亏损", "long": "多", "short": "空", "trades_unit": "笔交易", "sum_pl": "合计", "avg_pl": "单笔均",
            "placeholder": "运行回测后，结果将在此可视化展示", "na": "—"},
     "en": {"total_pnl": "Total P&L", "long_short": "Long/Short", "total_fee": "Total Fees",
-           "win": "Win", "loss": "Loss", "long": "L", "short": "S", "trades_unit": "trades",
+           "win": "Win", "loss": "Loss", "long": "L", "short": "S", "trades_unit": "trades", "sum_pl": "Total", "avg_pl": "Avg/trade",
            "placeholder": "Run a backtest to see the visual results here", "na": "—"},
     "ko": {"total_pnl": "총 손익", "long_short": "롱/숏", "total_fee": "총 수수료",
-           "win": "수익", "loss": "손실", "long": "롱", "short": "숏", "trades_unit": "건",
+           "win": "수익", "loss": "손실", "long": "롱", "short": "숏", "trades_unit": "건", "sum_pl": "합계", "avg_pl": "건당 평균",
            "placeholder": "백테스트를 실행하면 여기에 시각화됩니다", "na": "—"},
     "ja": {"total_pnl": "総損益", "long_short": "ロング/ショート", "total_fee": "総手数料",
-           "win": "勝ち", "loss": "負け", "long": "買", "short": "売", "trades_unit": "回",
+           "win": "勝ち", "loss": "負け", "long": "買", "short": "売", "trades_unit": "回", "sum_pl": "合計", "avg_pl": "1回平均",
            "placeholder": "バックテストを実行すると結果がここに表示されます", "na": "—"},
     "ar": {"total_pnl": "إجمالي الربح/الخسارة", "long_short": "شراء/بيع", "total_fee": "إجمالي الرسوم",
-           "win": "ربح", "loss": "خسارة", "long": "شراء", "short": "بيع", "trades_unit": "صفقة",
+           "win": "ربح", "loss": "خسارة", "long": "شراء", "short": "بيع", "trades_unit": "صفقة", "sum_pl": "الإجمالي", "avg_pl": "متوسط/صفقة",
            "placeholder": "شغّل اختبارًا خلفيًا لعرض النتائج هنا", "na": "—"},
     "ru": {"total_pnl": "Общий P&L", "long_short": "Лонг/Шорт", "total_fee": "Сумма комиссий",
-           "win": "Приб.", "loss": "Убыт.", "long": "Л", "short": "Ш", "trades_unit": "сделок",
+           "win": "Приб.", "loss": "Убыт.", "long": "Л", "short": "Ш", "trades_unit": "сделок", "sum_pl": "Сумма", "avg_pl": "Сред.",
            "placeholder": "Запустите бэктест, чтобы увидеть результаты", "na": "—"},
 }
 
@@ -200,11 +200,11 @@ def build_dashboard_html(metrics, trades, meta, summary_text, lang_code="zh"):
          f'{wins} {t["win"]} / {losses} {t["loss"]}', win_frac),
         (t["long_short"], (_num(long_frac * 100, na=na) + "%"),
          f'{longs}{t["long"]} / {shorts}{t["short"]}', long_frac),
-        # 盈亏比 与 交易次数 互换：盈亏比占普通卡片位
+        # 盈亏比 与 交易次数 互换：盈亏比占普通卡片位。副标题标「单笔均」区别于 PF 的「合计」
         (st.get("payoff_ratio", "payoff_ratio"), _num(metrics.get("payoff_ratio"), na=na),
-         f'+{_num(avg_p)} / {_num(avg_l)}', payoff_frac),
+         f'{t["avg_pl"]} +{_num(avg_p)} / {_num(avg_l)}', payoff_frac),
         (st.get("profit_factor", "PF"), _num(metrics.get("profit_factor"), na=na),
-         f'+{_num(gross_profit)} / {_num(gross_loss)}', pf_frac),
+         f'{t["sum_pl"]} +{_num(gross_profit)} / {_num(gross_loss)}', pf_frac),
     ]
     # 交易次数 改为整行卡片置于末尾（与盈亏比互换）
     cards.append((st.get("trade_count", "trades"), str(metrics.get("trade_count", len(trades))),
