@@ -36,8 +36,13 @@ def _json_safe(obj):
 
 def build_run_record(
     *, prompt, strategy_code, market, params, metrics, chart_file, timestamp_utc,
+    summary="",
 ):
-    """组装一条自包含历史记录（纯数据，不落盘）。params/metrics 为 JSON-able dict。"""
+    """组装一条自包含历史记录（纯数据，不落盘）。params/metrics 为 JSON-able dict。
+
+    metrics 是整套结构化指标（total_return_pct/annual_return_pct/sharpe_ratio/
+    max_drawdown_pct/trade_count/胜率/盈亏比...，给程序消费）；summary 是 UI 里那段
+    带语言标签的回测摘要原文（给人直接阅读），两者都存。"""
     return {
         "record_version": RUN_RECORD_VERSION,
         "timestamp_utc": timestamp_utc,
@@ -45,7 +50,8 @@ def build_run_record(
         "strategy_code": strategy_code or "",
         "market": market,
         "params": params,
-        "metrics": metrics,
+        "metrics": metrics,              # 结构化指标（收益率/年化/夏普/回撤/胜率...）
+        "summary": summary or "",        # 人类可读回测摘要（与 UI 显示一致）
         "chart_file": chart_file,
     }
 

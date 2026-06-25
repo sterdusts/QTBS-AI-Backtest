@@ -1676,6 +1676,7 @@ def run_backtest_from_ui(
                     "slippage_percent": slippage_percent_value,
                 },
                 metrics=metrics,
+                summary=summary,
                 chart_file=html_path,
                 timestamp_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             ))

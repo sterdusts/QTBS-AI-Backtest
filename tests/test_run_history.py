@@ -26,7 +26,9 @@ def test_save_and_load_round_trip(tmp_path):
         strategy_code="CONTRACT_VERSION = 1\ndef generate_signals(df):\n    return df\n",
         market="crypto",
         params={"symbol": "BTCUSDT", "timeframe": "1d", "leverage": 1, "initial_cash": 1000.0},
-        metrics={"total_return_pct": 12.5, "sharpe_ratio": 1.2, "trade_count": 3},
+        metrics={"total_return_pct": 12.5, "annual_return_pct": 8.0,
+                 "sharpe_ratio": 1.2, "max_drawdown_pct": -20.0, "trade_count": 3},
+        summary="总收益率：12.50%\n年化收益：8.00%\n夏普比率：1.20",
         chart_file="Past_data/x.html",
         timestamp_utc="2026-06-24 05:00:00 UTC",
     )
@@ -38,7 +40,14 @@ def test_save_and_load_round_trip(tmp_path):
     assert back["prompt"].startswith("比特币")
     assert "generate_signals" in back["strategy_code"]
     assert back["params"]["symbol"] == "BTCUSDT"
+    # 结构化指标：收益率/年化/夏普/回撤/交易次数全部留存
     assert back["metrics"]["total_return_pct"] == 12.5
+    assert back["metrics"]["annual_return_pct"] == 8.0
+    assert back["metrics"]["sharpe_ratio"] == 1.2
+    assert back["metrics"]["max_drawdown_pct"] == -20.0
+    assert back["metrics"]["trade_count"] == 3
+    # 人类可读摘要原文也留存
+    assert "夏普比率" in back["summary"]
     assert back["chart_file"] == "Past_data/x.html"
     assert path in list_run_records(str(tmp_path))
 
