@@ -106,11 +106,11 @@ def test_dashboard_negative_return_red():
 # =========================================================
 
 _TRADES_FULL = [
-    {"side": "long", "net_pnl": 300.0, "open_fee": 1.0, "close_fee": 1.0,
+    {"side": "long", "net_pnl": 300.0, "net_pnl_pct": 29.76, "open_fee": 1.0, "close_fee": 1.0,
      "entry_time": "2024-01-02 08:00:00", "exit_time": "2024-01-05 12:00:00",
      "entry_price": 42000.0, "exit_price": 45000.0, "entry_notional": 4200.0,
      "exit_reason": "take_profit", "max_abs_qty": 0.1},
-    {"side": "short", "net_pnl": -151.37, "open_fee": 1.0, "close_fee": 1.0,
+    {"side": "short", "net_pnl": -151.37, "net_pnl_pct": -15.13, "open_fee": 1.0, "close_fee": 1.0,
      "entry_time": "2024-02-01 00:00:00", "exit_time": "2024-02-03 04:00:00",
      "entry_price": 43000.0, "exit_price": 44500.0, "entry_notional": 4300.0,
      "exit_reason": "stop_loss", "max_abs_qty": 0.1},
@@ -132,6 +132,8 @@ def test_dashboard_renders_trade_and_order_sections():
     assert "42,000" in h and "45,000" in h
     # 未截断时不得出现「仅显示前 N 条」误报（2 笔 / 4 条订单都远低于上限）
     assert "仅显示前" not in h
+    # 盈亏百分比小字角标（跟在盈亏额后）
+    assert "qd-pnlpct" in h and "+29.76%" in h and "-15.13%" in h
 
 
 def test_dashboard_orders_are_twice_trades():

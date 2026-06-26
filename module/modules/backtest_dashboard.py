@@ -137,6 +137,7 @@ _STYLE = """
 .qtbs-dash .qd-badge.bl{background:#e3f7ec;color:#16a564;}
 .qtbs-dash .qd-badge.bs{background:#fde8ea;color:#d6453d;}
 .qtbs-dash .qd-pnlv{font-weight:800;font-size:15px;}
+.qtbs-dash .qd-pnlpct{font-size:11px;font-weight:700;margin-left:3px;vertical-align:super;opacity:.85;}
 .qtbs-dash .qd-time{font-size:11px;color:#9aa0ab;margin:3px 0 7px;}
 .qtbs-dash .qd-fields{display:flex;gap:22px;font-size:13px;flex-wrap:wrap;}
 .qtbs-dash .qd-fields .fk{color:#9aa0ab;margin-right:5px;}
@@ -279,6 +280,14 @@ def _trade_row(tr, default_sym, lang):
     pnl_color = _color(pnl if pnl is not None else 0)
     pnl_sign = "+" if (pnl is not None and pnl >= 0) else ""
 
+    # 盈亏百分比小字角标，跟在盈亏额后（净盈亏 / 入场权益，引擎口径 net_pnl_pct）
+    pnl_pct = _f(tr, "net_pnl_pct", "pnl_pct")
+    pct_txt = _num(pnl_pct, na="") if pnl_pct is not None else ""
+    pct_html = (
+        f'<sup class="qd-pnlpct" style="color:{pnl_color}">'
+        f'{("+" if pnl_pct >= 0 else "")}{pct_txt}%</sup>'
+    ) if pct_txt else ""
+
     ep, xp = _f(tr, "entry_price"), _f(tr, "exit_price")
     notion = _notional_of(tr)
     reason = _reason(lang, tr.get("exit_reason"))
@@ -296,7 +305,7 @@ def _trade_row(tr, default_sym, lang):
         f'<div class="qd-trow {pnl_cls}">'
         f'<div class="tlh"><span class="qd-sym">{sym}</span>'
         f'<span class="qd-badge {badge_cls}">{esc(side_txt)}</span>'
-        f'<span class="qd-pnlv" style="color:{pnl_color}">{pnl_sign}{_num(pnl, na="—")}</span></div>'
+        f'<span class="qd-pnlv" style="color:{pnl_color}">{pnl_sign}{_num(pnl, na="—")}{pct_html}</span></div>'
         f'<div class="qd-time">{time_part}</div>'
         f'<div class="qd-fields">{fields}</div>'
         f'{reason_html}</div>'
