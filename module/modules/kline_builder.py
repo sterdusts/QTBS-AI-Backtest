@@ -49,10 +49,52 @@ class KlineBuilder:
         # 兼容 Binance 毫秒时间戳 / 字符串时间。errors="coerce" 与 load_existing_df /
         # data_integrity._read_open_times 同口径：损坏行 → NaT 后丢弃（下方 dropna），
         # 而非整批加载崩溃（如 object 列里混入非法 token 致 OutOfBoundsDatetime）。
-        if pd.api.types.is_numeric_dtype(df["open_time"]):
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
+        open_time = df["open_time"]
+        min_time_utc = pd.Timestamp("2010-01-01", tz="UTC")
+        max_time_utc = pd.Timestamp.max.tz_localize("UTC")
+        min_ms = min_time_utc.timestamp() * 1000
+        max_ms = max_time_utc.timestamp() * 1000
+        if pd.api.types.is_datetime64_any_dtype(open_time):
+            df["open_time"] = pd.to_datetime(open_time, errors="coerce", utc=True)
+        elif pd.api.types.is_numeric_dtype(open_time):
+            numeric_open_time = pd.to_numeric(open_time, errors="coerce")
+            valid_ms = numeric_open_time.between(min_ms, max_ms)
+            df["open_time"] = pd.to_datetime(
+                numeric_open_time.where(valid_ms),
+                unit="ms",
+                errors="coerce",
+                utc=True,
+            )
         else:
-            df["open_time"] = pd.to_datetime(df["open_time"], errors="coerce")
+            text_time = open_time.astype("string").str.strip()
+            numeric_like = text_time.str.fullmatch(r"[+-]?\d+(?:\.\d+)?").fillna(False)
+            numeric_open_time = pd.to_numeric(text_time.where(numeric_like), errors="coerce")
+            # Object 列可能混入 nanosecond epoch 字符串（pandas Timestamp.astype(int64)
+            # 的产物）。这些按毫秒解释会落到数万年后，pandas 3 可生成 ms 精度时间
+            # 但无法安全回落到 ns 精度；先按 pandas 可表示范围筛掉，后续 2010 底线
+            # 还会丢弃过早的损坏时间。
+            numeric_mask = numeric_like & numeric_open_time.between(min_ms, max_ms).fillna(False)
+            text_mask = ~numeric_like
+            parsed = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
+            if numeric_mask.any():
+                parsed.loc[numeric_mask] = pd.to_datetime(
+                    numeric_open_time.loc[numeric_mask],
+                    unit="ms",
+                    errors="coerce",
+                    utc=True,
+                )
+            if text_mask.any():
+                parsed_text = pd.to_datetime(
+                    open_time.loc[text_mask],
+                    errors="coerce",
+                    utc=True,
+                    format="mixed",
+                )
+                parsed_text = parsed_text.where(
+                    (parsed_text >= min_time_utc) & (parsed_text <= max_time_utc)
+                )
+                parsed.loc[text_mask] = parsed_text
+            df["open_time"] = parsed
         df = df[df["open_time"].notna()]
 
         # 遗留 tz-aware CSV（ISO "...+00:00"）会得到带时区的 datetime：统一剥成

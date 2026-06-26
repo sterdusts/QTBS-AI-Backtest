@@ -20,7 +20,26 @@ from module.modules.file_naming import build_timestamped_filename
 RUN_HISTORY_DIR = "Past_data/runs"
 
 # 记录 schema 版本（供将来历史查看器稳定消费，类比 CONTRACT_VERSION）
-RUN_RECORD_VERSION = "run_v1"
+# run_v2：新增 trades + equity（降采样），供历史查看器原样重渲可视化仪表盘
+# run_v3：新增 robustness（稳健性文字报告）+ robustness_chart（图表路径），随回测一并留档
+RUN_RECORD_VERSION = "run_v3"
+
+# 落盘上限：成交列表与权益曲线可能极大（分钟级高换手 / 数十万根权益点），
+# 历史留档只为重渲仪表盘，故按显示需要封顶——仪表盘列表本就只展示前 300 条。
+_MAX_STORED_TRADES = 500
+_MAX_STORED_EQUITY = 600
+
+
+def _downsample(seq, max_points):
+    """均匀抽样降采样，保留首尾点（权益曲线缩略图用，不追求逐点精确）。"""
+    seq = list(seq) if seq else []
+    n = len(seq)
+    if n <= max_points or max_points <= 1:
+        return seq
+    step = n / max_points
+    out = [seq[int(i * step)] for i in range(max_points)]
+    out[-1] = seq[-1]   # 始终保留最终权益点
+    return out
 
 
 def _json_safe(obj):
@@ -43,13 +62,16 @@ def _json_safe(obj):
 
 def build_run_record(
     *, prompt, strategy_code, market, params, metrics, chart_file, timestamp_utc,
-    summary="",
+    summary="", trades=None, equity=None, robustness="", robustness_chart=None,
 ):
     """组装一条自包含历史记录（纯数据，不落盘）。params/metrics 为 JSON-able dict。
 
     metrics 是整套结构化指标（total_return_pct/annual_return_pct/sharpe_ratio/
     max_drawdown_pct/trade_count/胜率/盈亏比...，给程序消费）；summary 是 UI 里那段
-    带语言标签的回测摘要原文（给人直接阅读），两者都存。"""
+    带语言标签的回测摘要原文（给人直接阅读），两者都存。
+
+    trades / equity 用于历史查看器原样重渲可视化仪表盘（成交+订单卡片列表 +
+    权益缩略曲线）：成交封顶 _MAX_STORED_TRADES，权益降采样到 _MAX_STORED_EQUITY。"""
     return {
         "record_version": RUN_RECORD_VERSION,
         "timestamp_utc": timestamp_utc,
@@ -60,6 +82,10 @@ def build_run_record(
         "metrics": metrics,              # 结构化指标（收益率/年化/夏普/回撤/胜率...）
         "summary": summary or "",        # 人类可读回测摘要（与 UI 显示一致）
         "chart_file": chart_file,
+        "trades": list(trades or [])[:_MAX_STORED_TRADES],   # 成交/片段（重渲卡片列表）
+        "equity": _downsample(equity or [], _MAX_STORED_EQUITY),  # 权益缩略曲线
+        "robustness": robustness or "",      # 稳健性分析文字报告（与回测同批，重渲历史用）
+        "robustness_chart": robustness_chart,  # 稳健性一页图 HTML 路径（按需打开）
     }
 
 

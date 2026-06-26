@@ -21,8 +21,31 @@ def test_extract_json_fenced():
 
 
 def test_extract_json_with_trailing_commentary():
-    # JSON 后面跟说明文字（含右花括号）也要能解析
+    # JSON 后面跟纯文字说明也要能解析
     assert _extract_json('{"a": 1}\n以上就是审查结果')["a"] == 1
+
+
+def test_extract_json_trailing_commentary_with_brace():
+    # 关键回归：尾部说明里【含右花括号】时，旧 rfind("}") 会截到最后一个 } 导致
+    # json.loads 失败；raw_decode 只取首个完整对象，尾部 } 不影响解析。
+    assert _extract_json('{"a": 1}\n说明：详见附录 {第3节}')["a"] == 1
+    assert _extract_json('{"score": 88}  // 备注 {ok}')["score"] == 88
+
+
+def test_extract_json_nested_object_full_parse():
+    # 嵌套对象必须完整解析（内层 } 不能被当成对象结尾）
+    data = _extract_json('{"a": {"b": 2}, "c": 3} 结尾说明')
+    assert data["a"]["b"] == 2 and data["c"] == 3
+
+
+def test_extract_json_leading_commentary():
+    # JSON 前有前言文字：从第一个 { 起解析
+    assert _extract_json('好的，审查结果如下：{"a": 1}')["a"] == 1
+
+
+def test_extract_json_fenced_with_trailing_brace_commentary():
+    # 围栏 + 尾部含 } 的说明（围栏剥离后仍走 raw_decode）
+    assert _extract_json('```json\n{"a": 1}\n```\n注：见 {附录}')["a"] == 1
 
 
 def test_extract_json_none_or_empty_raises():

@@ -36,7 +36,7 @@ def test_save_and_load_round_trip(tmp_path):
     assert os.path.exists(path) and path.endswith(".json")
 
     back = load_run_record(path)
-    assert back["record_version"] == "run_v1"
+    assert back["record_version"] == "run_v3"
     assert back["prompt"].startswith("比特币")
     assert "generate_signals" in back["strategy_code"]
     assert back["params"]["symbol"] == "BTCUSDT"
@@ -75,6 +75,55 @@ def test_empty_prompt_allowed(tmp_path):
 
 def test_list_empty_dir_returns_empty(tmp_path):
     assert list_run_records(str(tmp_path / "nonexistent")) == []
+
+
+def test_trades_and_equity_persisted_for_rerender(tmp_path):
+    # run_v2：成交 + 权益随记录留档，供「查看历史」重渲仪表盘
+    trades = [{"side": "long", "net_pnl": 10.0, "entry_price": 100.0, "exit_price": 110.0,
+               "entry_time": "2024-01-01 00:00:00", "exit_time": "2024-01-02 00:00:00",
+               "exit_reason": "signal", "max_abs_qty": 1.0}]
+    rec = build_run_record(
+        prompt="x", strategy_code="x", market="crypto", params={}, metrics={},
+        chart_file=None, timestamp_utc="t", trades=trades, equity=[1000, 1010, 1005, 1100])
+    back = load_run_record(save_run_record(rec, output_dir=str(tmp_path)))
+    assert back["trades"][0]["side"] == "long"
+    assert back["trades"][0]["exit_reason"] == "signal"
+    assert back["equity"] == [1000, 1010, 1005, 1100]
+
+
+def test_trades_and_equity_default_empty(tmp_path):
+    # 不传 trades/equity（旧调用方）：归一为空列表，不为 None、不崩
+    rec = build_run_record(prompt="x", strategy_code="x", market="crypto",
+                           params={}, metrics={}, chart_file=None, timestamp_utc="t")
+    assert rec["trades"] == [] and rec["equity"] == []
+
+
+def test_robustness_persisted_and_defaults(tmp_path):
+    # run_v3：稳健性报告文本 + 图表路径随记录留档；不传时归一为空串/None
+    rec = build_run_record(prompt="x", strategy_code="x", market="crypto",
+                           params={}, metrics={}, chart_file=None, timestamp_utc="t",
+                           robustness="【稳健性分析】...\n样本外平均夏普：1.2",
+                           robustness_chart="Past_data/r.html")
+    back = load_run_record(save_run_record(rec, output_dir=str(tmp_path)))
+    assert "样本外平均夏普" in back["robustness"]
+    assert back["robustness_chart"] == "Past_data/r.html"
+
+    rec2 = build_run_record(prompt="x", strategy_code="x", market="crypto",
+                            params={}, metrics={}, chart_file=None, timestamp_utc="t")
+    assert rec2["robustness"] == "" and rec2["robustness_chart"] is None
+
+
+def test_trades_capped_and_equity_downsampled(tmp_path):
+    from module.modules.run_history import _MAX_STORED_TRADES, _MAX_STORED_EQUITY
+    many_trades = [{"side": "long", "net_pnl": float(i)} for i in range(_MAX_STORED_TRADES + 250)]
+    long_equity = list(range(_MAX_STORED_EQUITY * 4))
+    rec = build_run_record(prompt="x", strategy_code="x", market="crypto",
+                           params={}, metrics={}, chart_file=None, timestamp_utc="t",
+                           trades=many_trades, equity=long_equity)
+    assert len(rec["trades"]) == _MAX_STORED_TRADES           # 成交封顶
+    assert len(rec["equity"]) == _MAX_STORED_EQUITY           # 权益降采样
+    assert rec["equity"][0] == 0                              # 保留首点
+    assert rec["equity"][-1] == long_equity[-1]               # 始终保留最终权益
 
 
 def test_numpy_scalars_serialize_as_numbers(tmp_path):

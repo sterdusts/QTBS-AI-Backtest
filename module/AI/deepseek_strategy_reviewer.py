@@ -29,12 +29,18 @@ def _extract_json(text) -> dict:
         text = text.strip()
 
     start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1:
+    if start == -1:
         raise ValueError(f"AI审查结果不是合法JSON：{text[:200]}")
 
-    return json.loads(text[start:end + 1])
+    # 从第一个 { 起解析「首个完整 JSON 对象」，其后说明文字一律忽略。
+    # 旧实现用 rfind("}") 截到最后一个右括号：一旦模型在 JSON 后追加的说明里含
+    # } （如「详见 {附录}」），就会把尾部说明并入 json.loads 而解析失败。
+    # raw_decode 是真正的 JSON 解析器，按括号深度找到对象结尾，天然跳过尾部数据。
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text, start)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI审查结果不是合法JSON：{text[:200]}")
+    return obj
 
 
 def _build_system_prompt(review_language: str, boundary: str) -> str:
