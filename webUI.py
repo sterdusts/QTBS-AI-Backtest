@@ -1795,6 +1795,14 @@ def run_backtest_from_ui(
         # 「计算中」占位——用户立即看到回测结果；② 再后台跑稳健性分析、出图、补进稳健性区。
         yield dashboard, html_path, _robustness_pending_html(output_language), None
 
+    except Exception as e:
+        # 仅捕获【第一次 yield 之前】的回测异常 → 错误展示在主仪表盘位
+        yield _result_error_html(f"{text['backtest_fail_error']}：{str(e)}"), None, "", None
+        return
+
+    # —— 第一次 yield 之后（稳健性 + 留档 + 第二次 yield）独立兜底：此段任何意外都【绝不】
+    # 冲掉已展示的回测结果——主仪表盘一律 gr.update() 空操作，失败只在稳健性区显示。——
+    try:
         # 稳健性分析：每次回测默认（70% IS 切分）自动跑一遍，复用已加载的 prepared
         # （数据不二次加载）；图表不自动弹出，路径交「查看稳健性图表」按钮按需打开。
         # 最佳努力：失败/数据不足不影响回测主结果。
@@ -1843,9 +1851,10 @@ def run_backtest_from_ui(
         # 不重发 48KB HTML）；回测图路径 html_path 原样回传（同值，不对 gr.State 写 gr.update()）。
         yield gr.update(), html_path, robustness_html, robustness_chart
 
-    except Exception as e:
-        yield _result_error_html(f"{text['backtest_fail_error']}：{str(e)}"), None, "", None
-        return
+    except Exception as post_err:
+        # 第一次 yield 后的意外：主仪表盘 gr.update() 保持不变，错误只落到稳健性区
+        rt_fail = get_robustness_text(output_language)["fail"]
+        yield gr.update(), html_path, _robustness_html(f"{rt_fail}：{post_err}", output_language), None
 
 
 # =========================================================
