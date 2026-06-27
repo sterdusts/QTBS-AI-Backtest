@@ -428,6 +428,45 @@ def test_syntax_error_rejected():
         validate_strategy_code("def generate_signals(df:\n    return df")
 
 
+@pytest.mark.parametrize("snippet", [
+    'df["target_position"] = (df["close"].shift(-1) > df["close"]).astype(int)',
+    'df["target_position"] = (df["close"].shift(periods=-1) > df["close"]).astype(int)',
+    'df["target_position"] = (df["close"].diff(-1) > 0).astype(int)',
+    'df["target_position"] = (df["close"].pct_change(periods=-1) > 0).astype(int)',
+    'df["target_position"] = (df["close"].rolling(3, center=True).mean() > df["close"]).astype(int)',
+    'df["target_position"] = (df["close"].rolling(3, 1, True).mean() > df["close"]).astype(int)',
+])
+def test_lookahead_operations_rejected(snippet):
+    code = f"""
+import pandas as pd
+import numpy as np
+
+def generate_signals(df):
+    df = df.copy()
+    {snippet}
+    return df
+"""
+    with pytest.raises(ValueError, match="未来函数"):
+        validate_strategy_code(code)
+
+
+def test_past_only_lag_operations_allowed():
+    code = """
+import pandas as pd
+import numpy as np
+
+def generate_signals(df):
+    df = df.copy()
+    prev_close = df["close"].shift(1)
+    delta = df["close"].diff()
+    ret = df["close"].pct_change(1)
+    ma = df["close"].rolling(3, center=False).mean()
+    df["target_position"] = ((prev_close > ma) & (delta > 0) & (ret > 0)).astype(int)
+    return df
+"""
+    validate_strategy_code(code)
+
+
 # =========================================================
 # 契约元数据解析
 # =========================================================

@@ -255,6 +255,57 @@ FORBIDDEN_KEYWORDS = [
 ]
 
 
+LOOKAHEAD_PERIOD_METHODS = frozenset({"shift", "diff", "pct_change"})
+
+
+def _static_number(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return node.value
+    if (
+        isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, (int, float))
+        and not isinstance(node.operand.value, bool)
+    ):
+        return -node.operand.value
+    return None
+
+
+def _is_negative_period_arg(node) -> bool:
+    number = _static_number(node)
+    if number is not None:
+        return number < 0
+    return isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+
+
+def _is_true_literal(node) -> bool:
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _reject_lookahead_call(node: ast.Call, method_name: str) -> None:
+    period_node = node.args[0] if node.args else None
+    for keyword in node.keywords:
+        if keyword.arg == "periods":
+            period_node = keyword.value
+            break
+
+    if period_node is not None and _is_negative_period_arg(period_node):
+        raise ValueError(
+            f"策略代码不允许使用未来函数: {method_name}() 的 periods 不能为负数"
+        )
+
+
+def _reject_centered_rolling(node: ast.Call) -> None:
+    center_node = node.args[2] if len(node.args) >= 3 else None
+    for keyword in node.keywords:
+        if keyword.arg == "center":
+            center_node = keyword.value
+            break
+
+    if center_node is not None and _is_true_literal(center_node):
+        raise ValueError("策略代码不允许使用未来函数: rolling(center=True) 会读取未来窗口")
+
+
 def validate_strategy_code(code: str) -> None:
     """
     对 AI 生成的策略代码做最基础安全检查。
@@ -281,6 +332,13 @@ def validate_strategy_code(code: str) -> None:
     # 防止把 import 藏在函数里绕过顶层检查。
     # 按根模块名判断，允许 pandas/numpy 的子模块。
     for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            method_name = node.func.attr
+            if method_name in LOOKAHEAD_PERIOD_METHODS:
+                _reject_lookahead_call(node, method_name)
+            elif method_name == "rolling":
+                _reject_centered_rolling(node)
+
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] not in ALLOWED_IMPORT_ROOTS:
@@ -438,16 +496,7 @@ def parse_strategy_metadata(code: str) -> dict:
 
 def _ast_number(node):
     """从 AST 节点提取数值常量（int/float，含一元负号），否则返回 None。"""
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return node.value
-    if (
-        isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
-        and isinstance(node.operand, ast.Constant)
-        and isinstance(node.operand.value, (int, float))
-        and not isinstance(node.operand.value, bool)
-    ):
-        return -node.operand.value
-    return None
+    return _static_number(node)
 
 
 def _parse_param_space(value):

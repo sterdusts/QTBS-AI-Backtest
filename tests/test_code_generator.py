@@ -143,6 +143,15 @@ def test_validate_missing_generate_signals_rejected():
         validate_generated_code("CONTRACT_VERSION = 1\nx = 1\n")
 
 
+def test_validate_lookahead_shift_rejected():
+    code = V1_CODE.replace(
+        'df["target_position"] = 0',
+        'df["target_position"] = (df["close"].shift(-1) > df["close"]).astype(int)',
+    )
+    with pytest.raises(ValueError, match="未来函数"):
+        validate_generated_code(code)
+
+
 @pytest.mark.parametrize("token", ['"4h"', "'1d'", "resample("])
 def test_validate_forbidden_tokens_rejected_for_both_contracts(token):
     v1_bad = V1_CODE + f"\n# {token}\n"
